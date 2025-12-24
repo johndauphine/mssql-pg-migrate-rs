@@ -43,6 +43,7 @@ tracing = { workspace = true }
 # Async utilities
 futures = { workspace = true }
 async-trait = { workspace = true }
+async-channel = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }

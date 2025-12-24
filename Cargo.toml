@@ -15,7 +15,7 @@ authors = ["John Dauphine <jdauphine@gmail.com>"]
 tokio = { version = "1.40", features = ["full"] }
 
 # MSSQL driver (pure Rust with rustls)
-tiberius = { version = "0.12", default-features = false, features = ["rustls", "chrono"] }
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # PostgreSQL driver
@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+async-channel = "2.3"
 
 # Concurrency
 parking_lot = "0.12"

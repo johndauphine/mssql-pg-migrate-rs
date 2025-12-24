@@ -242,6 +242,7 @@ impl MssqlPool {
     }
 
     /// Query rows from the database and convert to SqlValue.
+    /// Note: This method does O(n) lookup per column per row. Use query_rows_fast for better performance.
     pub async fn query_rows(
         &self,
         sql: &str,
@@ -271,6 +272,70 @@ impl MssqlPool {
         }
 
         Ok(result)
+    }
+
+    /// Query rows with pre-computed column types for O(1) lookup per value.
+    /// This is the high-performance version used by the parallel transfer engine.
+    pub async fn query_rows_fast(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+        let mut client = self.get_client().await?;
+        let t_conn = t0.elapsed();
+
+        let t1 = Instant::now();
+        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
+        let t_query = t1.elapsed();
+
+        let t2 = Instant::now();
+        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let t_fetch = t2.elapsed();
+
+        let t3 = Instant::now();
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+
+            // O(1) lookup using pre-computed column types array
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = convert_row_value(&row, idx, data_type);
+                values.push(value);
+            }
+
+            result.push(values);
+        }
+        let t_convert = t3.elapsed();
+
+        // Log timing breakdown for chunks with significant data
+        if result.len() > 1000 {
+            debug!(
+                "PROFILE read: {} rows - conn={:?}, query={:?}, fetch={:?}, convert={:?}",
+                result.len(), t_conn, t_query, t_fetch, t_convert
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Get the maximum primary key value for a table.
+    pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let query = format!(
+            "SELECT CAST(MAX([{}]) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
+            pk_col, schema, table
+        );
+
+        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
+        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+
+        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
 
     /// Load row count for a table (fast approximate from sys.partitions).

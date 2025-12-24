@@ -1,4 +1,9 @@
-//! Data transfer engine with read-ahead/write-ahead pipeline.
+//! Data transfer engine with parallel read-ahead/write-ahead pipeline.
+//!
+//! This module implements a high-performance transfer engine that uses:
+//! - Multiple parallel readers (PK range splitting) to maximize source throughput
+//! - Multiple parallel writers to maximize target throughput
+//! - Read-ahead buffering to overlap read and write operations
 
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
@@ -60,14 +65,22 @@ pub struct TransferStats {
 /// A chunk of rows to be transferred.
 #[derive(Debug)]
 struct RowChunk {
-    /// Column names.
-    columns: Vec<String>,
     /// Row data.
     rows: Vec<Vec<SqlValue>>,
     /// Last PK value in this chunk (for resume).
     last_pk: Option<i64>,
     /// Time taken to read this chunk.
     read_time: Duration,
+}
+
+/// A write job for the parallel writer pool.
+struct WriteJob {
+    /// Row data to write.
+    rows: Vec<Vec<SqlValue>>,
+    /// Read time for stats tracking.
+    read_time: Duration,
+    /// Last PK for stats tracking.
+    last_pk: Option<i64>,
 }
 
 /// Transfer engine configuration.
@@ -77,13 +90,19 @@ pub struct TransferConfig {
     pub chunk_size: usize,
     /// Number of read-ahead chunks to buffer.
     pub read_ahead: usize,
+    /// Number of parallel readers per table.
+    pub parallel_readers: usize,
+    /// Number of parallel writers per table.
+    pub parallel_writers: usize,
 }
 
 impl Default for TransferConfig {
     fn default() -> Self {
         Self {
             chunk_size: 50_000,
-            read_ahead: 10, // Larger buffer reduces reader stalls
+            read_ahead: 16,
+            parallel_readers: 4,
+            parallel_writers: 4,
         }
     }
 }
@@ -114,98 +133,226 @@ impl TransferEngine {
         self.rows_transferred.load(Ordering::Relaxed)
     }
 
-    /// Execute a transfer job using read-ahead pipeline.
+    /// Execute a transfer job using parallel read-ahead/write-ahead pipeline.
     pub async fn execute(&self, job: TransferJob) -> Result<TransferStats> {
         let table_name = job.table.full_name();
         info!(
-            "Starting transfer for {} (mode: {:?})",
-            table_name, job.target_mode
+            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {})",
+            table_name, job.target_mode, self.config.parallel_readers, self.config.parallel_writers
         );
 
         let start = Instant::now();
         let mut stats = TransferStats::default();
 
-        // Create channel for read-ahead pipeline
-        let (tx, mut rx) = mpsc::channel::<RowChunk>(self.config.read_ahead);
-
-        // Get column names for this table
+        // Get column names and pre-compute column types for O(1) lookup
         let columns: Vec<String> = job.table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = job.table.columns.iter().map(|c| c.data_type.clone()).collect();
         let pk_cols: Vec<String> = job.table.primary_key.clone();
 
-        // Spawn reader task
+        // Determine if we can use parallel keyset pagination
+        let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
+        let num_readers = if use_keyset { self.config.parallel_readers } else { 1 };
+
+        if !use_keyset {
+            warn!("{}: using OFFSET pagination (slower, single reader)", table_name);
+        }
+
+        // Create channel for read-ahead pipeline
+        let (read_tx, read_rx) = mpsc::channel::<RowChunk>(self.config.read_ahead);
+
+        // Create channel for write jobs (multiple writers consume from this)
+        let (write_tx, write_rx) = async_channel::bounded::<WriteJob>(self.config.parallel_writers * 2);
+
+        // Spawn parallel readers
         let source = self.source.clone();
         let job_clone = job.clone();
         let chunk_size = self.config.chunk_size;
         let columns_clone = columns.clone();
+        let col_types_clone = col_types.clone();
 
         let reader_handle = tokio::spawn(async move {
-            read_table_chunks(source, job_clone, columns_clone, chunk_size, tx).await
+            if use_keyset && num_readers > 1 {
+                read_table_chunks_parallel(
+                    source,
+                    job_clone,
+                    columns_clone,
+                    col_types_clone,
+                    chunk_size,
+                    num_readers,
+                    read_tx,
+                ).await
+            } else {
+                read_table_chunks(
+                    source,
+                    job_clone,
+                    columns_clone,
+                    col_types_clone,
+                    chunk_size,
+                    read_tx,
+                ).await
+            }
         });
 
-        // Write chunks as they arrive
-        let mut write_time = Duration::ZERO;
-        let mut rows_written: i64 = 0;
+        // Spawn parallel writers
+        let num_writers = self.config.parallel_writers;
+        let mut writer_handles = Vec::with_capacity(num_writers);
 
-        while let Some(chunk) = rx.recv().await {
-            let write_start = Instant::now();
+        for writer_id in 0..num_writers {
+            let write_rx = write_rx.clone();
+            let target = self.target.clone();
+            let schema = job.target_schema.clone();
+            let table_name_clone = job.table.name.clone();
+            let columns_clone = columns.clone();
+            let pk_cols_clone = pk_cols.clone();
+            let target_mode = job.target_mode;
 
-            let row_count = chunk.rows.len() as u64;
-            stats.last_pk = chunk.last_pk;
-            stats.query_time += chunk.read_time;
+            let handle = tokio::spawn(async move {
+                let mut local_write_time = Duration::ZERO;
+                let mut local_rows = 0i64;
 
-            match job.target_mode {
-                TargetMode::Upsert => {
-                    self.target
-                        .upsert_chunk(
-                            &job.target_schema,
-                            &job.table.name,
-                            &columns,
-                            &pk_cols,
-                            chunk.rows,
-                        )
-                        .await?;
+                while let Ok(write_job) = write_rx.recv().await {
+                    let write_start = Instant::now();
+                    let row_count = write_job.rows.len() as i64;
+
+                    let result = match target_mode {
+                        TargetMode::Upsert => {
+                            target
+                                .upsert_chunk(
+                                    &schema,
+                                    &table_name_clone,
+                                    &columns_clone,
+                                    &pk_cols_clone,
+                                    write_job.rows,
+                                )
+                                .await
+                        }
+                        _ => {
+                            target
+                                .write_chunk(&schema, &table_name_clone, &columns_clone, write_job.rows)
+                                .await
+                        }
+                    };
+
+                    if let Err(e) = result {
+                        return Err(MigrateError::Transfer {
+                            table: table_name_clone.clone(),
+                            message: format!("Writer {} failed: {}", writer_id, e),
+                        });
+                    }
+
+                    local_write_time += write_start.elapsed();
+                    local_rows += row_count;
+
+                    debug!(
+                        "Writer {}: wrote {} rows (local total: {})",
+                        writer_id, row_count, local_rows
+                    );
                 }
-                _ => {
-                    self.target
-                        .write_chunk(&job.target_schema, &job.table.name, &columns, chunk.rows)
-                        .await?;
-                }
-            }
 
-            write_time += write_start.elapsed();
-            rows_written += row_count as i64;
-            self.rows_transferred.fetch_add(row_count as i64, Ordering::Relaxed);
+                Ok::<(Duration, i64), MigrateError>((local_write_time, local_rows))
+            });
 
-            debug!(
-                "{}: wrote {} rows (total: {})",
-                table_name, row_count, rows_written
-            );
+            writer_handles.push(handle);
         }
+
+        // Drop our copy of write_rx so channel closes when all writers are done
+        drop(write_rx);
+
+        // Dispatcher: read from read_rx, dispatch to write_tx
+        let mut total_query_time = Duration::ZERO;
+        let mut last_pk = None;
+
+        // Use a separate receiver for the read channel
+        let mut read_rx = read_rx;
+
+        while let Some(chunk) = read_rx.recv().await {
+            total_query_time += chunk.read_time;
+            // With parallel readers, chunks may arrive out of order.
+            // For resume safety, track the minimum PK processed so far.
+            last_pk = match (last_pk, chunk.last_pk) {
+                (None, pk) => pk,
+                (pk, None) => pk,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
+
+            let write_job = WriteJob {
+                rows: chunk.rows,
+                read_time: chunk.read_time,
+                last_pk: chunk.last_pk,
+            };
+
+            if write_tx.send(write_job).await.is_err() {
+                // Writers have all failed
+                break;
+            }
+        }
+
+        // Close write channel to signal writers to finish
+        drop(write_tx);
 
         // Wait for reader to complete
         match reader_handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(MigrateError::Transfer {
-                table: table_name.clone(),
-                message: format!("Reader task failed: {}", e),
-            }),
+            Err(e) => {
+                return Err(MigrateError::Transfer {
+                    table: table_name.clone(),
+                    message: format!("Reader task failed: {}", e),
+                })
+            }
         }
 
-        stats.rows = rows_written;
-        stats.write_time = write_time;
-        // Use saturating_sub to avoid overflow if query_time + write_time > elapsed
+        // Wait for all writers and aggregate stats
+        // Writers run in parallel, so wall-clock write time is approximated
+        // by the maximum per-writer duration, not the sum.
+        let mut total_write_time = Duration::ZERO;
+        let mut total_rows = 0i64;
+
+        for handle in writer_handles {
+            match handle.await {
+                Ok(Ok((write_time, rows))) => {
+                    if write_time > total_write_time {
+                        total_write_time = write_time;
+                    }
+                    total_rows += rows;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(MigrateError::Transfer {
+                        table: table_name.clone(),
+                        message: format!("Writer task panicked: {}", e),
+                    })
+                }
+            }
+        }
+
+        // Update global counter
+        self.rows_transferred.fetch_add(total_rows, Ordering::Relaxed);
+
+        stats.rows = total_rows;
+        stats.query_time = total_query_time;
+        stats.write_time = total_write_time;
+        stats.last_pk = last_pk;
+
+        // Calculate scan time as remainder
         let total_elapsed = start.elapsed();
         stats.scan_time = total_elapsed
             .saturating_sub(stats.query_time)
             .saturating_sub(stats.write_time);
         stats.completed = true;
 
+        let rows_per_sec = if total_elapsed.as_secs_f64() > 0.0 {
+            (total_rows as f64 / total_elapsed.as_secs_f64()) as i64
+        } else {
+            0
+        };
+
         info!(
-            "{}: transferred {} rows in {:?} (read: {:?}, write: {:?})",
+            "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
             table_name,
             stats.rows,
-            start.elapsed(),
+            total_elapsed,
+            rows_per_sec,
             stats.query_time,
             stats.write_time
         );
@@ -214,30 +361,221 @@ impl TransferEngine {
     }
 }
 
-/// Read table data in chunks using keyset pagination.
+/// Split a PK range into N sub-ranges for parallel reading.
+/// Each reader gets an explicit lower bound derived from min_pk to prevent data duplication.
+fn split_pk_range(min_pk: i64, max_pk: i64, num_readers: usize) -> Vec<(Option<i64>, i64)> {
+    if num_readers <= 1 || max_pk <= min_pk {
+        // Single reader or invalid range: use explicit min_pk bound
+        return vec![(Some(min_pk), max_pk)];
+    }
+
+    let total_range = max_pk - min_pk;
+    let range_size = total_range / num_readers as i64;
+
+    if range_size < 1 {
+        // Range too small to split: use a single bounded range
+        return vec![(Some(min_pk), max_pk)];
+    }
+
+    (0..num_readers)
+        .map(|i| {
+            // Each reader has an explicit lower bound derived from min_pk
+            let range_min = Some(min_pk + (i as i64 * range_size));
+            let range_max = if i == num_readers - 1 {
+                max_pk // Last reader goes to the end
+            } else {
+                min_pk + ((i + 1) as i64 * range_size)
+            };
+            (range_min, range_max)
+        })
+        .collect()
+}
+
+/// Read table data using parallel readers with PK range splitting.
+async fn read_table_chunks_parallel(
+    source: Arc<MssqlPool>,
+    job: TransferJob,
+    columns: Vec<String>,
+    col_types: Vec<String>,
+    chunk_size: usize,
+    num_readers: usize,
+    tx: mpsc::Sender<RowChunk>,
+) -> Result<()> {
+    let table = &job.table;
+    let table_name = table.full_name();
+
+    // Get min/max PK for range splitting
+    // If job already has partition boundaries, use them; otherwise query the table
+    let min_pk = job.min_pk.unwrap_or(0);
+    let max_pk = match job.max_pk {
+        Some(pk) => pk,
+        None => {
+            // Query max PK if not provided
+            source.get_max_pk(&table.schema, &table.name, &table.primary_key[0]).await?
+        }
+    };
+
+    // Check if this is already a partitioned job (has min_pk set)
+    // If so, we should NOT do nested parallel reading - just use single reader
+    // The orchestrator's partitioning provides enough parallelism
+    let is_partitioned = job.min_pk.is_some() || job.partition_id.is_some();
+    let actual_num_readers = if is_partitioned { 1 } else { num_readers };
+
+    let ranges = split_pk_range(min_pk, max_pk, actual_num_readers);
+    let actual_readers = ranges.len();
+
+    info!(
+        "{}: starting {} parallel readers for PK range {} to {}{}",
+        table_name, actual_readers, min_pk, max_pk,
+        if is_partitioned { " (partitioned job)" } else { "" }
+    );
+
+    let mut reader_handles = Vec::with_capacity(actual_readers);
+
+    for (reader_id, (range_min, range_max)) in ranges.into_iter().enumerate() {
+        let source = source.clone();
+        let table = job.table.clone();
+        let columns = columns.clone();
+        let col_types = col_types.clone();
+        let tx = tx.clone();
+
+        // For partitioned jobs or resume, use the job's min_pk as starting point
+        let start_pk = if reader_id == 0 {
+            job.resume_from_pk.or(job.min_pk)
+        } else {
+            range_min
+        };
+
+        let handle = tokio::spawn(async move {
+            read_chunk_range(
+                source,
+                table,
+                columns,
+                col_types,
+                start_pk,
+                range_max,
+                chunk_size,
+                reader_id,
+                tx,
+            )
+            .await
+        });
+
+        reader_handles.push(handle);
+    }
+
+    // Wait for all readers to complete
+    let mut total_rows = 0i64;
+    for handle in reader_handles {
+        match handle.await {
+            Ok(Ok(rows)) => total_rows += rows,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(MigrateError::Transfer {
+                    table: table_name.clone(),
+                    message: format!("Reader task panicked: {}", e),
+                })
+            }
+        }
+    }
+
+    info!("{}: all readers finished, total {} rows", table_name, total_rows);
+    Ok(())
+}
+
+/// Read chunks for a specific PK range.
+async fn read_chunk_range(
+    source: Arc<MssqlPool>,
+    table: Table,
+    columns: Vec<String>,
+    col_types: Vec<String>,
+    start_pk: Option<i64>,
+    end_pk: i64,
+    chunk_size: usize,
+    reader_id: usize,
+    tx: mpsc::Sender<RowChunk>,
+) -> Result<i64> {
+    let table_name = table.full_name();
+    let pk_col = &table.primary_key[0];
+
+    let mut last_pk = start_pk;
+    let mut total_rows = 0i64;
+    let mut chunk_num = 0;
+
+    loop {
+        let read_start = Instant::now();
+
+        let (rows, new_last_pk) =
+            read_chunk_keyset_fast(&source, &table, &columns, &col_types, last_pk, Some(end_pk), chunk_size)
+                .await?;
+
+        let read_time = read_start.elapsed();
+        let row_count = rows.len();
+
+        if rows.is_empty() {
+            break;
+        }
+
+        total_rows += row_count as i64;
+        chunk_num += 1;
+
+        debug!(
+            "{} reader {}: read chunk {} with {} rows in {:?}",
+            table_name, reader_id, chunk_num, row_count, read_time
+        );
+
+        let chunk = RowChunk {
+            rows,
+            last_pk: new_last_pk,
+            read_time,
+        };
+
+        if tx.send(chunk).await.is_err() {
+            return Err(MigrateError::Transfer {
+                table: table_name.clone(),
+                message: format!("Reader {}: write channel closed", reader_id),
+            });
+        }
+
+        last_pk = new_last_pk;
+
+        // Check if we've reached end of range
+        if let Some(lpk) = last_pk {
+            if lpk >= end_pk {
+                break;
+            }
+        }
+
+        // If we got fewer rows than chunk_size, we're done
+        if row_count < chunk_size {
+            break;
+        }
+    }
+
+    debug!(
+        "{} reader {}: finished, read {} rows in {} chunks",
+        table_name, reader_id, total_rows, chunk_num
+    );
+
+    Ok(total_rows)
+}
+
+/// Read table data in chunks using single reader (for OFFSET pagination or when parallelism disabled).
 async fn read_table_chunks(
     source: Arc<MssqlPool>,
     job: TransferJob,
     columns: Vec<String>,
+    col_types: Vec<String>,
     chunk_size: usize,
     tx: mpsc::Sender<RowChunk>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
 
-    // Determine starting point
-    let mut last_pk: Option<i64> = job.resume_from_pk.or(job.min_pk);
-    let max_pk = job.max_pk;
-
-    // Check if we can use keyset pagination
     let use_keyset = table.has_single_pk() && is_pk_sortable(table);
 
-    if !use_keyset {
-        warn!(
-            "{}: using OFFSET pagination (slower)",
-            table_name
-        );
-    }
+    let mut last_pk: Option<i64> = job.resume_from_pk.or(job.min_pk);
+    let max_pk = job.max_pk;
 
     let mut total_rows = 0i64;
     let mut chunk_num = 0;
@@ -246,9 +584,9 @@ async fn read_table_chunks(
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
-            read_chunk_keyset(&source, table, &columns, last_pk, max_pk, chunk_size).await?
+            read_chunk_keyset_fast(&source, table, &columns, &col_types, last_pk, max_pk, chunk_size).await?
         } else {
-            read_chunk_offset(&source, table, &columns, total_rows as usize, chunk_size).await?
+            read_chunk_offset(&source, table, &columns, &col_types, total_rows as usize, chunk_size).await?
         };
 
         let read_time = read_start.elapsed();
@@ -268,15 +606,12 @@ async fn read_table_chunks(
         );
 
         let chunk = RowChunk {
-            columns: columns.clone(),
             rows,
             last_pk: new_last_pk,
             read_time,
         };
 
-        // Send chunk to writer (blocks if buffer is full - backpressure)
         if tx.send(chunk).await.is_err() {
-            // Receiver dropped, likely due to error
             return Err(MigrateError::Transfer {
                 table: table_name.clone(),
                 message: "Write channel closed".into(),
@@ -298,21 +633,29 @@ async fn read_table_chunks(
         }
     }
 
-    info!("{}: finished reading {} rows in {} chunks", table_name, total_rows, chunk_num);
+    info!(
+        "{}: finished reading {} rows in {} chunks",
+        table_name, total_rows, chunk_num
+    );
     Ok(())
 }
 
-/// Read a chunk using keyset pagination (WHERE pk > last_pk).
-async fn read_chunk_keyset(
+/// Read a chunk using keyset pagination with pre-computed column types (O(1) lookup).
+async fn read_chunk_keyset_fast(
     source: &MssqlPool,
     table: &Table,
     columns: &[String],
+    col_types: &[String],
     last_pk: Option<i64>,
     max_pk: Option<i64>,
     chunk_size: usize,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
-    let col_list = columns.iter().map(|c| format!("[{}]", c)).collect::<Vec<_>>().join(", ");
+    let col_list = columns
+        .iter()
+        .map(|c| format!("[{}]", c))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let mut query = format!(
         "SELECT TOP {} {} FROM [{}].[{}] WITH (NOLOCK)",
@@ -334,20 +677,18 @@ async fn read_chunk_keyset(
 
     query.push_str(&format!(" ORDER BY [{}]", pk_col));
 
-    let rows = source.query_rows(&query, columns, table).await?;
+    // Use fast query with pre-computed column types
+    let rows = source.query_rows_fast(&query, columns, col_types).await?;
 
     // Get the last PK value from the result
-    // Handle all integer types: bigint, int, smallint, tinyint
+    let pk_idx = columns.iter().position(|c| c == pk_col);
     let new_last_pk = if !rows.is_empty() {
-        let pk_idx = columns.iter().position(|c| c == pk_col);
         pk_idx.and_then(|idx| {
-            rows.last().and_then(|row| {
-                match &row[idx] {
-                    SqlValue::I64(v) => Some(*v),
-                    SqlValue::I32(v) => Some(*v as i64),
-                    SqlValue::I16(v) => Some(*v as i64),
-                    _ => None,
-                }
+            rows.last().and_then(|row| match &row[idx] {
+                SqlValue::I64(v) => Some(*v),
+                SqlValue::I32(v) => Some(*v as i64),
+                SqlValue::I16(v) => Some(*v as i64),
+                _ => None,
             })
         })
     } else {
@@ -362,14 +703,18 @@ async fn read_chunk_offset(
     source: &MssqlPool,
     table: &Table,
     columns: &[String],
+    col_types: &[String],
     offset: usize,
     chunk_size: usize,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
-    let col_list = columns.iter().map(|c| format!("[{}]", c)).collect::<Vec<_>>().join(", ");
+    let col_list = columns
+        .iter()
+        .map(|c| format!("[{}]", c))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     // Create ORDER BY from primary key columns
     let order_by = if table.primary_key.is_empty() {
-        // No PK, try to use first column
         if !columns.is_empty() {
             format!("[{}]", columns[0])
         } else {
@@ -379,7 +724,12 @@ async fn read_chunk_offset(
             });
         }
     } else {
-        table.primary_key.iter().map(|c| format!("[{}]", c)).collect::<Vec<_>>().join(", ")
+        table
+            .primary_key
+            .iter()
+            .map(|c| format!("[{}]", c))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let query = format!(
@@ -387,7 +737,7 @@ async fn read_chunk_offset(
         col_list, table.schema, table.name, order_by, offset, chunk_size
     );
 
-    let rows = source.query_rows(&query, columns, table).await?;
+    let rows = source.query_rows_fast(&query, columns, col_types).await?;
     Ok((rows, None))
 }
 
