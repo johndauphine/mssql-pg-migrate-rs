@@ -5,8 +5,10 @@ use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use bytes::{BufMut, BytesMut};
+use futures::SinkExt;
 use tokio_postgres::{types::ToSql, Config as PgConfig, NoTls};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Trait for target database operations.
 #[async_trait]
@@ -725,8 +727,7 @@ impl TargetPool for PgPool {
 }
 
 impl PgPool {
-    /// Insert rows using batched INSERT statements with literal values.
-    /// Uses simple_query to avoid parameter type validation issues.
+    /// Insert rows using PostgreSQL COPY protocol for maximum performance.
     async fn insert_batch(
         &self,
         schema: &str,
@@ -744,44 +745,65 @@ impl PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        // Batch size based on reasonable SQL statement size
-        const BATCH_SIZE: usize = 1000;
+        // Build column list
+        let col_list: String = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        let mut total = 0u64;
+        // COPY statement with text format
+        let copy_stmt = format!(
+            "COPY \"{}\".\"{}\" ({}) FROM STDIN WITH (FORMAT text)",
+            schema, table, col_list
+        );
 
-        for chunk in rows.chunks(BATCH_SIZE) {
-            let sql = build_insert_sql_literals(schema, table, cols, chunk);
+        let sink = client
+            .copy_in(&copy_stmt)
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
 
-            match client.simple_query(&sql).await {
-                Ok(_) => {}
-                Err(e) => {
-                    // Log details about the failing row
-                    if let Some(first_row) = chunk.first() {
-                        let row_preview: Vec<String> = first_row
-                            .iter()
-                            .take(5)
-                            .map(|v| format!("{:?}", v))
-                            .collect();
-                        tracing::error!(
-                            "Insert failed for {}.{}: {} - first row preview: {:?}",
-                            schema,
-                            table,
-                            e,
-                            row_preview
-                        );
-                    }
-                    return Err(MigrateError::Target(e));
+        futures::pin_mut!(sink);
+
+        // Build data in chunks to avoid huge memory allocation
+        const CHUNK_SIZE: usize = 10000;
+        let mut buf = BytesMut::with_capacity(1024 * 1024); // 1MB buffer
+        let row_count = rows.len();
+
+        for (i, row) in rows.into_iter().enumerate() {
+            // Build tab-separated line
+            for (j, value) in row.iter().enumerate() {
+                if j > 0 {
+                    buf.put_u8(b'\t');
                 }
+                let text = sql_value_to_copy_text(value);
+                buf.extend_from_slice(text.as_bytes());
             }
+            buf.put_u8(b'\n');
 
-            total += chunk.len() as u64;
+            // Flush buffer periodically
+            if (i + 1) % CHUNK_SIZE == 0 || i + 1 == row_count {
+                sink.send(buf.split().freeze())
+                    .await
+                    .map_err(|e| MigrateError::Transfer {
+                        table: format!("{}.{}", schema, table),
+                        message: format!("COPY send failed: {}", e),
+                    })?;
+            }
         }
 
-        Ok(total)
+        // Finalize COPY
+        let copied = sink
+            .finish()
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        Ok(copied)
     }
 }
 
 /// Convert SqlValue to text format for COPY.
+/// Escapes special characters: backslash, tab, newline, carriage return.
 fn sql_value_to_copy_text(value: &SqlValue) -> String {
     match value {
         SqlValue::Null(_) => "\\N".to_string(),
@@ -791,15 +813,30 @@ fn sql_value_to_copy_text(value: &SqlValue) -> String {
         SqlValue::I64(n) => n.to_string(),
         SqlValue::F32(n) => n.to_string(),
         SqlValue::F64(n) => n.to_string(),
-        SqlValue::String(s) => s.replace('\t', "\\t").replace('\n', "\\n"),
-        SqlValue::Bytes(b) => format!("\\x{}", hex::encode(b)),
+        SqlValue::String(s) => escape_copy_text(s),
+        SqlValue::Bytes(b) => format!("\\\\x{}", hex::encode(b)),
         SqlValue::Uuid(u) => u.to_string(),
         SqlValue::Decimal(d) => d.to_string(),
-        SqlValue::DateTime(dt) => dt.to_string(),
+        SqlValue::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
         SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
         SqlValue::Date(d) => d.to_string(),
         SqlValue::Time(t) => t.to_string(),
     }
+}
+
+/// Escape special characters for COPY text format.
+fn escape_copy_text(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => result.push_str("\\\\"),
+            '\t' => result.push_str("\\t"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            _ => result.push(c),
+        }
+    }
+    result
 }
 /// Escape a string for SQL literal use.
 fn escape_sql_string(s: &str) -> String {

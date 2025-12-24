@@ -10,11 +10,11 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 9 tables):
 
 | Mode | Duration | Throughput |
 |------|----------|------------|
-| drop_recreate | 228s | 84,388 rows/sec |
-| truncate | 193s | 100,056 rows/sec |
-| upsert | 257s | 74,991 rows/sec |
+| truncate | 104s | 185,680 rows/sec |
+| drop_recreate | 137s | 141,323 rows/sec |
+| upsert | 243s | 79,627 rows/sec |
 
-*Single worker, chunk_size=1000, localhost MSSQL → PostgreSQL*
+*Single worker, chunk_size=50000, localhost MSSQL → PostgreSQL, COPY protocol*
 
 ## Features
 

@@ -24,35 +24,50 @@
 
 ## Results
 
-### Single Worker (workers=1, chunk_size=1000)
+### Single Worker (workers=1, chunk_size=50000)
 
 | Mode | Duration | Throughput | Notes |
 |------|----------|------------|-------|
-| drop_recreate | 228.8s | 84,388 rows/sec | Full schema recreation |
-| truncate | 193.0s | 100,056 rows/sec | Fastest - no DDL overhead |
-| upsert | 257.5s | 74,991 rows/sec | ON CONFLICT overhead |
+| truncate | 104s | 185,680 rows/sec | Fastest - COPY protocol, no DDL |
+| drop_recreate | 136.6s | 141,323 rows/sec | COPY protocol + table creation |
+| upsert | 242.5s | 79,627 rows/sec | INSERT...ON CONFLICT overhead |
+
+### Key Implementation Details
+
+- **COPY Protocol:** `truncate` and `drop_recreate` use PostgreSQL COPY protocol for bulk inserts
+- **Upsert:** Uses `INSERT...ON CONFLICT DO UPDATE` (COPY doesn't support upsert semantics)
+- **Read-ahead pipeline:** Concurrent reading/writing with tokio channels
 
 ### Observations
 
-1. **truncate is fastest** - No DDL operations, just TRUNCATE + INSERT
-2. **drop_recreate** - Includes table creation time
-3. **upsert is slowest** - ON CONFLICT DO UPDATE adds overhead for change detection
+1. **truncate is fastest** - No DDL operations, just TRUNCATE + COPY
+2. **drop_recreate** - Includes table creation time, still very fast with COPY
+3. **upsert is slowest** - ON CONFLICT DO UPDATE adds significant overhead for change detection
 
 ### Resource Usage
 
-- CPU: ~46-60% utilization (single-threaded migration)
+- CPU: ~45-100% utilization (single-threaded migration)
 - Memory: Minimal (~50MB resident)
 - Network: Localhost, no network bottleneck
+
+## Comparison with Go Implementation
+
+The Rust implementation achieves comparable or better performance:
+
+| Mode | Go (rows/sec) | Rust (rows/sec) | Notes |
+|------|---------------|-----------------|-------|
+| truncate | ~180K | 185K | Comparable |
+| drop_recreate | ~140K | 141K | Comparable |
+| upsert | ~75K | 80K | Comparable |
 
 ## Bottlenecks
 
 1. **Single connection:** Currently uses single source/target connection per table
-2. **SQL literals:** Using INSERT with literals instead of COPY protocol
+2. **Upsert limitation:** Cannot use COPY protocol for upsert operations
 3. **Sequential tables:** Tables processed one at a time (workers=1)
 
 ## Future Optimizations
 
-- [ ] Implement PostgreSQL COPY protocol for bulk inserts
 - [ ] Parallel table processing with multiple workers
 - [ ] Connection pooling for concurrent reads
-- [ ] Binary protocol for reduced serialization overhead
+- [ ] Binary COPY format for reduced serialization overhead
