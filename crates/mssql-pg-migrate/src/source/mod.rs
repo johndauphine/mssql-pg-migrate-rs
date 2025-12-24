@@ -282,11 +282,21 @@ impl MssqlPool {
         _columns: &[String],
         col_types: &[String],
     ) -> Result<Vec<Vec<SqlValue>>> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
         let mut client = self.get_client().await?;
+        let t_conn = t0.elapsed();
 
+        let t1 = Instant::now();
         let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let t_query = t1.elapsed();
 
+        let t2 = Instant::now();
+        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let t_fetch = t2.elapsed();
+
+        let t3 = Instant::now();
         let mut result = Vec::with_capacity(rows.len());
 
         for row in rows {
@@ -299,6 +309,15 @@ impl MssqlPool {
             }
 
             result.push(values);
+        }
+        let t_convert = t3.elapsed();
+
+        // Log timing breakdown for chunks with significant data
+        if result.len() > 1000 {
+            debug!(
+                "PROFILE read: {} rows - conn={:?}, query={:?}, fetch={:?}, convert={:?}",
+                result.len(), t_conn, t_query, t_fetch, t_convert
+            );
         }
 
         Ok(result)

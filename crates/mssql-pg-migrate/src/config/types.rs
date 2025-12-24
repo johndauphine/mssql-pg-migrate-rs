@@ -67,9 +67,9 @@ pub struct TableStats {
 }
 
 impl Config {
-    /// Apply auto-tuned defaults based on system resources.
+    /// Apply initial auto-tuned defaults based on system resources.
     /// Only fills in values that weren't explicitly set in the config file.
-    /// Uses a fixed estimate of 500 bytes per row.
+    /// Uses a default estimated row size (500 bytes) before actual table statistics are available.
     pub fn with_auto_tuning(mut self) -> Self {
         let resources = SystemResources::detect();
         resources.log();
@@ -84,9 +84,14 @@ impl Config {
         resources.log();
 
         // Calculate weighted average row size based on total data volume
-        let total_rows: i64 = tables.iter().map(|t| t.row_count).sum();
-        let total_bytes: i64 = tables.iter()
-            .map(|t| t.row_count * t.estimated_row_size)
+        // Use u128 to avoid overflow with large datasets
+        let total_rows: u128 = tables
+            .iter()
+            .map(|t| t.row_count.max(0) as u128)
+            .sum();
+        let total_bytes: u128 = tables
+            .iter()
+            .map(|t| (t.row_count.max(0) as u128) * (t.estimated_row_size.max(0) as u128))
             .sum();
 
         let avg_row_size = if total_rows > 0 {
@@ -262,10 +267,13 @@ fn default_memory_budget_percent() -> u8 {
 /// Estimated bytes per row for buffer calculations (conservative estimate)
 const ESTIMATED_BYTES_PER_ROW: usize = 500;
 
+/// Safety factor for memory calculations (2x headroom for overhead)
+const MEMORY_SAFETY_FACTOR: usize = 2;
+
 impl MigrationConfig {
     /// Apply auto-tuned defaults based on system resources.
     /// Only fills in values that are None (not explicitly set).
-    /// Memory usage is constrained to 70% of available RAM.
+    /// Memory usage is constrained to a configurable percentage of available RAM (default 70%).
     ///
     /// If `actual_row_size` is provided, it will be used instead of the default estimate.
     /// This should be the weighted average row size calculated from actual table metadata.
@@ -273,18 +281,27 @@ impl MigrationConfig {
         let ram_gb = resources.total_memory_gb;
         let cores = resources.cpu_cores;
 
-        // Use actual row size if provided, otherwise use conservative estimate
-        let bytes_per_row = actual_row_size.unwrap_or(ESTIMATED_BYTES_PER_ROW);
+        // Use actual row size if provided, otherwise use conservative estimate.
+        // Ensure bytes_per_row is at least 1 to prevent division by zero.
+        let bytes_per_row = actual_row_size.unwrap_or(ESTIMATED_BYTES_PER_ROW).max(1);
 
-        // Calculate memory budget based on configured percentage of available RAM
-        let memory_budget_pct = self.memory_budget_percent as f64 / 100.0;
+        // Calculate memory budget based on configured percentage of available RAM.
+        // Clamp to valid range [1, 100] to prevent division by zero or excessive memory usage.
+        let clamped_percent = self.memory_budget_percent.clamp(1, 100);
+        if clamped_percent != self.memory_budget_percent {
+            info!(
+                "Adjusted memory_budget_percent from {} to {} (must be between 1 and 100)",
+                self.memory_budget_percent, clamped_percent
+            );
+        }
+        let memory_budget_pct = clamped_percent as f64 / 100.0;
         let memory_budget_bytes = (resources.total_memory_bytes as f64 * memory_budget_pct) as usize;
         let memory_budget_mb = memory_budget_bytes / (1024 * 1024);
 
         info!(
             "Memory budget: {} MB ({}% of {:.1} GB available), row size estimate: {} bytes",
             memory_budget_mb,
-            self.memory_budget_percent,
+            clamped_percent,
             ram_gb,
             bytes_per_row
         );
@@ -326,7 +343,7 @@ impl MigrationConfig {
         let desired_read_ahead = ((ram_gb / 4.0) as usize).max(4).min(32);
 
         // Calculate max chunk size that fits in memory budget
-        let max_chunk_from_memory = memory_budget_bytes / (bytes_per_row * desired_read_ahead * workers * 2);
+        let max_chunk_from_memory = memory_budget_bytes / (bytes_per_row * desired_read_ahead * workers * MEMORY_SAFETY_FACTOR);
         let max_chunk_from_memory = max_chunk_from_memory.max(10_000); // Minimum viable chunk size
 
         // Chunk size: scale with RAM but respect memory budget
@@ -340,7 +357,7 @@ impl MigrationConfig {
         if self.read_ahead_buffers.is_none() {
             let chunk_size = self.chunk_size.unwrap();
             // Recalculate max read-ahead based on actual chunk size
-            let max_read_ahead_from_memory = memory_budget_bytes / (bytes_per_row * chunk_size * workers * 2);
+            let max_read_ahead_from_memory = memory_budget_bytes / (bytes_per_row * chunk_size * workers * MEMORY_SAFETY_FACTOR);
             let buffers = desired_read_ahead.min(max_read_ahead_from_memory).max(2).min(32);
             self.read_ahead_buffers = Some(buffers);
         }

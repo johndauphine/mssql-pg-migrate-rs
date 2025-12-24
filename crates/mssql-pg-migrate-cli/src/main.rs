@@ -69,8 +69,9 @@ async fn main() -> Result<()> {
     // Setup logging
     setup_logging(&cli.verbosity, &cli.log_format)?;
 
-    // Load configuration (auto-tuning will be applied after schema extraction)
-    let mut config = Config::load(&cli.config)?;
+    // Load configuration with initial auto-tuning for connection pool sizes.
+    // Will be re-tuned after schema extraction with actual row sizes.
+    let mut config = Config::load(&cli.config)?.with_auto_tuning();
     info!("Loaded configuration from {:?}", cli.config);
 
     // Setup cancellation

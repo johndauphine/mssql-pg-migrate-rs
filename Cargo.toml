@@ -15,7 +15,7 @@ authors = ["John Dauphine <jdauphine@gmail.com>"]
 tokio = { version = "1.40", features = ["full"] }
 
 # MSSQL driver (pure Rust with rustls)
-tiberius = { version = "0.12", default-features = false, features = ["chrono"] }
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # PostgreSQL driver

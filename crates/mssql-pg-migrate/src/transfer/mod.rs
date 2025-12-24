@@ -205,8 +205,6 @@ impl TransferEngine {
             let columns_clone = columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
-            let rows_transferred = Arc::new(AtomicI64::new(0));
-            let rows_transferred_clone = rows_transferred.clone();
 
             let handle = tokio::spawn(async move {
                 let mut local_write_time = Duration::ZERO;
@@ -244,7 +242,6 @@ impl TransferEngine {
 
                     local_write_time += write_start.elapsed();
                     local_rows += row_count;
-                    rows_transferred_clone.fetch_add(row_count, Ordering::Relaxed);
 
                     debug!(
                         "Writer {}: wrote {} rows (local total: {})",
@@ -255,7 +252,7 @@ impl TransferEngine {
                 Ok::<(Duration, i64), MigrateError>((local_write_time, local_rows))
             });
 
-            writer_handles.push((handle, rows_transferred));
+            writer_handles.push(handle);
         }
 
         // Drop our copy of write_rx so channel closes when all writers are done
@@ -270,7 +267,13 @@ impl TransferEngine {
 
         while let Some(chunk) = read_rx.recv().await {
             total_query_time += chunk.read_time;
-            last_pk = chunk.last_pk.or(last_pk);
+            // With parallel readers, chunks may arrive out of order.
+            // For resume safety, track the minimum PK processed so far.
+            last_pk = match (last_pk, chunk.last_pk) {
+                (None, pk) => pk,
+                (pk, None) => pk,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
 
             let write_job = WriteJob {
                 rows: chunk.rows,
@@ -300,13 +303,17 @@ impl TransferEngine {
         }
 
         // Wait for all writers and aggregate stats
+        // Writers run in parallel, so wall-clock write time is approximated
+        // by the maximum per-writer duration, not the sum.
         let mut total_write_time = Duration::ZERO;
         let mut total_rows = 0i64;
 
-        for (handle, _rows_counter) in writer_handles {
+        for handle in writer_handles {
             match handle.await {
                 Ok(Ok((write_time, rows))) => {
-                    total_write_time += write_time;
+                    if write_time > total_write_time {
+                        total_write_time = write_time;
+                    }
                     total_rows += rows;
                 }
                 Ok(Err(e)) => return Err(e),
@@ -355,26 +362,25 @@ impl TransferEngine {
 }
 
 /// Split a PK range into N sub-ranges for parallel reading.
+/// Each reader gets an explicit lower bound derived from min_pk to prevent data duplication.
 fn split_pk_range(min_pk: i64, max_pk: i64, num_readers: usize) -> Vec<(Option<i64>, i64)> {
     if num_readers <= 1 || max_pk <= min_pk {
-        return vec![(None, max_pk)];
+        // Single reader or invalid range: use explicit min_pk bound
+        return vec![(Some(min_pk), max_pk)];
     }
 
     let total_range = max_pk - min_pk;
     let range_size = total_range / num_readers as i64;
 
     if range_size < 1 {
-        // Range too small to split
-        return vec![(None, max_pk)];
+        // Range too small to split: use a single bounded range
+        return vec![(Some(min_pk), max_pk)];
     }
 
     (0..num_readers)
         .map(|i| {
-            let range_min = if i == 0 {
-                None // First reader starts from beginning
-            } else {
-                Some(min_pk + (i as i64 * range_size))
-            };
+            // Each reader has an explicit lower bound derived from min_pk
+            let range_min = Some(min_pk + (i as i64 * range_size));
             let range_max = if i == num_readers - 1 {
                 max_pk // Last reader goes to the end
             } else {

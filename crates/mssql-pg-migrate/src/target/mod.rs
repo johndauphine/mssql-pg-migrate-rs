@@ -854,11 +854,17 @@ impl PgPool {
         cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
+        use std::time::Instant;
+
+        let row_count = rows.len();
+        let t0 = Instant::now();
+
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
+        let t_conn = t0.elapsed();
 
         // Build column list
         let col_list: String = cols
@@ -873,10 +879,12 @@ impl PgPool {
             schema, table, col_list
         );
 
+        let t1 = Instant::now();
         let sink = client
             .copy_in(&copy_stmt)
             .await
             .map_err(|e| MigrateError::Target(e))?;
+        let t_copy_init = t1.elapsed();
 
         futures::pin_mut!(sink);
 
@@ -894,7 +902,12 @@ impl PgPool {
 
         let num_cols = cols.len() as i16;
 
+        let t2 = Instant::now();
+        let mut serialize_time = std::time::Duration::ZERO;
+        let mut send_time = std::time::Duration::ZERO;
+
         for (i, row) in rows.into_iter().enumerate() {
+            let ts = Instant::now();
             // Field count (16-bit)
             buf.put_i16(num_cols);
 
@@ -902,22 +915,27 @@ impl PgPool {
             for value in row.iter() {
                 write_binary_value(&mut buf, value);
             }
+            serialize_time += ts.elapsed();
 
             // Flush buffer periodically (including header on first flush)
             if (i + 1) % copy_buffer_rows == 0 {
+                let tsend = Instant::now();
                 sink.send(buf.split().freeze())
                     .await
                     .map_err(|e| MigrateError::Transfer {
                         table: format!("{}.{}", schema, table),
                         message: format!("Binary COPY send failed: {}", e),
                     })?;
+                send_time += tsend.elapsed();
             }
         }
+        let t_loop = t2.elapsed();
 
         // Write trailer: -1 as 16-bit signed integer
         buf.put_i16(-1);
 
         // Send remaining data
+        let t3 = Instant::now();
         if !buf.is_empty() {
             sink.send(buf.freeze())
                 .await
@@ -932,6 +950,15 @@ impl PgPool {
             .finish()
             .await
             .map_err(|e| MigrateError::Target(e))?;
+        let t_finish = t3.elapsed();
+
+        // Log timing breakdown for chunks with significant data
+        if row_count > 1000 {
+            debug!(
+                "PROFILE write: {} rows - conn={:?}, copy_init={:?}, serialize={:?}, send={:?}, finish={:?}",
+                row_count, t_conn, t_copy_init, serialize_time, send_time, t_finish
+            );
+        }
 
         Ok(copied)
     }
