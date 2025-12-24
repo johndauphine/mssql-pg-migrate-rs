@@ -315,7 +315,7 @@ async fn read_chunk_keyset(
     let col_list = columns.iter().map(|c| format!("[{}]", c)).collect::<Vec<_>>().join(", ");
 
     let mut query = format!(
-        "SELECT TOP {} {} FROM [{}].[{}]",
+        "SELECT TOP {} {} FROM [{}].[{}] WITH (NOLOCK)",
         chunk_size, col_list, table.schema, table.name
     );
 
@@ -337,6 +337,7 @@ async fn read_chunk_keyset(
     let rows = source.query_rows(&query, columns, table).await?;
 
     // Get the last PK value from the result
+    // Handle all integer types: bigint, int, smallint, tinyint
     let new_last_pk = if !rows.is_empty() {
         let pk_idx = columns.iter().position(|c| c == pk_col);
         pk_idx.and_then(|idx| {
@@ -344,6 +345,7 @@ async fn read_chunk_keyset(
                 match &row[idx] {
                     SqlValue::I64(v) => Some(*v),
                     SqlValue::I32(v) => Some(*v as i64),
+                    SqlValue::I16(v) => Some(*v as i64),
                     _ => None,
                 }
             })
@@ -381,7 +383,7 @@ async fn read_chunk_offset(
     };
 
     let query = format!(
-        "SELECT {} FROM [{}].[{}] ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+        "SELECT {} FROM [{}].[{}] WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
         col_list, table.schema, table.name, order_by, offset, chunk_size
     );
 

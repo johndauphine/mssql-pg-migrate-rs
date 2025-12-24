@@ -383,12 +383,13 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use NTILE to split into partitions - CAST all to BIGINT for consistent types
+        // Use NOLOCK to avoid blocking and improve performance
         let query = format!(
             r#"
             WITH numbered AS (
                 SELECT CAST([{pk}] AS BIGINT) AS pk_val,
                        NTILE({n}) OVER (ORDER BY [{pk}]) as partition_id
-                FROM [{schema}].[{table}]
+                FROM [{schema}].[{table}] WITH (NOLOCK)
             )
             SELECT CAST(partition_id AS BIGINT) AS partition_id,
                    MIN(pk_val) as min_pk,
@@ -601,18 +602,18 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // CAST to BIGINT for consistent type handling
+        // Use NOLOCK to avoid blocking and improve performance
         let query = format!(
-            "SELECT CAST(COUNT(*) AS BIGINT) FROM [{}].[{}]",
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
             schema, table
         );
 
         let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
         let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
 
-        // SQL Server COUNT(*) returns int (i32), so get as i32 and convert to i64
+        // We CAST to BIGINT in the query, so get as i64 directly
         Ok(row
-            .and_then(|r| r.get::<i32, _>(0))
-            .map(|v| v as i64)
+            .and_then(|r| r.get::<i64, _>(0))
             .unwrap_or(0))
     }
 
