@@ -6,7 +6,6 @@ use crate::state::MigrationState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Migration orchestrator.

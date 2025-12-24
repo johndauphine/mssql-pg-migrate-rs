@@ -5,7 +5,7 @@ mod validation;
 
 pub use types::*;
 
-use crate::error::{MigrateError, Result};
+use crate::error::Result;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
