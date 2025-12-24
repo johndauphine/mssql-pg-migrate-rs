@@ -36,7 +36,7 @@ pub mod transfer;
 pub mod typemap;
 
 // Re-exports for convenient access
-pub use config::{Config, MigrationConfig, SourceConfig, TargetConfig, TargetMode};
+pub use config::{Config, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode};
 pub use error::{MigrateError, Result};
 pub use orchestrator::{MigrationResult, Orchestrator};
 pub use source::{MssqlPool, Table};

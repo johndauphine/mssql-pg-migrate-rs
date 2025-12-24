@@ -1,6 +1,6 @@
 //! Migration orchestrator - main workflow coordinator.
 
-use crate::config::{Config, TargetMode};
+use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, SourcePool, Table};
 use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
@@ -142,6 +142,16 @@ impl Orchestrator {
         }
 
         info!("Found {} tables to migrate", tables.len());
+
+        // Apply auto-tuning now that we know actual table sizes
+        let table_stats: Vec<TableStats> = tables.iter()
+            .map(|t| TableStats {
+                name: t.full_name(),
+                row_count: t.row_count,
+                estimated_row_size: t.estimated_row_size,
+            })
+            .collect();
+        self.config.apply_auto_tuning_from_tables(&table_stats);
 
         // Initialize or update state
         let mut state = self.state.take().unwrap_or_else(|| {
@@ -345,6 +355,8 @@ impl Orchestrator {
         let transfer_config = TransferConfig {
             chunk_size: self.config.migration.get_chunk_size(),
             read_ahead: self.config.migration.get_read_ahead_buffers(),
+            parallel_readers: self.config.migration.get_parallel_readers(),
+            parallel_writers: self.config.migration.get_write_ahead_writers(),
         };
 
         let engine = Arc::new(TransferEngine::new(

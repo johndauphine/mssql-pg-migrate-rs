@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     // Setup logging
     setup_logging(&cli.verbosity, &cli.log_format)?;
 
-    // Load configuration and apply auto-tuning
-    let mut config = Config::load(&cli.config)?.with_auto_tuning();
+    // Load configuration (auto-tuning will be applied after schema extraction)
+    let mut config = Config::load(&cli.config)?;
     info!("Loaded configuration from {:?}", cli.config);
 
     // Setup cancellation

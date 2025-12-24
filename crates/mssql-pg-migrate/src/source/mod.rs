@@ -242,6 +242,7 @@ impl MssqlPool {
     }
 
     /// Query rows from the database and convert to SqlValue.
+    /// Note: This method does O(n) lookup per column per row. Use query_rows_fast for better performance.
     pub async fn query_rows(
         &self,
         sql: &str,
@@ -271,6 +272,51 @@ impl MssqlPool {
         }
 
         Ok(result)
+    }
+
+    /// Query rows with pre-computed column types for O(1) lookup per value.
+    /// This is the high-performance version used by the parallel transfer engine.
+    pub async fn query_rows_fast(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        let mut client = self.get_client().await?;
+
+        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
+        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+
+            // O(1) lookup using pre-computed column types array
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = convert_row_value(&row, idx, data_type);
+                values.push(value);
+            }
+
+            result.push(values);
+        }
+
+        Ok(result)
+    }
+
+    /// Get the maximum primary key value for a table.
+    pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let query = format!(
+            "SELECT CAST(MAX([{}]) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
+            pk_col, schema, table
+        );
+
+        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
+        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+
+        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
 
     /// Load row count for a table (fast approximate from sys.partitions).
