@@ -39,4 +39,7 @@ pub mod typemap;
 pub use config::{Config, MigrationConfig, SourceConfig, TargetConfig, TargetMode};
 pub use error::{MigrateError, Result};
 pub use orchestrator::{MigrationResult, Orchestrator};
+pub use source::{MssqlPool, Table};
 pub use state::MigrationState;
+pub use target::{PgPool, SqlValue};
+pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};

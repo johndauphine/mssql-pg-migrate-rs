@@ -35,6 +35,7 @@ pub enum RunStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 /// Per-table state.
@@ -163,6 +164,19 @@ impl MigrationState {
 }
 
 impl TableState {
+    /// Create a new table state.
+    pub fn new(rows_total: i64) -> Self {
+        Self {
+            status: TaskStatus::Pending,
+            rows_total,
+            rows_transferred: 0,
+            last_pk: None,
+            partitions: None,
+            completed_at: None,
+            error: None,
+        }
+    }
+
     /// Mark the table as in progress.
     pub fn mark_in_progress(&mut self) {
         self.status = TaskStatus::InProgress;
