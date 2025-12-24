@@ -248,10 +248,16 @@ pub struct MigrationConfig {
     /// Rows per upsert batch statement. Auto-tuned based on RAM if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upsert_batch_size: Option<usize>,
+
+    /// Memory budget as percentage of available RAM (default: 70).
+    /// Auto-tuning will constrain buffer sizes to stay within this limit.
+    #[serde(default = "default_memory_budget_percent")]
+    pub memory_budget_percent: u8,
 }
 
-/// Memory usage target: 70% of available RAM
-const MEMORY_BUDGET_PERCENT: f64 = 0.70;
+fn default_memory_budget_percent() -> u8 {
+    70
+}
 
 /// Estimated bytes per row for buffer calculations (conservative estimate)
 const ESTIMATED_BYTES_PER_ROW: usize = 500;
@@ -270,13 +276,15 @@ impl MigrationConfig {
         // Use actual row size if provided, otherwise use conservative estimate
         let bytes_per_row = actual_row_size.unwrap_or(ESTIMATED_BYTES_PER_ROW);
 
-        // Calculate memory budget (70% of available RAM)
-        let memory_budget_bytes = (resources.total_memory_bytes as f64 * MEMORY_BUDGET_PERCENT) as usize;
+        // Calculate memory budget based on configured percentage of available RAM
+        let memory_budget_pct = self.memory_budget_percent as f64 / 100.0;
+        let memory_budget_bytes = (resources.total_memory_bytes as f64 * memory_budget_pct) as usize;
         let memory_budget_mb = memory_budget_bytes / (1024 * 1024);
 
         info!(
-            "Memory budget: {} MB (70% of {:.1} GB available), row size estimate: {} bytes",
+            "Memory budget: {} MB ({}% of {:.1} GB available), row size estimate: {} bytes",
             memory_budget_mb,
+            self.memory_budget_percent,
             ram_gb,
             bytes_per_row
         );
