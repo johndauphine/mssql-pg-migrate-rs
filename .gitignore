@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock (include for binaries, exclude for libraries)
+# We're a workspace with both, so include it
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Config files with secrets
+config.yaml
+!examples/config.yaml
+
+# State files
+*.state
+*.state.tmp
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

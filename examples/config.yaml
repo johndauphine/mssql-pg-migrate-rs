@@ -1,0 +1,44 @@
+# Example configuration for mssql-pg-migrate
+# Copy this file and customize for your environment
+
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: SourceDB
+  user: sa
+  password: YourStrong@Passw0rd
+  schema: dbo
+  encrypt: "false"
+  trust_server_cert: true
+
+target:
+  type: postgres
+  host: localhost
+  port: 5432
+  database: target_db
+  user: postgres
+  password: postgres
+  schema: public
+  ssl_mode: disable
+
+migration:
+  # Target mode: drop_recreate, truncate, or upsert
+  target_mode: drop_recreate
+
+  # Performance tuning (auto-tuned by default)
+  # workers: 4
+  # chunk_size: 100000
+
+  # Table filtering (glob patterns)
+  # include_tables:
+  #   - "users"
+  #   - "orders_*"
+  # exclude_tables:
+  #   - "*_backup"
+  #   - "tmp_*"
+
+  # Constraint creation
+  create_indexes: true
+  create_foreign_keys: true
+  create_check_constraints: true

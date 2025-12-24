@@ -1,0 +1,62 @@
+[package]
+name = "mssql-pg-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "High-performance MSSQL to PostgreSQL migration library"
+keywords = ["mssql", "postgresql", "migration", "database", "etl"]
+categories = ["database", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# MSSQL driver
+tiberius = { workspace = true }
+tokio-util = { workspace = true }
+
+# PostgreSQL driver
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+postgres-types = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+
+# UUID handling
+uuid = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Decimal handling
+rust_decimal = { workspace = true }
+
+# Bytes handling
+bytes = { workspace = true }
+
+# Hashing for config validation
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+tracing-subscriber = { workspace = true }
