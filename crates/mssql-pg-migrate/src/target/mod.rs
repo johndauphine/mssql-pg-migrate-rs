@@ -92,7 +92,7 @@ pub trait TargetPool: Send + Sync {
 /// SQL value enum for type-safe row handling.
 #[derive(Debug, Clone)]
 pub enum SqlValue {
-    Null,
+    Null(SqlNullType),
     Bool(bool),
     I16(i16),
     I32(i32),
@@ -107,6 +107,25 @@ pub enum SqlValue {
     DateTimeOffset(chrono::DateTime<chrono::FixedOffset>),
     Date(chrono::NaiveDate),
     Time(chrono::NaiveTime),
+}
+
+/// Type hint for NULL values to ensure correct PostgreSQL encoding.
+#[derive(Debug, Clone, Copy)]
+pub enum SqlNullType {
+    Bool,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+    String,
+    Bytes,
+    Uuid,
+    Decimal,
+    DateTime,
+    DateTimeOffset,
+    Date,
+    Time,
 }
 
 /// PostgreSQL target pool implementation.
@@ -560,9 +579,9 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        // Get max value
+        // Get max value (cast to bigint for consistent type)
         let sql = format!(
-            "SELECT COALESCE(MAX({}), 0) FROM {}",
+            "SELECT COALESCE(MAX({})::bigint, 0) FROM {}",
             Self::quote_ident(&identity_col.name),
             Self::qualify_table(schema, &table.name)
         );
@@ -633,47 +652,8 @@ impl TargetPool for PgPool {
             return Ok(0);
         }
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
-
-        // Build column list
-        let col_list: String = cols.iter().map(|c| Self::quote_ident(c)).collect::<Vec<_>>().join(", ");
-
-        // Use COPY for bulk insert (text format for simplicity)
-        let copy_stmt = format!(
-            "COPY {}.\"{}\" ({}) FROM STDIN",
-            Self::quote_ident(schema),
-            table,
-            col_list
-        );
-
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
-
-        let writer = tokio_postgres::binary_copy::BinaryCopyInWriter::new(
-            sink,
-            &[], // Will use text format instead
-        );
-
-        // For simplicity, we'll use a text-based COPY
-        // In production, use binary format for better performance
-        let mut data = String::new();
-        for row in &rows {
-            let values: Vec<String> = row.iter().map(|v| sql_value_to_copy_text(v)).collect();
-            data.push_str(&values.join("\t"));
-            data.push('\n');
-        }
-
-        // Actually, let's use simple INSERT for now (COPY requires more complex handling)
-        // TODO: Implement proper COPY protocol for performance
-        drop(writer);
-
-        // Use batched INSERT instead
+        // Use batched INSERT statements
+        // TODO: Implement COPY protocol for better performance
         let count = self.insert_batch(schema, table, cols, rows).await?;
         Ok(count)
     }
@@ -700,25 +680,34 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        // PostgreSQL has a limit of ~65535 parameters per query
-        const MAX_PARAMS: usize = 65000;
-        let batch_size = MAX_PARAMS / cols.len();
-        let batch_size = batch_size.max(1).min(rows.len());
+        // Batch size based on reasonable SQL statement size
+        const BATCH_SIZE: usize = 1000;
 
         let mut total = 0u64;
 
-        for chunk in rows.chunks(batch_size) {
-            let (sql, params) = build_upsert_sql(schema, table, cols, pk_cols, chunk);
+        for chunk in rows.chunks(BATCH_SIZE) {
+            let sql = build_upsert_sql_literals(schema, table, cols, pk_cols, chunk);
 
-            let params_refs: Vec<&(dyn ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-                .collect();
-
-            client
-                .execute(&sql, &params_refs)
-                .await
-                .map_err(|e| MigrateError::Target(e))?;
+            match client.simple_query(&sql).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if let Some(first_row) = chunk.first() {
+                        let row_preview: Vec<String> = first_row
+                            .iter()
+                            .take(5)
+                            .map(|v| format!("{:?}", v))
+                            .collect();
+                        tracing::error!(
+                            "Upsert failed for {}.{}: {} - first row preview: {:?}",
+                            schema,
+                            table,
+                            e,
+                            row_preview
+                        );
+                    }
+                    return Err(MigrateError::Target(e));
+                }
+            }
 
             total += chunk.len() as u64;
         }
@@ -736,7 +725,8 @@ impl TargetPool for PgPool {
 }
 
 impl PgPool {
-    /// Insert rows using batched INSERT statements.
+    /// Insert rows using batched INSERT statements with literal values.
+    /// Uses simple_query to avoid parameter type validation issues.
     async fn insert_batch(
         &self,
         schema: &str,
@@ -754,24 +744,35 @@ impl PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        const MAX_PARAMS: usize = 65000;
-        let batch_size = MAX_PARAMS / cols.len();
-        let batch_size = batch_size.max(1).min(rows.len());
+        // Batch size based on reasonable SQL statement size
+        const BATCH_SIZE: usize = 1000;
 
         let mut total = 0u64;
 
-        for chunk in rows.chunks(batch_size) {
-            let (sql, params) = build_insert_sql(schema, table, cols, chunk);
+        for chunk in rows.chunks(BATCH_SIZE) {
+            let sql = build_insert_sql_literals(schema, table, cols, chunk);
 
-            let params_refs: Vec<&(dyn ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
-                .collect();
-
-            client
-                .execute(&sql, &params_refs)
-                .await
-                .map_err(|e| MigrateError::Target(e))?;
+            match client.simple_query(&sql).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // Log details about the failing row
+                    if let Some(first_row) = chunk.first() {
+                        let row_preview: Vec<String> = first_row
+                            .iter()
+                            .take(5)
+                            .map(|v| format!("{:?}", v))
+                            .collect();
+                        tracing::error!(
+                            "Insert failed for {}.{}: {} - first row preview: {:?}",
+                            schema,
+                            table,
+                            e,
+                            row_preview
+                        );
+                    }
+                    return Err(MigrateError::Target(e));
+                }
+            }
 
             total += chunk.len() as u64;
         }
@@ -783,7 +784,7 @@ impl PgPool {
 /// Convert SqlValue to text format for COPY.
 fn sql_value_to_copy_text(value: &SqlValue) -> String {
     match value {
-        SqlValue::Null => "\\N".to_string(),
+        SqlValue::Null(_) => "\\N".to_string(),
         SqlValue::Bool(b) => if *b { "t" } else { "f" }.to_string(),
         SqlValue::I16(n) => n.to_string(),
         SqlValue::I32(n) => n.to_string(),
@@ -798,6 +799,163 @@ fn sql_value_to_copy_text(value: &SqlValue) -> String {
         SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
         SqlValue::Date(d) => d.to_string(),
         SqlValue::Time(t) => t.to_string(),
+    }
+}
+/// Escape a string for SQL literal use.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Convert SqlValue to SQL literal string.
+fn sql_value_to_literal(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Null(_) => "NULL".to_string(),
+        SqlValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        SqlValue::I16(n) => n.to_string(),
+        SqlValue::I32(n) => n.to_string(),
+        SqlValue::I64(n) => n.to_string(),
+        SqlValue::F32(n) => n.to_string(),
+        SqlValue::F64(n) => n.to_string(),
+        SqlValue::String(s) => format!("'{}'", escape_sql_string(s)),
+        SqlValue::Bytes(b) => format!("'\\x{}'::bytea", hex::encode(b)),
+        SqlValue::Uuid(u) => format!("'{}'::uuid", u),
+        SqlValue::Decimal(d) => format!("{}::numeric", d),
+        SqlValue::DateTime(dt) => format!("'{}'::timestamp", dt.format("%Y-%m-%d %H:%M:%S%.6f")),
+        SqlValue::DateTimeOffset(dt) => format!("'{}'::timestamptz", dt.to_rfc3339()),
+        SqlValue::Date(d) => format!("'{}'::date", d),
+        SqlValue::Time(t) => format!("'{}'::time", t),
+    }
+}
+
+/// Build INSERT SQL with literal values (no parameters).
+fn build_insert_sql_literals(
+    schema: &str,
+    table: &str,
+    cols: &[String],
+    rows: &[Vec<SqlValue>],
+) -> String {
+    let col_list: String = cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let value_rows: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = row.iter().map(sql_value_to_literal).collect();
+            format!("({})", values.join(", "))
+        })
+        .collect();
+
+    format!(
+        "INSERT INTO \"{}\".\"{}\" ({}) VALUES {}",
+        schema,
+        table,
+        col_list,
+        value_rows.join(", ")
+    )
+}
+
+/// Build UPSERT SQL with literal values (no parameters).
+fn build_upsert_sql_literals(
+    schema: &str,
+    table: &str,
+    cols: &[String],
+    pk_cols: &[String],
+    rows: &[Vec<SqlValue>],
+) -> String {
+    let col_list: String = cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let pk_list: String = pk_cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build UPDATE SET clause (exclude PK columns)
+    let update_cols: Vec<String> = cols
+        .iter()
+        .filter(|c| !pk_cols.contains(c))
+        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .collect();
+
+    let value_rows: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let values: Vec<String> = row.iter().map(sql_value_to_literal).collect();
+            format!("({})", values.join(", "))
+        })
+        .collect();
+
+    // Build change detection WHERE clause
+    let change_detection: Vec<String> = cols
+        .iter()
+        .filter(|c| !pk_cols.contains(c))
+        .map(|c| format!("\"{}\".\"{}\" IS DISTINCT FROM EXCLUDED.\"{}\"", table, c, c))
+        .collect();
+
+    if update_cols.is_empty() {
+        // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
+        format!(
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
+            schema,
+            table,
+            col_list,
+            value_rows.join(", "),
+            pk_list
+        )
+    } else {
+        format!(
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            schema,
+            table,
+            col_list,
+            value_rows.join(", "),
+            pk_list,
+            update_cols.join(", "),
+            change_detection.join(" OR ")
+        )
+    }
+}
+
+/// Get SQL cast suffix for a SqlValue type.
+fn sql_cast_for_value(value: &SqlValue) -> &'static str {
+    match value {
+        SqlValue::Bool(_) => "::boolean",
+        SqlValue::I16(_) => "::smallint",
+        SqlValue::I32(_) => "::integer",
+        SqlValue::I64(_) => "::bigint",
+        SqlValue::F32(_) => "::real",
+        SqlValue::F64(_) => "::double precision",
+        SqlValue::String(_) => "::text",
+        SqlValue::DateTime(_) => "::timestamp",
+        SqlValue::DateTimeOffset(_) => "::timestamptz",
+        SqlValue::Date(_) => "::date",
+        SqlValue::Time(_) => "::time",
+        SqlValue::Uuid(_) => "::uuid",
+        SqlValue::Decimal(_) => "::numeric",
+        SqlValue::Bytes(_) => "::bytea",
+        SqlValue::Null(null_type) => match null_type {
+            SqlNullType::Bool => "::boolean",
+            SqlNullType::I16 => "::smallint",
+            SqlNullType::I32 => "::integer",
+            SqlNullType::I64 => "::bigint",
+            SqlNullType::F32 => "::real",
+            SqlNullType::F64 => "::double precision",
+            SqlNullType::String => "::text",
+            SqlNullType::DateTime => "::timestamp",
+            SqlNullType::DateTimeOffset => "::timestamptz",
+            SqlNullType::Date => "::date",
+            SqlNullType::Time => "::time",
+            SqlNullType::Uuid => "::uuid",
+            SqlNullType::Decimal => "::numeric",
+            SqlNullType::Bytes => "::bytea",
+        },
     }
 }
 
@@ -818,13 +976,23 @@ fn build_insert_sql(
     let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
     let mut idx = 1;
 
+    // Determine column casts from first row (all rows have same structure)
+    let col_casts: Vec<&'static str> = if let Some(first_row) = rows.first() {
+        first_row.iter().map(|v| sql_cast_for_value(v)).collect()
+    } else {
+        vec![]
+    };
+
     for row in rows {
         let row_placeholders: Vec<String> = row
             .iter()
-            .map(|_| {
+            .enumerate()
+            .map(|(col_idx, value)| {
                 let p = format!("${}", idx);
                 idx += 1;
-                p
+                // Use cast from first row if available, otherwise from current value
+                let cast = col_casts.get(col_idx).copied().unwrap_or_else(|| sql_cast_for_value(value));
+                format!("{}{}", p, cast)
             })
             .collect();
         placeholders.push(format!("({})", row_placeholders.join(", ")));
@@ -876,13 +1044,22 @@ fn build_upsert_sql(
     let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
     let mut idx = 1;
 
+    // Determine column casts from first row (all rows have same structure)
+    let col_casts: Vec<&'static str> = if let Some(first_row) = rows.first() {
+        first_row.iter().map(|v| sql_cast_for_value(v)).collect()
+    } else {
+        vec![]
+    };
+
     for row in rows {
         let row_placeholders: Vec<String> = row
             .iter()
-            .map(|_| {
+            .enumerate()
+            .map(|(col_idx, value)| {
                 let p = format!("${}", idx);
                 idx += 1;
-                p
+                let cast = col_casts.get(col_idx).copied().unwrap_or_else(|| sql_cast_for_value(value));
+                format!("{}{}", p, cast)
             })
             .collect();
         placeholders.push(format!("({})", row_placeholders.join(", ")));
@@ -926,22 +1103,23 @@ fn build_upsert_sql(
 }
 
 /// Convert SqlValue to a boxed ToSql parameter.
+/// Converts ALL values to strings - PostgreSQL will cast them using SQL cast syntax.
 fn sql_value_to_param(value: &SqlValue) -> Box<dyn ToSql + Sync + Send> {
     match value {
-        SqlValue::Null => Box::new(None::<i32>),
-        SqlValue::Bool(b) => Box::new(*b),
-        SqlValue::I16(n) => Box::new(*n),
-        SqlValue::I32(n) => Box::new(*n),
-        SqlValue::I64(n) => Box::new(*n),
-        SqlValue::F32(n) => Box::new(*n),
-        SqlValue::F64(n) => Box::new(*n),
+        SqlValue::Null(_) => Box::new(None::<String>),
+        SqlValue::Bool(b) => Box::new(if *b { "t".to_string() } else { "f".to_string() }),
+        SqlValue::I16(n) => Box::new(n.to_string()),
+        SqlValue::I32(n) => Box::new(n.to_string()),
+        SqlValue::I64(n) => Box::new(n.to_string()),
+        SqlValue::F32(n) => Box::new(n.to_string()),
+        SqlValue::F64(n) => Box::new(n.to_string()),
         SqlValue::String(s) => Box::new(s.clone()),
-        SqlValue::Bytes(b) => Box::new(b.clone()),
-        SqlValue::Uuid(u) => Box::new(*u),
-        SqlValue::Decimal(d) => Box::new(*d),
-        SqlValue::DateTime(dt) => Box::new(*dt),
-        SqlValue::DateTimeOffset(dt) => Box::new(*dt),
-        SqlValue::Date(d) => Box::new(*d),
-        SqlValue::Time(t) => Box::new(*t),
+        SqlValue::Bytes(b) => Box::new(format!("\\x{}", hex::encode(b))),
+        SqlValue::Uuid(u) => Box::new(u.to_string()),
+        SqlValue::Decimal(d) => Box::new(d.to_string()),
+        SqlValue::DateTime(dt) => Box::new(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+        SqlValue::DateTimeOffset(dt) => Box::new(dt.to_rfc3339()),
+        SqlValue::Date(d) => Box::new(d.to_string()),
+        SqlValue::Time(t) => Box::new(t.to_string()),
     }
 }

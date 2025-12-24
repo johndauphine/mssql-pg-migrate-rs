@@ -6,7 +6,7 @@ pub use types::*;
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
-use crate::target::SqlValue;
+use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, Row};
@@ -119,11 +119,11 @@ impl MssqlPool {
             SELECT
                 COLUMN_NAME,
                 DATA_TYPE,
-                ISNULL(CHARACTER_MAXIMUM_LENGTH, 0),
-                ISNULL(NUMERIC_PRECISION, 0),
-                ISNULL(NUMERIC_SCALE, 0),
+                CAST(ISNULL(CHARACTER_MAXIMUM_LENGTH, 0) AS INT),
+                CAST(ISNULL(NUMERIC_PRECISION, 0) AS INT),
+                CAST(ISNULL(NUMERIC_SCALE, 0) AS INT),
                 CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END,
-                COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity'),
+                ISNULL(COLUMNPROPERTY(OBJECT_ID(TABLE_SCHEMA + '.' + TABLE_NAME), COLUMN_NAME, 'IsIdentity'), 0),
                 ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2
@@ -142,8 +142,8 @@ impl MssqlPool {
                 name: row.get::<&str, _>(0).unwrap_or_default().to_string(),
                 data_type: row.get::<&str, _>(1).unwrap_or_default().to_string(),
                 max_length: row.get::<i32, _>(2).unwrap_or(0),
-                precision: row.get::<i32, _>(3).unwrap_or(0) as i32,
-                scale: row.get::<i32, _>(4).unwrap_or(0) as i32,
+                precision: row.get::<i32, _>(3).unwrap_or(0),
+                scale: row.get::<i32, _>(4).unwrap_or(0),
                 is_nullable: row.get::<i32, _>(5).unwrap_or(0) == 1,
                 is_identity: row.get::<i32, _>(6).unwrap_or(0) == 1,
                 ordinal_pos: row.get::<i32, _>(7).unwrap_or(0),
@@ -384,32 +384,43 @@ impl SourcePool for MssqlPool {
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
         let mut client = self.get_client().await?;
 
-        let query = r#"
+        // Use subquery approach for ordered string aggregation
+        let query = format!(r#"
             SELECT
                 i.name AS index_name,
                 i.is_unique,
                 i.type_desc,
-                STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns,
-                ISNULL(STRING_AGG(CASE WHEN ic.is_included_column = 1 THEN c.name END, ',')
-                    WITHIN GROUP (ORDER BY ic.key_ordinal), '') AS include_columns
+                STUFF((
+                    SELECT ',' + c2.name
+                    FROM sys.index_columns ic2
+                    JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+                    WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id AND ic2.is_included_column = 0
+                    ORDER BY ic2.key_ordinal
+                    FOR XML PATH('')
+                ), 1, 1, '') AS columns,
+                ISNULL(STUFF((
+                    SELECT ',' + c2.name
+                    FROM sys.index_columns ic2
+                    JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+                    WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id AND ic2.is_included_column = 1
+                    ORDER BY ic2.key_ordinal
+                    FOR XML PATH('')
+                ), 1, 1, ''), '') AS include_columns
             FROM sys.indexes i
-            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-            JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
             JOIN sys.tables tb ON i.object_id = tb.object_id
             JOIN sys.schemas s ON tb.schema_id = s.schema_id
             WHERE s.name = @P1
               AND tb.name = @P2
               AND i.is_primary_key = 0
               AND i.type > 0
-            GROUP BY i.name, i.is_unique, i.type_desc
             ORDER BY i.name
-        "#;
+        "#);
 
-        let mut query = Query::new(query);
-        query.bind(&table.schema);
-        query.bind(&table.name);
+        let mut q = Query::new(&query);
+        q.bind(&table.schema);
+        q.bind(&table.name);
 
-        let stream = query.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
         let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
 
         for row in rows {
@@ -434,33 +445,44 @@ impl SourcePool for MssqlPool {
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
         let mut client = self.get_client().await?;
 
-        let query = r#"
+        // Use STUFF/FOR XML PATH for ordered string aggregation
+        let query = format!(r#"
             SELECT
                 fk.name AS fk_name,
-                STRING_AGG(pc.name, ',') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS parent_columns,
+                STUFF((
+                    SELECT ',' + pc2.name
+                    FROM sys.foreign_key_columns fkc2
+                    JOIN sys.columns pc2 ON fkc2.parent_object_id = pc2.object_id AND fkc2.parent_column_id = pc2.column_id
+                    WHERE fkc2.constraint_object_id = fk.object_id
+                    ORDER BY fkc2.constraint_column_id
+                    FOR XML PATH('')
+                ), 1, 1, '') AS parent_columns,
                 rs.name AS ref_schema,
                 rt.name AS ref_table,
-                STRING_AGG(rc.name, ',') WITHIN GROUP (ORDER BY fkc.constraint_column_id) AS ref_columns,
+                STUFF((
+                    SELECT ',' + rc2.name
+                    FROM sys.foreign_key_columns fkc2
+                    JOIN sys.columns rc2 ON fkc2.referenced_object_id = rc2.object_id AND fkc2.referenced_column_id = rc2.column_id
+                    WHERE fkc2.constraint_object_id = fk.object_id
+                    ORDER BY fkc2.constraint_column_id
+                    FOR XML PATH('')
+                ), 1, 1, '') AS ref_columns,
                 fk.delete_referential_action_desc,
                 fk.update_referential_action_desc
             FROM sys.foreign_keys fk
-            JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
             JOIN sys.tables pt ON fk.parent_object_id = pt.object_id
             JOIN sys.schemas ps ON pt.schema_id = ps.schema_id
-            JOIN sys.columns pc ON fkc.parent_object_id = pc.object_id AND fkc.parent_column_id = pc.column_id
             JOIN sys.tables rt ON fk.referenced_object_id = rt.object_id
             JOIN sys.schemas rs ON rt.schema_id = rs.schema_id
-            JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id
             WHERE ps.name = @P1 AND pt.name = @P2
-            GROUP BY fk.name, rs.name, rt.name, fk.delete_referential_action_desc, fk.update_referential_action_desc
             ORDER BY fk.name
-        "#;
+        "#);
 
-        let mut query = Query::new(query);
-        query.bind(&table.schema);
-        query.bind(&table.name);
+        let mut q = Query::new(&query);
+        q.bind(&table.schema);
+        q.bind(&table.name);
 
-        let stream = query.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
         let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
 
         for row in rows {
@@ -553,52 +575,64 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
         "bit" => {
             row.get::<bool, _>(idx)
                 .map(SqlValue::Bool)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::Bool))
         }
         "tinyint" => {
             row.get::<u8, _>(idx)
                 .map(|v| SqlValue::I16(v as i16))
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::I16))
         }
         "smallint" => {
             row.get::<i16, _>(idx)
                 .map(SqlValue::I16)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::I16))
         }
         "int" => {
             row.get::<i32, _>(idx)
                 .map(SqlValue::I32)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::I32))
         }
         "bigint" => {
             row.get::<i64, _>(idx)
                 .map(SqlValue::I64)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::I64))
         }
         "real" => {
             row.get::<f32, _>(idx)
                 .map(SqlValue::F32)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::F32))
         }
         "float" => {
             row.get::<f64, _>(idx)
                 .map(SqlValue::F64)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::F64))
         }
         "uniqueidentifier" => {
             row.get::<Uuid, _>(idx)
                 .map(SqlValue::Uuid)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::Uuid))
         }
         "datetime" | "datetime2" | "smalldatetime" => {
             row.get::<NaiveDateTime, _>(idx)
                 .map(SqlValue::DateTime)
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::DateTime))
+        }
+        "date" => {
+            // Tiberius returns date as NaiveDateTime, extract just the date part
+            row.get::<NaiveDateTime, _>(idx)
+                .map(|dt| SqlValue::Date(dt.date()))
+                .unwrap_or(SqlValue::Null(SqlNullType::Date))
+        }
+        "time" => {
+            // Tiberius returns time as NaiveDateTime, extract just the time part
+            row.get::<NaiveDateTime, _>(idx)
+                .map(|dt| SqlValue::Time(dt.time()))
+                .unwrap_or(SqlValue::Null(SqlNullType::Time))
         }
         "binary" | "varbinary" | "image" => {
             row.get::<&[u8], _>(idx)
                 .map(|v| SqlValue::Bytes(v.to_vec()))
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::Bytes))
         }
         "decimal" | "numeric" | "money" | "smallmoney" => {
             // For decimal/numeric, try to get as string and parse
@@ -614,13 +648,13 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
                             .unwrap_or(SqlValue::F64(f))
                     })
                 })
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::Decimal))
         }
         _ => {
             // Default: treat as string (covers varchar, nvarchar, char, nchar, text, ntext, xml, etc.)
             row.get::<&str, _>(idx)
                 .map(|s| SqlValue::String(s.to_string()))
-                .unwrap_or(SqlValue::Null)
+                .unwrap_or(SqlValue::Null(SqlNullType::String))
         }
     }
 }

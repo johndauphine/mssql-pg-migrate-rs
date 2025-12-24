@@ -194,7 +194,11 @@ impl TransferEngine {
 
         stats.rows = rows_written;
         stats.write_time = write_time;
-        stats.scan_time = start.elapsed() - stats.query_time - stats.write_time;
+        // Use saturating_sub to avoid overflow if query_time + write_time > elapsed
+        let total_elapsed = start.elapsed();
+        stats.scan_time = total_elapsed
+            .saturating_sub(stats.query_time)
+            .saturating_sub(stats.write_time);
         stats.completed = true;
 
         info!(
