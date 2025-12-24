@@ -4,12 +4,21 @@ use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
 use async_trait::async_trait;
-use bytes::{BufMut, BytesMut};
+use bytes::{Bytes, BufMut, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
+use tokio::sync::mpsc;
 use tokio_postgres::{types::ToSql, Config as PgConfig, NoTls};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Target buffer size for COPY operations (~64KB like Go pgx).
+/// This is the threshold at which we flush the buffer to reduce syscalls
+/// while keeping memory bounded.
+const COPY_SEND_BUF_SIZE: usize = 65536 - 5; // Account for packet header
+
+/// Number of buffer chunks to queue for concurrent network I/O.
+const COPY_CHANNEL_SIZE: usize = 4;
 
 /// Trait for target database operations.
 #[async_trait]
@@ -846,7 +855,12 @@ impl PgPool {
         Ok(copied)
     }
 
-    /// Insert rows using binary COPY format (faster for numeric-heavy tables).
+    /// Insert rows using binary COPY format with optimized batching.
+    ///
+    /// Optimizations (inspired by Go pgx):
+    /// 1. Adaptive buffer sizing - flushes based on buffer size (~64KB), not row count
+    /// 2. Concurrent serialize/send - overlaps serialization with network I/O
+    /// 3. Tracks largest row to prevent buffer overflow
     async fn insert_batch_binary(
         &self,
         schema: &str,
@@ -857,6 +871,10 @@ impl PgPool {
         use std::time::Instant;
 
         let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(0);
+        }
+
         let t0 = Instant::now();
 
         let client = self
@@ -888,64 +906,99 @@ impl PgPool {
 
         futures::pin_mut!(sink);
 
-        // Binary COPY buffer
-        let copy_buffer_rows = self.copy_buffer_rows;
-        let mut buf = BytesMut::with_capacity(2 * 1024 * 1024); // 2MB buffer for binary
-
-        // Write binary COPY header
-        // Signature: PGCOPY\n\377\r\n\0
-        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
-        // Flags field (32-bit): 0 = no OIDs
-        buf.put_i32(0);
-        // Header extension area length: 0
-        buf.put_i32(0);
+        // Create channel for concurrent serialize/send
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<Bytes>(COPY_CHANNEL_SIZE);
 
         let num_cols = cols.len() as i16;
+        let table_name = format!("{}.{}", schema, table);
+        let table_name_clone = table_name.clone();
 
+        // Spawn serializer task (producer)
+        let serializer_handle = tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(COPY_SEND_BUF_SIZE * 2);
+
+            // Write binary COPY header
+            buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+            buf.put_i32(0); // Flags: no OIDs
+            buf.put_i32(0); // Header extension length: 0
+
+            // Track largest row for adaptive flushing
+            let mut largest_row_len: usize = 0;
+
+            for row in rows {
+                let row_start = buf.len();
+
+                // Field count (16-bit)
+                buf.put_i16(num_cols);
+
+                // Write each field
+                for value in row.iter() {
+                    write_binary_value(&mut buf, value);
+                }
+
+                // Track largest row size for buffer management
+                let row_len = buf.len() - row_start;
+                if row_len > largest_row_len {
+                    largest_row_len = row_len;
+                }
+
+                // Adaptive flush: send when buffer approaches target size
+                // Leave room for the largest row we've seen
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
+                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
+                        return Err(MigrateError::Transfer {
+                            table: table_name_clone.clone(),
+                            message: "Receiver dropped".into(),
+                        });
+                    }
+                }
+            }
+
+            // Write trailer: -1 as 16-bit signed integer
+            buf.put_i16(-1);
+
+            // Send remaining data
+            if !buf.is_empty() {
+                if chunk_tx.send(buf.freeze()).await.is_err() {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped (final)".into(),
+                    });
+                }
+            }
+
+            Ok::<usize, MigrateError>(largest_row_len)
+        });
+
+        // Consumer: send chunks to PostgreSQL concurrently with serialization
         let t2 = Instant::now();
-        let mut serialize_time = std::time::Duration::ZERO;
-        let mut send_time = std::time::Duration::ZERO;
+        let mut send_count = 0usize;
 
-        for (i, row) in rows.into_iter().enumerate() {
-            let ts = Instant::now();
-            // Field count (16-bit)
-            buf.put_i16(num_cols);
-
-            // Write each field
-            for value in row.iter() {
-                write_binary_value(&mut buf, value);
-            }
-            serialize_time += ts.elapsed();
-
-            // Flush buffer periodically (including header on first flush)
-            if (i + 1) % copy_buffer_rows == 0 {
-                let tsend = Instant::now();
-                sink.send(buf.split().freeze())
-                    .await
-                    .map_err(|e| MigrateError::Transfer {
-                        table: format!("{}.{}", schema, table),
-                        message: format!("Binary COPY send failed: {}", e),
-                    })?;
-                send_time += tsend.elapsed();
-            }
-        }
-        let t_loop = t2.elapsed();
-
-        // Write trailer: -1 as 16-bit signed integer
-        buf.put_i16(-1);
-
-        // Send remaining data
-        let t3 = Instant::now();
-        if !buf.is_empty() {
-            sink.send(buf.freeze())
+        while let Some(chunk) = chunk_rx.recv().await {
+            sink.send(chunk)
                 .await
                 .map_err(|e| MigrateError::Transfer {
-                    table: format!("{}.{}", schema, table),
-                    message: format!("Binary COPY final send failed: {}", e),
+                    table: table_name.clone(),
+                    message: format!("Binary COPY send failed: {}", e),
                 })?;
+            send_count += 1;
         }
+        let t_send = t2.elapsed();
+
+        // Wait for serializer to complete and check for errors
+        let largest_row = match serializer_handle.await {
+            Ok(Ok(size)) => size,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(MigrateError::Transfer {
+                    table: table_name,
+                    message: format!("Serializer task panicked: {}", e),
+                })
+            }
+        };
 
         // Finalize COPY
+        let t3 = Instant::now();
         let copied = sink
             .finish()
             .await
@@ -955,8 +1008,143 @@ impl PgPool {
         // Log timing breakdown for chunks with significant data
         if row_count > 1000 {
             debug!(
-                "PROFILE write: {} rows - conn={:?}, copy_init={:?}, serialize={:?}, send={:?}, finish={:?}",
-                row_count, t_conn, t_copy_init, serialize_time, send_time, t_finish
+                "PROFILE write: {} rows in {} chunks - conn={:?}, copy_init={:?}, send={:?}, finish={:?}, largest_row={}B",
+                row_count, send_count, t_conn, t_copy_init, t_send, t_finish, largest_row
+            );
+        }
+
+        Ok(copied)
+    }
+
+    /// Stream rows directly to PostgreSQL using COPY protocol.
+    ///
+    /// This method accepts a receiver channel, allowing rows to be streamed
+    /// from the source without buffering the entire dataset in memory.
+    /// Uses concurrent serialization and network I/O for maximum throughput.
+    pub async fn write_chunk_streaming(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        mut row_rx: mpsc::Receiver<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+
+        // Build column list
+        let col_list: String = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // COPY statement with binary format
+        let copy_stmt = format!(
+            "COPY \"{}\".\"{}\" ({}) FROM STDIN WITH (FORMAT binary)",
+            schema, table, col_list
+        );
+
+        let sink = client
+            .copy_in(&copy_stmt)
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        futures::pin_mut!(sink);
+
+        // Create channel for concurrent serialize/send
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<Bytes>(COPY_CHANNEL_SIZE);
+
+        let num_cols = cols.len() as i16;
+        let table_name = format!("{}.{}", schema, table);
+        let table_name_clone = table_name.clone();
+
+        // Spawn serializer task that reads from row_rx
+        let serializer_handle = tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(COPY_SEND_BUF_SIZE * 2);
+
+            // Write binary COPY header
+            buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+            buf.put_i32(0); // Flags: no OIDs
+            buf.put_i32(0); // Header extension length: 0
+
+            let mut largest_row_len: usize = 0;
+            let mut row_count: u64 = 0;
+
+            while let Some(row) = row_rx.recv().await {
+                let row_start = buf.len();
+
+                buf.put_i16(num_cols);
+                for value in row.iter() {
+                    write_binary_value(&mut buf, value);
+                }
+
+                let row_len = buf.len() - row_start;
+                if row_len > largest_row_len {
+                    largest_row_len = row_len;
+                }
+                row_count += 1;
+
+                // Adaptive flush
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
+                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
+                        return Err(MigrateError::Transfer {
+                            table: table_name_clone.clone(),
+                            message: "Receiver dropped".into(),
+                        });
+                    }
+                }
+            }
+
+            // Write trailer
+            buf.put_i16(-1);
+
+            if !buf.is_empty() {
+                if chunk_tx.send(buf.freeze()).await.is_err() {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped (final)".into(),
+                    });
+                }
+            }
+
+            Ok::<u64, MigrateError>(row_count)
+        });
+
+        // Consumer: send chunks to PostgreSQL
+        while let Some(chunk) = chunk_rx.recv().await {
+            sink.send(chunk)
+                .await
+                .map_err(|e| MigrateError::Transfer {
+                    table: table_name.clone(),
+                    message: format!("Binary COPY send failed: {}", e),
+                })?;
+        }
+
+        // Wait for serializer
+        let row_count = match serializer_handle.await {
+            Ok(Ok(count)) => count,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(MigrateError::Transfer {
+                    table: table_name,
+                    message: format!("Serializer task panicked: {}", e),
+                })
+            }
+        };
+
+        // Finalize COPY
+        let copied = sink
+            .finish()
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        if copied != row_count {
+            warn!(
+                "Row count mismatch for {}: serialized {} but PostgreSQL reported {}",
+                table_name, row_count, copied
             );
         }
 
