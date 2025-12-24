@@ -602,7 +602,10 @@ impl SourcePool for MssqlPool {
         let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
         let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
 
-        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
+        // SQL Server COUNT(*) returns int (i32), so get as i32 and convert to i64
+        Ok(row.map(|r| {
+            r.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0)
+        }).unwrap_or(0))
     }
 
     fn db_type(&self) -> &str {
