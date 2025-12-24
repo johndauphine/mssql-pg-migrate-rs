@@ -85,10 +85,7 @@ impl Config {
 
         // Calculate weighted average row size based on total data volume
         // Use u128 to avoid overflow with large datasets
-        let total_rows: u128 = tables
-            .iter()
-            .map(|t| t.row_count.max(0) as u128)
-            .sum();
+        let total_rows: u128 = tables.iter().map(|t| t.row_count.max(0) as u128).sum();
         let total_bytes: u128 = tables
             .iter()
             .map(|t| (t.row_count.max(0) as u128) * (t.estimated_row_size.max(0) as u128))
@@ -102,10 +99,15 @@ impl Config {
 
         info!(
             "Calculated average row size: {} bytes (from {} tables, {} total rows)",
-            avg_row_size, tables.len(), total_rows
+            avg_row_size,
+            tables.len(),
+            total_rows
         );
 
-        self.migration = self.migration.clone().with_auto_tuning(&resources, Some(avg_row_size));
+        self.migration = self
+            .migration
+            .clone()
+            .with_auto_tuning(&resources, Some(avg_row_size));
     }
 }
 
@@ -277,7 +279,11 @@ impl MigrationConfig {
     ///
     /// If `actual_row_size` is provided, it will be used instead of the default estimate.
     /// This should be the weighted average row size calculated from actual table metadata.
-    pub fn with_auto_tuning(mut self, resources: &SystemResources, actual_row_size: Option<usize>) -> Self {
+    pub fn with_auto_tuning(
+        mut self,
+        resources: &SystemResources,
+        actual_row_size: Option<usize>,
+    ) -> Self {
         let ram_gb = resources.total_memory_gb;
         let cores = resources.cpu_cores;
 
@@ -295,15 +301,13 @@ impl MigrationConfig {
             );
         }
         let memory_budget_pct = clamped_percent as f64 / 100.0;
-        let memory_budget_bytes = (resources.total_memory_bytes as f64 * memory_budget_pct) as usize;
+        let memory_budget_bytes =
+            (resources.total_memory_bytes as f64 * memory_budget_pct) as usize;
         let memory_budget_mb = memory_budget_bytes / (1024 * 1024);
 
         info!(
             "Memory budget: {} MB ({}% of {:.1} GB available), row size estimate: {} bytes",
-            memory_budget_mb,
-            clamped_percent,
-            ram_gb,
-            bytes_per_row
+            memory_budget_mb, clamped_percent, ram_gb, bytes_per_row
         );
 
         // Workers: cores - 2, but at least 2 and at most 32
@@ -314,17 +318,16 @@ impl MigrationConfig {
         }
         let workers = self.workers.unwrap();
 
-        // Parallel readers: scale with cores, 2-16 range (aggressive parallelism)
-        // More cores = more parallel readers per table for maximum source throughput
+        // Parallel readers: scale with cores, but stay conservative to avoid over-subscribing DB connections
+        // Target: roughly cores/2, capped at 12 (good balance for typical 8–32 core hosts)
         if self.parallel_readers.is_none() {
-            let readers = (cores / 2).max(2).min(16);
+            let readers = (cores / 2).max(2).min(12);
             self.parallel_readers = Some(readers);
         }
 
-        // Parallel writers: scale with cores, 2-16 range (aggressive parallelism)
-        // More writers = better overlap of write I/O
+        // Parallel writers: smaller than readers; cap to limit connection pressure on Postgres
         if self.write_ahead_writers.is_none() {
-            let writers = (cores / 2).max(2).min(16);
+            let writers = (cores / 3).max(2).min(8);
             self.write_ahead_writers = Some(writers);
         }
 
@@ -343,13 +346,17 @@ impl MigrationConfig {
         let desired_read_ahead = ((ram_gb / 4.0) as usize).max(4).min(32);
 
         // Calculate max chunk size that fits in memory budget
-        let max_chunk_from_memory = memory_budget_bytes / (bytes_per_row * desired_read_ahead * workers * MEMORY_SAFETY_FACTOR);
+        let max_chunk_from_memory = memory_budget_bytes
+            / (bytes_per_row * desired_read_ahead * workers * MEMORY_SAFETY_FACTOR);
         let max_chunk_from_memory = max_chunk_from_memory.max(10_000); // Minimum viable chunk size
 
         // Chunk size: scale with RAM but respect memory budget
         if self.chunk_size.is_none() {
             let desired_chunk = 50_000 + ((ram_gb / 8.0) as usize * 25_000);
-            let chunk = desired_chunk.min(max_chunk_from_memory).max(10_000).min(200_000);
+            let chunk = desired_chunk
+                .min(max_chunk_from_memory)
+                .max(10_000)
+                .min(200_000);
             self.chunk_size = Some(chunk);
         }
 
@@ -357,15 +364,21 @@ impl MigrationConfig {
         if self.read_ahead_buffers.is_none() {
             let chunk_size = self.chunk_size.unwrap();
             // Recalculate max read-ahead based on actual chunk size
-            let max_read_ahead_from_memory = memory_budget_bytes / (bytes_per_row * chunk_size * workers * MEMORY_SAFETY_FACTOR);
-            let buffers = desired_read_ahead.min(max_read_ahead_from_memory).max(2).min(32);
+            let max_read_ahead_from_memory =
+                memory_budget_bytes / (bytes_per_row * chunk_size * workers * MEMORY_SAFETY_FACTOR);
+            let buffers = desired_read_ahead
+                .min(max_read_ahead_from_memory)
+                .max(2)
+                .min(32);
             self.read_ahead_buffers = Some(buffers);
         }
 
         // Large table threshold: scale with RAM
         // More RAM = can handle larger tables before partitioning
         if self.large_table_threshold.is_none() {
-            let threshold = ((ram_gb / 8.0) as i64 * 1_000_000).max(1_000_000).min(20_000_000);
+            let threshold = ((ram_gb / 8.0) as i64 * 1_000_000)
+                .max(1_000_000)
+                .min(20_000_000);
             self.large_table_threshold = Some(threshold);
         }
 
@@ -385,20 +398,21 @@ impl MigrationConfig {
         // Need enough connections for parallel readers + writers + workers
         if self.max_mssql_connections.is_none() {
             let readers = self.parallel_readers.unwrap_or(4);
-            let conns = (workers * readers + 4).max(8).min(100);
+            let conns = (workers * readers + 4).max(8).min(64);
             self.max_mssql_connections = Some(conns);
         }
 
         if self.max_pg_connections.is_none() {
             let writers = self.write_ahead_writers.unwrap_or(4);
-            let conns = (workers * writers + 4).max(8).min(100);
+            let conns = (workers * writers + 4).max(8).min(48);
             self.max_pg_connections = Some(conns);
         }
 
         // Calculate estimated memory usage for logging
         let chunk_size = self.chunk_size.unwrap();
         let read_ahead = self.read_ahead_buffers.unwrap();
-        let estimated_buffer_memory_mb = (workers * read_ahead * chunk_size * bytes_per_row) / (1024 * 1024);
+        let estimated_buffer_memory_mb =
+            (workers * read_ahead * chunk_size * bytes_per_row) / (1024 * 1024);
 
         // Log the auto-tuned values
         info!(
