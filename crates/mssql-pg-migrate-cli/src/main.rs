@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
     // Setup logging
     setup_logging(&cli.verbosity, &cli.log_format)?;
 
-    // Load configuration
-    let mut config = Config::load(&cli.config)?;
+    // Load configuration and apply auto-tuning
+    let mut config = Config::load(&cli.config)?.with_auto_tuning();
     info!("Loaded configuration from {:?}", cli.config);
 
     // Setup cancellation
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
                 config.target.schema = schema;
             }
             if let Some(w) = workers {
-                config.migration.workers = w;
+                config.migration.workers = Some(w);
             }
 
             // Create orchestrator

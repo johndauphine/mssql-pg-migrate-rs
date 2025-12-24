@@ -64,18 +64,17 @@ impl Orchestrator {
     /// Create a new orchestrator.
     pub async fn new(config: Config) -> Result<Self> {
         // Create source pool with configurable size
-        let mssql_pool_size = config.migration.max_mssql_connections
-            .unwrap_or_else(|| (config.migration.workers.max(4) * 2) as usize) as u32;
+        let mssql_pool_size = config.migration.get_max_mssql_connections() as u32;
         let source = MssqlPool::with_max_connections(config.source.clone(), mssql_pool_size).await?;
 
         // Create target pool
-        let max_conns = config.migration.max_pg_connections
-            .unwrap_or_else(|| config.migration.workers.max(4) * 2);
+        let max_conns = config.migration.get_max_pg_connections();
         let target = PgPool::new(
             &config.target,
             max_conns,
-            config.migration.copy_buffer_rows,
-            config.migration.upsert_batch_size,
+            config.migration.get_copy_buffer_rows(),
+            config.migration.get_upsert_batch_size(),
+            config.migration.use_binary_copy,
         ).await?;
 
         Ok(Self {
@@ -309,6 +308,30 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Check if a table should be partitioned for parallel reads.
+    fn should_partition(&self, table: &Table) -> bool {
+        // Must have single-column integer PK for keyset pagination
+        if !table.has_single_pk() {
+            return false;
+        }
+
+        let pk_type = table.pk_columns.first()
+            .map(|c| c.data_type.to_lowercase())
+            .unwrap_or_default();
+
+        let is_sortable = matches!(
+            pk_type.as_str(),
+            "int" | "bigint" | "smallint" | "tinyint"
+        );
+
+        if !is_sortable {
+            return false;
+        }
+
+        // Only partition large tables
+        table.row_count >= self.config.migration.get_large_table_threshold()
+    }
+
     /// Transfer data for all tables.
     async fn transfer_data(
         &self,
@@ -316,12 +339,12 @@ impl Orchestrator {
         state: &mut MigrationState,
         cancel: watch::Receiver<bool>,
     ) -> Result<()> {
-        let workers = self.config.migration.workers;
+        let workers = self.config.migration.get_workers();
         let semaphore = Arc::new(Semaphore::new(workers));
 
         let transfer_config = TransferConfig {
-            chunk_size: self.config.migration.chunk_size,
-            read_ahead: self.config.migration.read_ahead_buffers,
+            chunk_size: self.config.migration.get_chunk_size(),
+            read_ahead: self.config.migration.get_read_ahead_buffers(),
         };
 
         let engine = Arc::new(TransferEngine::new(
@@ -353,14 +376,69 @@ impl Orchestrator {
             }
 
             let table_name = table.full_name();
+
+            // Check if table should be partitioned for parallel reads
+            let num_partitions = self.config.migration.get_parallel_readers();
+            if self.should_partition(table) && num_partitions > 1 {
+                // Get partition boundaries
+                match self.source.get_partition_boundaries(table, num_partitions).await {
+                    Ok(partitions) => {
+                        info!(
+                            "{}: partitioning into {} parallel reads ({} rows)",
+                            table_name, partitions.len(), table.row_count
+                        );
+
+                        // Update state
+                        if let Some(ts) = state.tables.get_mut(&table_name) {
+                            ts.status = TaskStatus::InProgress;
+                        }
+                        self.save_state(state)?;
+
+                        // Create a job for each partition
+                        for partition in partitions {
+                            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+                            // Subtract 1 from min_pk so that `WHERE pk > (min_pk - 1)` includes the first row.
+                            // For the first partition (min_pk = 1), this becomes `WHERE pk > 0`.
+                            let adjusted_min = partition.min_pk.map(|pk| pk - 1);
+
+                            let job = TransferJob {
+                                table: table.clone(),
+                                partition_id: Some(partition.partition_id),
+                                min_pk: adjusted_min,
+                                max_pk: partition.max_pk,
+                                resume_from_pk: None, // Partitions don't support resume yet
+                                target_mode: self.config.migration.target_mode.clone(),
+                                target_schema: self.config.target.schema.clone(),
+                            };
+
+                            let engine_clone = engine.clone();
+                            let partition_name = format!("{}:p{}", table_name, partition.partition_id);
+
+                            let handle = tokio::spawn(async move {
+                                let result = engine_clone.execute(job).await;
+                                drop(permit);
+                                result
+                            });
+
+                            handles.push((partition_name, handle));
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("{}: failed to partition, using single reader: {}", table_name, e);
+                        // Fall through to single-job path
+                    }
+                }
+            }
+
+            // Single job for small tables or partition failures
             let permit = semaphore.clone().acquire_owned().await.unwrap();
 
             // Update state
             if let Some(ts) = state.tables.get_mut(&table_name) {
                 ts.status = TaskStatus::InProgress;
             }
-
-            // Save state periodically
             self.save_state(state)?;
 
             let job = TransferJob {
@@ -378,44 +456,75 @@ impl Orchestrator {
 
             let handle = tokio::spawn(async move {
                 let result = engine_clone.execute(job).await;
-                drop(permit); // Release worker slot
+                drop(permit);
                 result
             });
 
             handles.push((table_name, handle));
         }
 
-        // Collect results
-        for (table_name, handle) in handles {
+        // Collect results, tracking partition aggregation
+        let mut table_rows: HashMap<String, i64> = HashMap::new();
+        let mut table_errors: HashMap<String, String> = HashMap::new();
+
+        for (job_name, handle) in handles {
+            // Extract base table name (handles both "schema.table" and "schema.table:p1")
+            let base_table = job_name.split(":p").next().unwrap_or(&job_name).to_string();
+
             match handle.await {
                 Ok(Ok(stats)) => {
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Completed;
-                        ts.rows_transferred = stats.rows;
-                        ts.last_pk = stats.last_pk;
-                        ts.completed_at = Some(Utc::now());
+                    info!("{}: completed ({} rows)", job_name, stats.rows);
+                    *table_rows.entry(base_table.clone()).or_insert(0) += stats.rows;
+
+                    // For non-partitioned tables, update state directly
+                    if !job_name.contains(":p") {
+                        if let Some(ts) = state.tables.get_mut(&base_table) {
+                            ts.status = TaskStatus::Completed;
+                            ts.rows_transferred = stats.rows;
+                            ts.last_pk = stats.last_pk;
+                            ts.completed_at = Some(Utc::now());
+                        }
                     }
-                    info!("{}: completed ({} rows)", table_name, stats.rows);
                 }
                 Ok(Err(e)) => {
-                    error!("{}: failed - {}", table_name, e);
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Failed;
-                        ts.error = Some(e.to_string());
-                    }
+                    error!("{}: failed - {}", job_name, e);
+                    table_errors.insert(base_table.clone(), e.to_string());
                 }
                 Err(e) => {
-                    error!("{}: task panicked - {}", table_name, e);
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Failed;
-                        ts.error = Some(format!("Task panicked: {}", e));
-                    }
+                    error!("{}: task panicked - {}", job_name, e);
+                    table_errors.insert(base_table.clone(), format!("Task panicked: {}", e));
                 }
             }
-
-            // Save state after each table
-            self.save_state(state)?;
         }
+
+        // Finalize partitioned table states
+        for (table_name, rows) in &table_rows {
+            if let Some(ts) = state.tables.get_mut(table_name) {
+                if table_errors.contains_key(table_name) {
+                    ts.status = TaskStatus::Failed;
+                    ts.error = table_errors.get(table_name).cloned();
+                } else if ts.status != TaskStatus::Completed {
+                    // Partitioned table - aggregate rows
+                    ts.status = TaskStatus::Completed;
+                    ts.rows_transferred = *rows;
+                    ts.completed_at = Some(Utc::now());
+                    info!("{}: completed ({} rows total)", table_name, rows);
+                }
+            }
+        }
+
+        // Handle tables that only had errors (no successful partitions)
+        for (table_name, error) in &table_errors {
+            if let Some(ts) = state.tables.get_mut(table_name) {
+                if ts.status != TaskStatus::Completed {
+                    ts.status = TaskStatus::Failed;
+                    ts.error = Some(error.clone());
+                }
+            }
+        }
+
+        // Save final state
+        self.save_state(state)?;
 
         // Check for failures
         let failed: Vec<_> = state.tables.iter()
@@ -444,8 +553,8 @@ impl Orchestrator {
             }
         }
 
-        // Create primary keys (for drop_recreate and truncate)
-        if !matches!(self.config.migration.target_mode, TargetMode::Upsert) {
+        // Create primary keys (only for drop_recreate - truncate and upsert preserve existing PKs)
+        if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
             for table in tables {
                 if !table.primary_key.is_empty() {
                     debug!("Creating PK for: {}", table.full_name());
