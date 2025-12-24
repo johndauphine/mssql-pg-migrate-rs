@@ -4,10 +4,22 @@ High-performance MSSQL to PostgreSQL migration tool written in Rust.
 
 Designed for headless operation in scripted environments, Kubernetes, and Airflow DAGs.
 
+## Performance
+
+Tested with Stack Overflow 2010 dataset (~19.3M rows):
+
+| Mode | Throughput |
+|------|------------|
+| drop_recreate | ~90K rows/sec |
+| truncate | ~92K rows/sec |
+| upsert | ~76K rows/sec |
+
 ## Features
 
-- **High throughput** - PostgreSQL COPY protocol for bulk inserts
+- **High throughput** - Read-ahead pipeline with concurrent reading/writing
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
+- **Automatic type mapping** - MSSQL to PostgreSQL type conversion
+- **Keyset pagination** - Efficient chunked reads using `WHERE pk > last_pk`
 - **Resume capability** - JSON state file for process restartability
 - **Static binary** - No runtime dependencies, ideal for containers
 - **Airflow integration** - JSON output for XCom, automatic retry support
@@ -16,17 +28,26 @@ Designed for headless operation in scripted environments, Kubernetes, and Airflo
 
 ### Download pre-built binaries
 
-Download from [GitHub Releases](https://github.com/johndauphine/mssql-pg-migrate-rs/releases/latest).
+Download from [GitHub Releases](https://github.com/johndauphine/mssql-pg-migrate-rs/releases/latest):
+
+| Platform | Architecture | Binary |
+|----------|--------------|--------|
+| Linux | x86_64 | `mssql-pg-migrate-linux-x86_64` |
+| Linux | ARM64 | `mssql-pg-migrate-linux-aarch64` |
+| macOS | Intel | `mssql-pg-migrate-darwin-x86_64` |
+| macOS | Apple Silicon | `mssql-pg-migrate-darwin-aarch64` |
+| Windows | x86_64 | `mssql-pg-migrate-windows-x86_64.exe` |
+
+```bash
+# Linux/macOS
+chmod +x mssql-pg-migrate-*
+./mssql-pg-migrate-linux-x86_64 -c config.yaml run
+```
 
 ### Build from source
 
 ```bash
-# Standard build
 cargo build --release
-
-# Fully static Linux binary (musl)
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ## Usage
@@ -62,10 +83,10 @@ source:
   port: 1433
   database: SourceDB
   user: sa
-  password: ${MSSQL_PASSWORD}  # Environment variable support
+  password: "YourPassword"
   schema: dbo
-  encrypt: "true"
-  trust_server_cert: false
+  encrypt: "false"
+  trust_server_cert: true
 
 target:
   type: postgres
@@ -73,14 +94,14 @@ target:
   port: 5432
   database: target_db
   user: postgres
-  password: ${PG_PASSWORD}
+  password: "YourPassword"
   schema: public
-  ssl_mode: require
+  ssl_mode: disable
 
 migration:
   target_mode: drop_recreate  # or truncate, upsert
   workers: 4
-  chunk_size: 100000
+  chunk_size: 50000
   create_indexes: true
   create_foreign_keys: true
   create_check_constraints: true
@@ -90,9 +111,33 @@ migration:
 
 | Mode | Behavior |
 |------|----------|
-| `drop_recreate` | Drop target tables, create fresh, bulk copy |
-| `truncate` | Truncate existing tables, create if missing, bulk copy |
-| `upsert` | INSERT new rows, UPDATE changed rows, preserve target-only data |
+| `drop_recreate` | Drop target tables, create fresh, bulk insert |
+| `truncate` | Truncate existing tables, create if missing, bulk insert |
+| `upsert` | INSERT new rows, UPDATE changed rows (ON CONFLICT) |
+
+## Type Mapping
+
+| MSSQL | PostgreSQL |
+|-------|------------|
+| bit | boolean |
+| tinyint | smallint |
+| smallint | smallint |
+| int | integer |
+| bigint | bigint |
+| decimal(p,s) | numeric(p,s) |
+| float | double precision |
+| real | real |
+| varchar(n) | varchar(n) |
+| nvarchar(n) | varchar(n) |
+| nvarchar(max) | text |
+| text/ntext | text |
+| datetime | timestamp |
+| datetime2 | timestamp |
+| datetimeoffset | timestamptz |
+| date | date |
+| time | time |
+| uniqueidentifier | uuid |
+| binary/varbinary | bytea |
 
 ## Airflow Integration
 
@@ -127,6 +172,15 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 FROM scratch
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/mssql-pg-migrate /
 ENTRYPOINT ["/mssql-pg-migrate"]
+```
+
+Or use the pre-built binary:
+
+```dockerfile
+FROM alpine:latest
+ADD https://github.com/johndauphine/mssql-pg-migrate-rs/releases/latest/download/mssql-pg-migrate-linux-x86_64 /usr/local/bin/mssql-pg-migrate
+RUN chmod +x /usr/local/bin/mssql-pg-migrate
+ENTRYPOINT ["mssql-pg-migrate"]
 ```
 
 ## License
