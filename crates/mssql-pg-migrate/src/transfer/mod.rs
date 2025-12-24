@@ -146,22 +146,35 @@ impl TransferEngine {
 
         // Get column names and pre-compute column types for O(1) lookup
         let columns: Vec<String> = job.table.columns.iter().map(|c| c.name.clone()).collect();
-        let col_types: Vec<String> = job.table.columns.iter().map(|c| c.data_type.clone()).collect();
+        let col_types: Vec<String> = job
+            .table
+            .columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect();
         let pk_cols: Vec<String> = job.table.primary_key.clone();
 
         // Determine if we can use parallel keyset pagination
         let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
-        let num_readers = if use_keyset { self.config.parallel_readers } else { 1 };
+        let num_readers = if use_keyset {
+            self.config.parallel_readers
+        } else {
+            1
+        };
 
         if !use_keyset {
-            warn!("{}: using OFFSET pagination (slower, single reader)", table_name);
+            warn!(
+                "{}: using OFFSET pagination (slower, single reader)",
+                table_name
+            );
         }
 
         // Create channel for read-ahead pipeline
         let (read_tx, read_rx) = mpsc::channel::<RowChunk>(self.config.read_ahead);
 
         // Create channel for write jobs (multiple writers consume from this)
-        let (write_tx, write_rx) = async_channel::bounded::<WriteJob>(self.config.parallel_writers * 2);
+        let (write_tx, write_rx) =
+            async_channel::bounded::<WriteJob>(self.config.parallel_writers * 2);
 
         // Spawn parallel readers
         let source = self.source.clone();
@@ -180,7 +193,8 @@ impl TransferEngine {
                     chunk_size,
                     num_readers,
                     read_tx,
-                ).await
+                )
+                .await
             } else {
                 read_table_chunks(
                     source,
@@ -189,7 +203,8 @@ impl TransferEngine {
                     col_types_clone,
                     chunk_size,
                     read_tx,
-                ).await
+                )
+                .await
             }
         });
 
@@ -228,7 +243,12 @@ impl TransferEngine {
                         }
                         _ => {
                             target
-                                .write_chunk(&schema, &table_name_clone, &columns_clone, write_job.rows)
+                                .write_chunk(
+                                    &schema,
+                                    &table_name_clone,
+                                    &columns_clone,
+                                    write_job.rows,
+                                )
                                 .await
                         }
                     };
@@ -327,7 +347,8 @@ impl TransferEngine {
         }
 
         // Update global counter
-        self.rows_transferred.fetch_add(total_rows, Ordering::Relaxed);
+        self.rows_transferred
+            .fetch_add(total_rows, Ordering::Relaxed);
 
         stats.rows = total_rows;
         stats.query_time = total_query_time;
@@ -349,12 +370,7 @@ impl TransferEngine {
 
         info!(
             "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-            table_name,
-            stats.rows,
-            total_elapsed,
-            rows_per_sec,
-            stats.query_time,
-            stats.write_time
+            table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
         );
 
         Ok(stats)
@@ -411,7 +427,9 @@ async fn read_table_chunks_parallel(
         Some(pk) => pk,
         None => {
             // Query max PK if not provided
-            source.get_max_pk(&table.schema, &table.name, &table.primary_key[0]).await?
+            source
+                .get_max_pk(&table.schema, &table.name, &table.primary_key[0])
+                .await?
         }
     };
 
@@ -426,8 +444,15 @@ async fn read_table_chunks_parallel(
 
     info!(
         "{}: starting {} parallel readers for PK range {} to {}{}",
-        table_name, actual_readers, min_pk, max_pk,
-        if is_partitioned { " (partitioned job)" } else { "" }
+        table_name,
+        actual_readers,
+        min_pk,
+        max_pk,
+        if is_partitioned {
+            " (partitioned job)"
+        } else {
+            ""
+        }
     );
 
     let mut reader_handles = Vec::with_capacity(actual_readers);
@@ -448,15 +473,7 @@ async fn read_table_chunks_parallel(
 
         let handle = tokio::spawn(async move {
             read_chunk_range(
-                source,
-                table,
-                columns,
-                col_types,
-                start_pk,
-                range_max,
-                chunk_size,
-                reader_id,
-                tx,
+                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id, tx,
             )
             .await
         });
@@ -479,7 +496,10 @@ async fn read_table_chunks_parallel(
         }
     }
 
-    info!("{}: all readers finished, total {} rows", table_name, total_rows);
+    info!(
+        "{}: all readers finished, total {} rows",
+        table_name, total_rows
+    );
     Ok(())
 }
 
@@ -496,7 +516,6 @@ async fn read_chunk_range(
     tx: mpsc::Sender<RowChunk>,
 ) -> Result<i64> {
     let table_name = table.full_name();
-    let pk_col = &table.primary_key[0];
 
     let mut last_pk = start_pk;
     let mut total_rows = 0i64;
@@ -505,9 +524,16 @@ async fn read_chunk_range(
     loop {
         let read_start = Instant::now();
 
-        let (rows, new_last_pk) =
-            read_chunk_keyset_fast(&source, &table, &columns, &col_types, last_pk, Some(end_pk), chunk_size)
-                .await?;
+        let (rows, new_last_pk) = read_chunk_keyset_fast(
+            &source,
+            &table,
+            &columns,
+            &col_types,
+            last_pk,
+            Some(end_pk),
+            chunk_size,
+        )
+        .await?;
 
         let read_time = read_start.elapsed();
         let row_count = rows.len();
@@ -584,9 +610,20 @@ async fn read_table_chunks(
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
-            read_chunk_keyset_fast(&source, table, &columns, &col_types, last_pk, max_pk, chunk_size).await?
+            read_chunk_keyset_fast(
+                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size,
+            )
+            .await?
         } else {
-            read_chunk_offset(&source, table, &columns, &col_types, total_rows as usize, chunk_size).await?
+            read_chunk_offset(
+                &source,
+                table,
+                &columns,
+                &col_types,
+                total_rows as usize,
+                chunk_size,
+            )
+            .await?
         };
 
         let read_time = read_start.elapsed();
@@ -653,21 +690,23 @@ async fn read_chunk_keyset_fast(
     let pk_col = &table.primary_key[0];
     let col_list = columns
         .iter()
-        .map(|c| format!("[{}]", c))
+        .map(|c| quote_mssql_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
     let mut query = format!(
-        "SELECT TOP {} {} FROM [{}].[{}] WITH (NOLOCK)",
-        chunk_size, col_list, table.schema, table.name
+        "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
+        chunk_size,
+        col_list,
+        qualify_mssql_table(&table.schema, &table.name)
     );
 
     let mut conditions = Vec::new();
     if let Some(pk) = last_pk {
-        conditions.push(format!("[{}] > {}", pk_col, pk));
+        conditions.push(format!("{} > {}", quote_mssql_ident(pk_col), pk));
     }
     if let Some(pk) = max_pk {
-        conditions.push(format!("[{}] <= {}", pk_col, pk));
+        conditions.push(format!("{} <= {}", quote_mssql_ident(pk_col), pk));
     }
 
     if !conditions.is_empty() {
@@ -675,7 +714,7 @@ async fn read_chunk_keyset_fast(
         query.push_str(&conditions.join(" AND "));
     }
 
-    query.push_str(&format!(" ORDER BY [{}]", pk_col));
+    query.push_str(&format!(" ORDER BY {}", quote_mssql_ident(pk_col)));
 
     // Use fast query with pre-computed column types
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
@@ -709,14 +748,14 @@ async fn read_chunk_offset(
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let col_list = columns
         .iter()
-        .map(|c| format!("[{}]", c))
+        .map(|c| quote_mssql_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
     // Create ORDER BY from primary key columns
     let order_by = if table.primary_key.is_empty() {
         if !columns.is_empty() {
-            format!("[{}]", columns[0])
+            quote_mssql_ident(&columns[0])
         } else {
             return Err(MigrateError::Transfer {
                 table: table.full_name(),
@@ -727,14 +766,18 @@ async fn read_chunk_offset(
         table
             .primary_key
             .iter()
-            .map(|c| format!("[{}]", c))
+            .map(|c| quote_mssql_ident(c))
             .collect::<Vec<_>>()
             .join(", ")
     };
 
     let query = format!(
-        "SELECT {} FROM [{}].[{}] WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-        col_list, table.schema, table.name, order_by, offset, chunk_size
+        "SELECT {} FROM {} WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+        col_list,
+        qualify_mssql_table(&table.schema, &table.name),
+        order_by,
+        offset,
+        chunk_size
     );
 
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
@@ -748,8 +791,15 @@ fn is_pk_sortable(table: &Table) -> bool {
     }
 
     let pk_type = table.pk_columns[0].data_type.to_lowercase();
-    matches!(
-        pk_type.as_str(),
-        "int" | "bigint" | "smallint" | "tinyint"
-    )
+    matches!(pk_type.as_str(), "int" | "bigint" | "smallint" | "tinyint")
+}
+
+/// Quote a SQL Server identifier, escaping closing brackets.
+fn quote_mssql_ident(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
+/// Qualify a SQL Server table name with schema and proper quoting.
+fn qualify_mssql_table(schema: &str, table: &str) -> String {
+    format!("{}.{}", quote_mssql_ident(schema), quote_mssql_ident(table))
 }

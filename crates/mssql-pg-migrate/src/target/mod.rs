@@ -4,7 +4,7 @@ use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
 use async_trait::async_trait;
-use bytes::{Bytes, BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
@@ -208,13 +208,14 @@ impl PgPool {
     fn generate_ddl(&self, table: &Table, target_schema: &str, unlogged: bool) -> String {
         let unlogged_str = if unlogged { "UNLOGGED " } else { "" };
 
-        let mut ddl = format!(
-            "CREATE {}TABLE \"{}\".\"{}\" (\n",
-            unlogged_str, target_schema, table.name
-        );
+        let schema = Self::quote_ident(target_schema);
+        let table_name = Self::quote_ident(&table.name);
+
+        let mut ddl = format!("CREATE {}TABLE {}.{} (\n", unlogged_str, schema, table_name);
 
         for (i, col) in table.columns.iter().enumerate() {
-            let pg_type = mssql_to_postgres(&col.data_type, col.max_length, col.precision, col.scale);
+            let pg_type =
+                mssql_to_postgres(&col.data_type, col.max_length, col.precision, col.scale);
 
             let nullable = if col.is_nullable { "" } else { " NOT NULL" };
 
@@ -224,7 +225,13 @@ impl PgPool {
                 ""
             };
 
-            ddl.push_str(&format!("    \"{}\" {}{}{}", col.name, pg_type, nullable, identity));
+            ddl.push_str(&format!(
+                "    {} {}{}{}",
+                Self::quote_ident(&col.name),
+                pg_type,
+                nullable,
+                identity
+            ));
 
             if i < table.columns.len() - 1 {
                 ddl.push_str(",\n");
@@ -244,7 +251,7 @@ impl PgPool {
 
     /// Fully qualify a table name.
     fn qualify_table(schema: &str, table: &str) -> String {
-        format!("\"{}\".\"{}\"", schema, table)
+        format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
     }
 
     /// Map SQL Server referential action to PostgreSQL.
@@ -294,7 +301,7 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        let sql = format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema);
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema));
         client
             .execute(&sql, &[])
             .await
@@ -428,12 +435,7 @@ impl TargetPool for PgPool {
         Ok(())
     }
 
-    async fn create_index(
-        &self,
-        table: &Table,
-        idx: &Index,
-        target_schema: &str,
-    ) -> Result<()> {
+    async fn create_index(&self, table: &Table, idx: &Index, target_schema: &str) -> Result<()> {
         let client = self
             .pool
             .get()
@@ -471,7 +473,10 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Target(e))?;
 
-        debug!("Created index {} for {}.{}", idx_name, target_schema, table.name);
+        debug!(
+            "Created index {} for {}.{}",
+            idx_name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -488,7 +493,11 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
         let cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
-        let ref_cols: Vec<String> = fk.ref_columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let ref_cols: Vec<String> = fk
+            .ref_columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
 
         let on_delete = Self::map_referential_action(&fk.on_delete);
         let on_update = Self::map_referential_action(&fk.on_update);
@@ -514,7 +523,10 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Target(e))?;
 
-        debug!("Created foreign key {} for {}.{}", fk_name, target_schema, table.name);
+        debug!(
+            "Created foreign key {} for {}.{}",
+            fk_name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -549,7 +561,10 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Target(e))?;
 
-        debug!("Created check constraint {} for {}.{}", chk_name, target_schema, table.name);
+        debug!(
+            "Created check constraint {} for {}.{}",
+            chk_name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -583,7 +598,10 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        let sql = format!("SELECT COUNT(*) FROM {}", Self::qualify_table(schema, table));
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}",
+            Self::qualify_table(schema, table)
+        );
         let row = client
             .query_one(&sql, &[])
             .await
@@ -644,7 +662,10 @@ impl TargetPool for PgPool {
                 .map_err(|e| MigrateError::Target(e))?;
         }
 
-        debug!("Reset sequence for {}.{}.{}", schema, table.name, identity_col.name);
+        debug!(
+            "Reset sequence for {}.{}.{}",
+            schema, table.name, identity_col.name
+        );
         Ok(())
     }
 
@@ -722,10 +743,8 @@ impl TargetPool for PgPool {
         // Even though sequential, this benefits from plan caching
         for row in &rows {
             // Convert SqlValue to params with native types
-            let params: Vec<Box<dyn ToSql + Sync + Send>> = row
-                .iter()
-                .map(sql_value_to_boxed_param)
-                .collect();
+            let params: Vec<Box<dyn ToSql + Sync + Send>> =
+                row.iter().map(sql_value_to_boxed_param).collect();
 
             // Create references for execute
             let param_refs: Vec<&(dyn ToSql + Sync)> = params
@@ -736,18 +755,7 @@ impl TargetPool for PgPool {
             match client.execute(&stmt, &param_refs).await {
                 Ok(_) => total += 1,
                 Err(e) => {
-                    let row_preview: Vec<String> = row
-                        .iter()
-                        .take(5)
-                        .map(|v| format!("{:?}", v))
-                        .collect();
-                    tracing::error!(
-                        "Upsert failed for {}.{}: {} - row preview: {:?}",
-                        schema,
-                        table,
-                        e,
-                        row_preview
-                    );
+                    tracing::error!("Upsert failed for {}.{}: {}", schema, table, e);
                     return Err(MigrateError::Target(e));
                 }
             }
@@ -802,14 +810,15 @@ impl PgPool {
         // Build column list
         let col_list: String = cols
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| pg_quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
 
         // COPY statement with text format
         let copy_stmt = format!(
-            "COPY \"{}\".\"{}\" ({}) FROM STDIN WITH (FORMAT text)",
-            schema, table, col_list
+            "COPY {} ({}) FROM STDIN WITH (FORMAT text)",
+            pg_qualify_table(schema, table),
+            col_list
         );
 
         let sink = client
@@ -847,10 +856,7 @@ impl PgPool {
         }
 
         // Finalize COPY
-        let copied = sink
-            .finish()
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
 
         Ok(copied)
     }
@@ -887,14 +893,15 @@ impl PgPool {
         // Build column list
         let col_list: String = cols
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|c| pg_quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
 
         // COPY statement with binary format
         let copy_stmt = format!(
-            "COPY \"{}\".\"{}\" ({}) FROM STDIN WITH (FORMAT binary)",
-            schema, table, col_list
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            pg_qualify_table(schema, table),
+            col_list
         );
 
         let t1 = Instant::now();
@@ -910,7 +917,7 @@ impl PgPool {
         let (chunk_tx, mut chunk_rx) = mpsc::channel::<Bytes>(COPY_CHANNEL_SIZE);
 
         let num_cols = cols.len() as i16;
-        let table_name = format!("{}.{}", schema, table);
+        let table_name = pg_qualify_table(schema, table);
         let table_name_clone = table_name.clone();
 
         // Spawn serializer task (producer)
@@ -975,12 +982,10 @@ impl PgPool {
         let mut send_count = 0usize;
 
         while let Some(chunk) = chunk_rx.recv().await {
-            sink.send(chunk)
-                .await
-                .map_err(|e| MigrateError::Transfer {
-                    table: table_name.clone(),
-                    message: format!("Binary COPY send failed: {}", e),
-                })?;
+            sink.send(chunk).await.map_err(|e| MigrateError::Transfer {
+                table: table_name.clone(),
+                message: format!("Binary COPY send failed: {}", e),
+            })?;
             send_count += 1;
         }
         let t_send = t2.elapsed();
@@ -999,10 +1004,7 @@ impl PgPool {
 
         // Finalize COPY
         let t3 = Instant::now();
-        let copied = sink
-            .finish()
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
         let t_finish = t3.elapsed();
 
         // Log timing breakdown for chunks with significant data
@@ -1115,12 +1117,10 @@ impl PgPool {
 
         // Consumer: send chunks to PostgreSQL
         while let Some(chunk) = chunk_rx.recv().await {
-            sink.send(chunk)
-                .await
-                .map_err(|e| MigrateError::Transfer {
-                    table: table_name.clone(),
-                    message: format!("Binary COPY send failed: {}", e),
-                })?;
+            sink.send(chunk).await.map_err(|e| MigrateError::Transfer {
+                table: table_name.clone(),
+                message: format!("Binary COPY send failed: {}", e),
+            })?;
         }
 
         // Wait for serializer
@@ -1136,10 +1136,7 @@ impl PgPool {
         };
 
         // Finalize COPY
-        let copied = sink
-            .finish()
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
 
         if copied != row_count {
             warn!(
@@ -1230,8 +1227,8 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue) {
         }
         SqlValue::Time(t) => {
             // PostgreSQL time is microseconds since midnight
-            let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
-                + t.nanosecond() as i64 / 1000;
+            let micros =
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1000;
             buf.put_i32(8);
             buf.put_i64(micros);
         }
@@ -1309,7 +1306,7 @@ fn build_insert_sql_literals(
 ) -> String {
     let col_list: String = cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1322,9 +1319,8 @@ fn build_insert_sql_literals(
         .collect();
 
     format!(
-        "INSERT INTO \"{}\".\"{}\" ({}) VALUES {}",
-        schema,
-        table,
+        "INSERT INTO {} ({}) VALUES {}",
+        pg_qualify_table(schema, table),
         col_list,
         value_rows.join(", ")
     )
@@ -1340,13 +1336,13 @@ fn build_upsert_sql_literals(
 ) -> String {
     let col_list: String = cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
     let pk_list: String = pk_cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1354,7 +1350,7 @@ fn build_upsert_sql_literals(
     let update_cols: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
         .collect();
 
     let value_rows: Vec<String> = rows
@@ -1369,24 +1365,29 @@ fn build_upsert_sql_literals(
     let change_detection: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\".\"{}\" IS DISTINCT FROM EXCLUDED.\"{}\"", table, c, c))
+        .map(|c| {
+            format!(
+                "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                pg_quote_ident(table),
+                pg_quote_ident(c),
+                pg_quote_ident(c)
+            )
+        })
         .collect();
 
     if update_cols.is_empty() {
         // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
-            schema,
-            table,
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
+            pg_qualify_table(schema, table),
             col_list,
             value_rows.join(", "),
             pk_list
         )
     } else {
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
-            schema,
-            table,
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            pg_qualify_table(schema, table),
             col_list,
             value_rows.join(", "),
             pk_list,
@@ -1441,7 +1442,7 @@ fn build_insert_sql(
 ) -> (String, Vec<Box<dyn ToSql + Sync + Send>>) {
     let col_list: String = cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1464,7 +1465,10 @@ fn build_insert_sql(
                 let p = format!("${}", idx);
                 idx += 1;
                 // Use cast from first row if available, otherwise from current value
-                let cast = col_casts.get(col_idx).copied().unwrap_or_else(|| sql_cast_for_value(value));
+                let cast = col_casts
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or_else(|| sql_cast_for_value(value));
                 format!("{}{}", p, cast)
             })
             .collect();
@@ -1476,9 +1480,8 @@ fn build_insert_sql(
     }
 
     let sql = format!(
-        "INSERT INTO \"{}\".\"{}\" ({}) VALUES {}",
-        schema,
-        table,
+        "INSERT INTO {} ({}) VALUES {}",
+        pg_qualify_table(schema, table),
         col_list,
         placeholders.join(", ")
     );
@@ -1496,13 +1499,13 @@ fn build_upsert_sql(
 ) -> (String, Vec<Box<dyn ToSql + Sync + Send>>) {
     let col_list: String = cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
     let pk_list: String = pk_cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1510,7 +1513,7 @@ fn build_upsert_sql(
     let update_cols: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
         .collect();
 
     let mut placeholders = Vec::new();
@@ -1531,7 +1534,10 @@ fn build_upsert_sql(
             .map(|(col_idx, value)| {
                 let p = format!("${}", idx);
                 idx += 1;
-                let cast = col_casts.get(col_idx).copied().unwrap_or_else(|| sql_cast_for_value(value));
+                let cast = col_casts
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or_else(|| sql_cast_for_value(value));
                 format!("{}{}", p, cast)
             })
             .collect();
@@ -1546,24 +1552,28 @@ fn build_upsert_sql(
     let change_detection: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\" IS DISTINCT FROM EXCLUDED.\"{}\"", c, c))
+        .map(|c| {
+            format!(
+                "{} IS DISTINCT FROM EXCLUDED.{}",
+                pg_quote_ident(c),
+                pg_quote_ident(c)
+            )
+        })
         .collect();
 
     let sql = if update_cols.is_empty() {
         // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
-            schema,
-            table,
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING",
+            pg_qualify_table(schema, table),
             col_list,
             placeholders.join(", "),
             pk_list
         )
     } else {
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
-            schema,
-            table,
+            "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            pg_qualify_table(schema, table),
             col_list,
             placeholders.join(", "),
             pk_list,
@@ -1595,6 +1605,14 @@ fn sql_value_to_param(value: &SqlValue) -> Box<dyn ToSql + Sync + Send> {
         SqlValue::Date(d) => Box::new(d.to_string()),
         SqlValue::Time(t) => Box::new(t.to_string()),
     }
+}
+
+fn pg_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn pg_qualify_table(schema: &str, table: &str) -> String {
+    format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(table))
 }
 
 /// Convert SqlValue to a boxed ToSql parameter with native types.
@@ -1646,13 +1664,13 @@ fn build_prepared_upsert_sql(
 ) -> String {
     let col_list: String = cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
     let pk_list: String = pk_cols
         .iter()
-        .map(|c| format!("\"{}\"", c))
+        .map(|c| pg_quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1666,26 +1684,39 @@ fn build_prepared_upsert_sql(
     let update_cols: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
         .collect();
 
     // Build change detection WHERE clause
     let change_detection: Vec<String> = cols
         .iter()
         .filter(|c| !pk_cols.contains(c))
-        .map(|c| format!("\"{}\".\"{}\" IS DISTINCT FROM EXCLUDED.\"{}\"", table, c, c))
+        .map(|c| {
+            format!(
+                "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                pg_quote_ident(table),
+                pg_quote_ident(c),
+                pg_quote_ident(c)
+            )
+        })
         .collect();
 
     if update_cols.is_empty() {
         // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
-            schema, table, col_list, placeholders, pk_list
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
+            pg_qualify_table(schema, table),
+            col_list,
+            placeholders,
+            pk_list
         )
     } else {
         format!(
-            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
-            schema, table, col_list, placeholders, pk_list,
+            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            pg_qualify_table(schema, table),
+            col_list,
+            placeholders,
+            pk_list,
             update_cols.join(", "),
             change_detection.join(" OR ")
         )
