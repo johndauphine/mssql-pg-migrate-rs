@@ -318,10 +318,10 @@ impl MigrationConfig {
         }
         let workers = self.workers.unwrap();
 
-        // Parallel readers: scale with cores, but stay conservative to avoid over-subscribing DB connections
-        // Target: roughly cores/2, capped at 12 (good balance for typical 8–32 core hosts)
+        // Parallel readers: scale with cores, but cap to avoid over-subscribing DB connections
+        // Target: roughly cores/2, capped at 16
         if self.parallel_readers.is_none() {
-            let readers = (cores / 2).max(2).min(12);
+            let readers = (cores / 2).max(2).min(16);
             self.parallel_readers = Some(readers);
         }
 
@@ -398,13 +398,13 @@ impl MigrationConfig {
         // Need enough connections for parallel readers + writers + workers
         if self.max_mssql_connections.is_none() {
             let readers = self.parallel_readers.unwrap_or(4);
-            let conns = (workers * readers + 4).max(8).min(64);
+            let conns = (workers * readers + 4).max(8).min(80);
             self.max_mssql_connections = Some(conns);
         }
 
         if self.max_pg_connections.is_none() {
             let writers = self.write_ahead_writers.unwrap_or(4);
-            let conns = (workers * writers + 4).max(8).min(48);
+            let conns = (workers * writers + 4).max(8).min(64);
             self.max_pg_connections = Some(conns);
         }
 
