@@ -21,5 +21,5 @@ migration:
   workers: 4
   chunk_size: 100000
   target_mode: drop_recreate
-  parallel_readers: 24
-  parallel_writers: 12
+  parallel_readers: 16
+  parallel_writers: 8
