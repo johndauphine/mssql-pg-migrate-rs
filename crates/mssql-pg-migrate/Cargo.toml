@@ -59,6 +59,9 @@ sha2 = { workspace = true }
 # Hex encoding
 hex = { workspace = true }
 
+# Connection pooling
+bb8 = { workspace = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

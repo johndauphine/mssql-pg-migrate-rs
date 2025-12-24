@@ -134,11 +134,20 @@ pub enum SqlNullType {
 pub struct PgPool {
     pool: Pool,
     config: crate::config::TargetConfig,
+    /// Rows per COPY buffer flush.
+    copy_buffer_rows: usize,
+    /// Rows per upsert batch statement.
+    upsert_batch_size: usize,
 }
 
 impl PgPool {
     /// Create a new PostgreSQL target pool.
-    pub async fn new(config: &crate::config::TargetConfig, max_conns: usize) -> Result<Self> {
+    pub async fn new(
+        config: &crate::config::TargetConfig,
+        max_conns: usize,
+        copy_buffer_rows: usize,
+        upsert_batch_size: usize,
+    ) -> Result<Self> {
         // Build tokio_postgres::Config
         let mut pg_config = PgConfig::new();
         pg_config.host(&config.host);
@@ -176,6 +185,8 @@ impl PgPool {
         Ok(Self {
             pool,
             config: config.clone(),
+            copy_buffer_rows,
+            upsert_batch_size,
         })
     }
 
@@ -682,12 +693,9 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
-        // Batch size based on reasonable SQL statement size
-        const BATCH_SIZE: usize = 1000;
-
         let mut total = 0u64;
 
-        for chunk in rows.chunks(BATCH_SIZE) {
+        for chunk in rows.chunks(self.upsert_batch_size) {
             let sql = build_upsert_sql_literals(schema, table, cols, pk_cols, chunk);
 
             match client.simple_query(&sql).await {
@@ -766,7 +774,7 @@ impl PgPool {
         futures::pin_mut!(sink);
 
         // Build data in chunks to avoid huge memory allocation
-        const CHUNK_SIZE: usize = 10000;
+        let copy_buffer_rows = self.copy_buffer_rows;
         let mut buf = BytesMut::with_capacity(1024 * 1024); // 1MB buffer
         let row_count = rows.len();
 
@@ -782,7 +790,7 @@ impl PgPool {
             buf.put_u8(b'\n');
 
             // Flush buffer periodically
-            if (i + 1) % CHUNK_SIZE == 0 || i + 1 == row_count {
+            if (i + 1) % copy_buffer_rows == 0 || i + 1 == row_count {
                 sink.send(buf.split().freeze())
                     .await
                     .map_err(|e| MigrateError::Transfer {

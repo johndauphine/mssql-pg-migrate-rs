@@ -146,6 +146,14 @@ pub struct MigrationConfig {
     /// Maximum PostgreSQL connections (default: auto).
     #[serde(default)]
     pub max_pg_connections: Option<usize>,
+
+    /// Rows per COPY buffer flush (default: 10000).
+    #[serde(default = "default_copy_buffer_rows")]
+    pub copy_buffer_rows: usize,
+
+    /// Rows per upsert batch statement (default: 1000).
+    #[serde(default = "default_upsert_batch_size")]
+    pub upsert_batch_size: usize,
 }
 
 /// Target mode for migration.
@@ -181,6 +189,8 @@ impl Default for MigrationConfig {
             create_check_constraints: true,
             max_mssql_connections: None,
             max_pg_connections: None,
+            copy_buffer_rows: default_copy_buffer_rows(),
+            upsert_batch_size: default_upsert_batch_size(),
         }
     }
 }
@@ -238,7 +248,7 @@ fn default_large_table_threshold() -> i64 {
 }
 
 fn default_read_ahead_buffers() -> usize {
-    4
+    10
 }
 
 fn default_write_ahead_writers() -> usize {
@@ -251,4 +261,12 @@ fn default_parallel_readers() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_copy_buffer_rows() -> usize {
+    10_000
+}
+
+fn default_upsert_batch_size() -> usize {
+    1_000
 }

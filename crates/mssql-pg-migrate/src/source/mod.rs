@@ -8,6 +8,7 @@ use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
 use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
+use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
@@ -47,39 +48,18 @@ pub trait SourcePool: Send + Sync {
     async fn close(&self);
 }
 
-/// MSSQL source pool implementation.
-pub struct MssqlPool {
+/// Connection manager for bb8 pool with tiberius.
+#[derive(Clone)]
+struct TiberiusConnectionManager {
     config: SourceConfig,
 }
 
-impl MssqlPool {
-    /// Create a new MSSQL source pool.
-    pub async fn new(config: SourceConfig) -> Result<Self> {
-        // Test connection on creation
-        let pool = Self { config };
-        let mut client = pool.get_client().await?;
-
-        // Test query
-        let row = client
-            .simple_query("SELECT 1")
-            .await
-            .map_err(|e| MigrateError::Source(e))?
-            .into_row()
-            .await
-            .map_err(|e| MigrateError::Source(e))?;
-
-        if row.is_some() {
-            info!(
-                "Connected to MSSQL: {}:{}/{}",
-                pool.config.host, pool.config.port, pool.config.database
-            );
-        }
-
-        Ok(pool)
+impl TiberiusConnectionManager {
+    fn new(config: SourceConfig) -> Self {
+        Self { config }
     }
 
-    /// Get a new client connection.
-    async fn get_client(&self) -> Result<Client<Compat<TcpStream>>> {
+    fn build_config(&self) -> Config {
         let mut config = Config::new();
         config.host(&self.config.host);
         config.port(self.config.port);
@@ -99,18 +79,86 @@ impl MssqlPool {
             }
         }
 
+        config
+    }
+}
+
+#[async_trait]
+impl bb8::ManageConnection for TiberiusConnectionManager {
+    type Connection = Client<Compat<TcpStream>>;
+    type Error = tiberius::error::Error;
+
+    async fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
+        let config = self.build_config();
         let tcp = TcpStream::connect(config.get_addr())
             .await
-            .map_err(|e| MigrateError::Pool(format!("TCP connect failed: {}", e)))?;
+            .map_err(|e| tiberius::error::Error::Io {
+                kind: e.kind(),
+                message: e.to_string(),
+            })?;
 
-        tcp.set_nodelay(true)
-            .map_err(|e| MigrateError::Pool(format!("Set nodelay failed: {}", e)))?;
+        tcp.set_nodelay(true).ok();
 
-        let client = Client::connect(config, tcp.compat_write())
+        Client::connect(config, tcp.compat_write()).await
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        conn.simple_query("SELECT 1").await?.into_row().await?;
+        Ok(())
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        false
+    }
+}
+
+/// MSSQL source pool implementation with connection pooling.
+pub struct MssqlPool {
+    pool: Pool<TiberiusConnectionManager>,
+    config: SourceConfig,
+}
+
+impl MssqlPool {
+    /// Create a new MSSQL source pool with connection pooling.
+    pub async fn new(config: SourceConfig) -> Result<Self> {
+        Self::with_max_connections(config, 8).await
+    }
+
+    /// Create a new MSSQL source pool with specified max connections.
+    pub async fn with_max_connections(config: SourceConfig, max_size: u32) -> Result<Self> {
+        let manager = TiberiusConnectionManager::new(config.clone());
+        let pool = Pool::builder()
+            .max_size(max_size)
+            .min_idle(Some(1))
+            .build(manager)
             .await
-            .map_err(|e| MigrateError::Source(e))?;
+            .map_err(|e| MigrateError::Pool(format!("Failed to create MSSQL pool: {}", e)))?;
 
-        Ok(client)
+        // Test connection
+        {
+            let mut conn = pool.get().await
+                .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))?;
+
+            conn.simple_query("SELECT 1")
+                .await
+                .map_err(|e| MigrateError::Source(e))?
+                .into_row()
+                .await
+                .map_err(|e| MigrateError::Source(e))?;
+        }
+
+        info!(
+            "Connected to MSSQL: {}:{}/{} (pool_size={})",
+            config.host, config.port, config.database, max_size
+        );
+
+        Ok(Self { pool, config })
+    }
+
+    /// Get a pooled connection.
+    async fn get_client(&self) -> Result<PooledConnection<'_, TiberiusConnectionManager>> {
+        self.pool.get().await
+            .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))
     }
 
     /// Load columns for a table.

@@ -83,7 +83,7 @@ impl Default for TransferConfig {
     fn default() -> Self {
         Self {
             chunk_size: 50_000,
-            read_ahead: 3,
+            read_ahead: 10, // Larger buffer reduces reader stalls
         }
     }
 }

@@ -63,12 +63,20 @@ pub struct MigrationResult {
 impl Orchestrator {
     /// Create a new orchestrator.
     pub async fn new(config: Config) -> Result<Self> {
-        // Create source pool
-        let source = MssqlPool::new(config.source.clone()).await?;
+        // Create source pool with configurable size
+        let mssql_pool_size = config.migration.max_mssql_connections
+            .unwrap_or_else(|| (config.migration.workers.max(4) * 2) as usize) as u32;
+        let source = MssqlPool::with_max_connections(config.source.clone(), mssql_pool_size).await?;
 
         // Create target pool
-        let max_conns = config.migration.workers.max(4) * 2;
-        let target = PgPool::new(&config.target, max_conns).await?;
+        let max_conns = config.migration.max_pg_connections
+            .unwrap_or_else(|| config.migration.workers.max(4) * 2);
+        let target = PgPool::new(
+            &config.target,
+            max_conns,
+            config.migration.copy_buffer_rows,
+            config.migration.upsert_batch_size,
+        ).await?;
 
         Ok(Self {
             config,
@@ -313,7 +321,7 @@ impl Orchestrator {
 
         let transfer_config = TransferConfig {
             chunk_size: self.config.migration.chunk_size,
-            read_ahead: 3,
+            read_ahead: self.config.migration.read_ahead_buffers,
         };
 
         let engine = Arc::new(TransferEngine::new(
