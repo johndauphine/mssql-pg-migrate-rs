@@ -49,13 +49,13 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
 
-    // Migration config validation
-    if config.migration.workers == 0 {
+    // Migration config validation - only check if explicitly set
+    if let Some(0) = config.migration.workers {
         return Err(MigrateError::Config(
             "migration.workers must be at least 1".into(),
         ));
     }
-    if config.migration.chunk_size == 0 {
+    if let Some(0) = config.migration.chunk_size {
         return Err(MigrateError::Config(
             "migration.chunk_size must be at least 1".into(),
         ));

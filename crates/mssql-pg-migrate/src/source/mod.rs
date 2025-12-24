@@ -382,18 +382,18 @@ impl SourcePool for MssqlPool {
         let pk_col = &table.primary_key[0];
         let mut client = self.get_client().await?;
 
-        // Use NTILE to split into partitions
+        // Use NTILE to split into partitions - CAST all to BIGINT for consistent types
         let query = format!(
             r#"
             WITH numbered AS (
-                SELECT [{pk}],
+                SELECT CAST([{pk}] AS BIGINT) AS pk_val,
                        NTILE({n}) OVER (ORDER BY [{pk}]) as partition_id
                 FROM [{schema}].[{table}]
             )
-            SELECT partition_id,
-                   MIN([{pk}]) as min_pk,
-                   MAX([{pk}]) as max_pk,
-                   COUNT(*) as row_count
+            SELECT CAST(partition_id AS BIGINT) AS partition_id,
+                   MIN(pk_val) as min_pk,
+                   MAX(pk_val) as max_pk,
+                   CAST(COUNT(*) AS BIGINT) as row_count
             FROM numbered
             GROUP BY partition_id
             ORDER BY partition_id
@@ -409,14 +409,20 @@ impl SourcePool for MssqlPool {
 
         let mut partitions = Vec::new();
         for row in rows {
+            // All values are now BIGINT
+            let partition_id = row.get::<i64, _>(0).unwrap_or(0) as i32;
+            let min_pk = row.get::<i64, _>(1);
+            let max_pk = row.get::<i64, _>(2);
+            let row_count = row.get::<i64, _>(3).unwrap_or(0);
+
             let partition = Partition {
                 table_name: table.full_name(),
-                partition_id: row.get::<i32, _>(0).unwrap_or(0),
-                min_pk: row.get::<i64, _>(1),
-                max_pk: row.get::<i64, _>(2),
+                partition_id,
+                min_pk,
+                max_pk,
                 start_row: 0,
                 end_row: 0,
-                row_count: row.get::<i64, _>(3).unwrap_or(0),
+                row_count,
             };
             partitions.push(partition);
         }
@@ -594,8 +600,9 @@ impl SourcePool for MssqlPool {
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         let mut client = self.get_client().await?;
 
+        // CAST to BIGINT for consistent type handling
         let query = format!(
-            "SELECT COUNT(*) FROM [{}].[{}]",
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM [{}].[{}]",
             schema, table
         );
 

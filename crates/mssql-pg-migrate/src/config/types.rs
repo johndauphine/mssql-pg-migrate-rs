@@ -1,6 +1,45 @@
-//! Configuration type definitions.
+//! Configuration type definitions with auto-tuning based on system resources.
 
 use serde::{Deserialize, Serialize};
+use sysinfo::System;
+use tracing::info;
+
+/// System resource information for auto-tuning.
+#[derive(Debug, Clone)]
+pub struct SystemResources {
+    /// Total RAM in bytes.
+    pub total_memory_bytes: u64,
+    /// Total RAM in GB.
+    pub total_memory_gb: f64,
+    /// Number of CPU cores.
+    pub cpu_cores: usize,
+}
+
+impl SystemResources {
+    /// Detect system resources.
+    pub fn detect() -> Self {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        let total_memory_bytes = sys.total_memory();
+        let total_memory_gb = total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let cpu_cores = sys.cpus().len();
+
+        Self {
+            total_memory_bytes,
+            total_memory_gb,
+            cpu_cores,
+        }
+    }
+
+    /// Log detected system resources.
+    pub fn log(&self) {
+        info!(
+            "System resources: {:.1} GB RAM, {} CPU cores",
+            self.total_memory_gb, self.cpu_cores
+        );
+    }
+}
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +53,17 @@ pub struct Config {
     /// Migration behavior configuration.
     #[serde(default)]
     pub migration: MigrationConfig,
+}
+
+impl Config {
+    /// Apply auto-tuned defaults based on system resources.
+    /// Only fills in values that weren't explicitly set in the config file.
+    pub fn with_auto_tuning(mut self) -> Self {
+        let resources = SystemResources::detect();
+        resources.log();
+        self.migration = self.migration.with_auto_tuning(&resources);
+        self
+    }
 }
 
 /// Source database (MSSQL) configuration.
@@ -85,23 +135,25 @@ pub struct TargetConfig {
 }
 
 /// Migration behavior configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// All performance-related fields use Option<T> to distinguish between
+/// "not set" (use auto-tuned default) and "explicitly set" (use provided value).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MigrationConfig {
-    /// Number of parallel workers (default: CPU cores - 2).
-    #[serde(default = "default_workers")]
-    pub workers: usize,
+    /// Number of parallel workers. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<usize>,
 
-    /// Rows per chunk (default: 100000).
-    #[serde(default = "default_chunk_size")]
-    pub chunk_size: usize,
+    /// Rows per chunk. Auto-tuned based on RAM if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<usize>,
 
-    /// Maximum partitions for large tables (default: 10).
-    #[serde(default = "default_max_partitions")]
-    pub max_partitions: usize,
+    /// Maximum partitions for large tables. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_partitions: Option<usize>,
 
-    /// Row count threshold for partitioning (default: 5000000).
-    #[serde(default = "default_large_table_threshold")]
-    pub large_table_threshold: i64,
+    /// Row count threshold for partitioning. Auto-tuned based on RAM if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large_table_threshold: Option<i64>,
 
     /// Tables to include (glob patterns).
     #[serde(default)]
@@ -115,17 +167,17 @@ pub struct MigrationConfig {
     #[serde(default)]
     pub target_mode: TargetMode,
 
-    /// Read-ahead buffer count (default: 4).
-    #[serde(default = "default_read_ahead_buffers")]
-    pub read_ahead_buffers: usize,
+    /// Read-ahead buffer count. Auto-tuned based on RAM if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_ahead_buffers: Option<usize>,
 
-    /// Parallel writers (default: 2).
-    #[serde(default = "default_write_ahead_writers")]
-    pub write_ahead_writers: usize,
+    /// Parallel writers. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_ahead_writers: Option<usize>,
 
-    /// Parallel readers (default: 2).
-    #[serde(default = "default_parallel_readers")]
-    pub parallel_readers: usize,
+    /// Parallel readers per large table. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_readers: Option<usize>,
 
     /// Create indexes after transfer (default: true).
     #[serde(default = "default_true")]
@@ -139,21 +191,168 @@ pub struct MigrationConfig {
     #[serde(default = "default_true")]
     pub create_check_constraints: bool,
 
-    /// Maximum MSSQL connections (default: auto).
-    #[serde(default)]
+    /// Maximum MSSQL connections. Auto-tuned based on workers if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_mssql_connections: Option<usize>,
 
-    /// Maximum PostgreSQL connections (default: auto).
-    #[serde(default)]
+    /// Maximum PostgreSQL connections. Auto-tuned based on workers if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pg_connections: Option<usize>,
 
-    /// Rows per COPY buffer flush (default: 10000).
-    #[serde(default = "default_copy_buffer_rows")]
-    pub copy_buffer_rows: usize,
+    /// Rows per COPY buffer flush. Auto-tuned based on RAM if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_buffer_rows: Option<usize>,
 
-    /// Rows per upsert batch statement (default: 1000).
-    #[serde(default = "default_upsert_batch_size")]
-    pub upsert_batch_size: usize,
+    /// Use binary COPY format (default: false).
+    #[serde(default)]
+    pub use_binary_copy: bool,
+
+    /// Rows per upsert batch statement. Auto-tuned based on RAM if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsert_batch_size: Option<usize>,
+}
+
+impl MigrationConfig {
+    /// Apply auto-tuned defaults based on system resources.
+    /// Only fills in values that are None (not explicitly set).
+    pub fn with_auto_tuning(mut self, resources: &SystemResources) -> Self {
+        let ram_gb = resources.total_memory_gb;
+        let cores = resources.cpu_cores;
+
+        // Workers: cores - 2, but at least 2 and at most 32
+        // For high core count machines, cap at a reasonable level
+        if self.workers.is_none() {
+            let workers = cores.saturating_sub(2).max(2).min(32);
+            self.workers = Some(workers);
+        }
+        let workers = self.workers.unwrap();
+
+        // Parallel readers: scale with cores, 2-8 range
+        // More cores = more parallel readers per table
+        if self.parallel_readers.is_none() {
+            let readers = (cores / 4).max(2).min(8);
+            self.parallel_readers = Some(readers);
+        }
+
+        // Parallel writers: similar to readers
+        if self.write_ahead_writers.is_none() {
+            let writers = (cores / 4).max(2).min(8);
+            self.write_ahead_writers = Some(writers);
+        }
+
+        // Max partitions: scale with cores
+        if self.max_partitions.is_none() {
+            let partitions = (cores / 2).max(4).min(16);
+            self.max_partitions = Some(partitions);
+        }
+
+        // Chunk size: scale with RAM
+        // Base: 50K rows, +25K per 8GB of RAM, cap at 200K
+        if self.chunk_size.is_none() {
+            let chunk = 50_000 + ((ram_gb / 8.0) as usize * 25_000);
+            let chunk = chunk.max(50_000).min(200_000);
+            self.chunk_size = Some(chunk);
+        }
+
+        // Read-ahead buffers: scale with RAM
+        // More RAM = larger read-ahead pipeline
+        if self.read_ahead_buffers.is_none() {
+            let buffers = ((ram_gb / 4.0) as usize).max(4).min(32);
+            self.read_ahead_buffers = Some(buffers);
+        }
+
+        // Large table threshold: scale with RAM
+        // More RAM = can handle larger tables before partitioning
+        if self.large_table_threshold.is_none() {
+            let threshold = ((ram_gb / 8.0) as i64 * 1_000_000).max(1_000_000).min(20_000_000);
+            self.large_table_threshold = Some(threshold);
+        }
+
+        // COPY buffer rows: scale with RAM
+        if self.copy_buffer_rows.is_none() {
+            let rows = ((ram_gb / 4.0) as usize * 5_000).max(5_000).min(50_000);
+            self.copy_buffer_rows = Some(rows);
+        }
+
+        // Upsert batch size: scale with RAM
+        if self.upsert_batch_size.is_none() {
+            let batch = ((ram_gb / 8.0) as usize * 500).max(500).min(5_000);
+            self.upsert_batch_size = Some(batch);
+        }
+
+        // Connection pool sizes: scale with workers
+        if self.max_mssql_connections.is_none() {
+            let conns = (workers * 2).max(4).min(64);
+            self.max_mssql_connections = Some(conns);
+        }
+
+        if self.max_pg_connections.is_none() {
+            let conns = (workers * 2).max(4).min(64);
+            self.max_pg_connections = Some(conns);
+        }
+
+        // Log the auto-tuned values
+        info!(
+            "Auto-tuned config: workers={}, parallel_readers={}, chunk_size={}, read_ahead={}, \
+             large_table_threshold={}, mssql_conns={}, pg_conns={}",
+            self.workers.unwrap(),
+            self.parallel_readers.unwrap(),
+            self.chunk_size.unwrap(),
+            self.read_ahead_buffers.unwrap(),
+            self.large_table_threshold.unwrap(),
+            self.max_mssql_connections.unwrap(),
+            self.max_pg_connections.unwrap(),
+        );
+
+        self
+    }
+
+    // Accessor methods that return the effective value (with fallback defaults)
+    // These are used when the config hasn't been auto-tuned yet
+
+    pub fn get_workers(&self) -> usize {
+        self.workers.unwrap_or(4)
+    }
+
+    pub fn get_chunk_size(&self) -> usize {
+        self.chunk_size.unwrap_or(50_000)
+    }
+
+    pub fn get_max_partitions(&self) -> usize {
+        self.max_partitions.unwrap_or(10)
+    }
+
+    pub fn get_large_table_threshold(&self) -> i64 {
+        self.large_table_threshold.unwrap_or(5_000_000)
+    }
+
+    pub fn get_read_ahead_buffers(&self) -> usize {
+        self.read_ahead_buffers.unwrap_or(10)
+    }
+
+    pub fn get_write_ahead_writers(&self) -> usize {
+        self.write_ahead_writers.unwrap_or(2)
+    }
+
+    pub fn get_parallel_readers(&self) -> usize {
+        self.parallel_readers.unwrap_or(2)
+    }
+
+    pub fn get_max_mssql_connections(&self) -> usize {
+        self.max_mssql_connections.unwrap_or(8)
+    }
+
+    pub fn get_max_pg_connections(&self) -> usize {
+        self.max_pg_connections.unwrap_or(8)
+    }
+
+    pub fn get_copy_buffer_rows(&self) -> usize {
+        self.copy_buffer_rows.unwrap_or(10_000)
+    }
+
+    pub fn get_upsert_batch_size(&self) -> usize {
+        self.upsert_batch_size.unwrap_or(1_000)
+    }
 }
 
 /// Target mode for migration.
@@ -171,31 +370,7 @@ pub enum TargetMode {
     Upsert,
 }
 
-impl Default for MigrationConfig {
-    fn default() -> Self {
-        Self {
-            workers: default_workers(),
-            chunk_size: default_chunk_size(),
-            max_partitions: default_max_partitions(),
-            large_table_threshold: default_large_table_threshold(),
-            include_tables: Vec::new(),
-            exclude_tables: Vec::new(),
-            target_mode: TargetMode::default(),
-            read_ahead_buffers: default_read_ahead_buffers(),
-            write_ahead_writers: default_write_ahead_writers(),
-            parallel_readers: default_parallel_readers(),
-            create_indexes: true,
-            create_foreign_keys: true,
-            create_check_constraints: true,
-            max_mssql_connections: None,
-            max_pg_connections: None,
-            copy_buffer_rows: default_copy_buffer_rows(),
-            upsert_batch_size: default_upsert_batch_size(),
-        }
-    }
-}
-
-// Default value functions
+// Default value functions for serde
 fn default_mssql() -> String {
     "mssql".to_string()
 }
@@ -228,45 +403,6 @@ fn default_require() -> String {
     "require".to_string()
 }
 
-fn default_workers() -> usize {
-    let cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-    (cpus.saturating_sub(2)).max(2).min(32)
-}
-
-fn default_chunk_size() -> usize {
-    100_000
-}
-
-fn default_max_partitions() -> usize {
-    10
-}
-
-fn default_large_table_threshold() -> i64 {
-    5_000_000
-}
-
-fn default_read_ahead_buffers() -> usize {
-    10
-}
-
-fn default_write_ahead_writers() -> usize {
-    2
-}
-
-fn default_parallel_readers() -> usize {
-    2
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_copy_buffer_rows() -> usize {
-    10_000
-}
-
-fn default_upsert_batch_size() -> usize {
-    1_000
 }

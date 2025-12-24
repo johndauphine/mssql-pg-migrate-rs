@@ -4,11 +4,12 @@ use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use bytes::{BufMut, BytesMut};
+use chrono::Timelike;
+use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
 use tokio_postgres::{types::ToSql, Config as PgConfig, NoTls};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Trait for target database operations.
 #[async_trait]
@@ -138,6 +139,8 @@ pub struct PgPool {
     copy_buffer_rows: usize,
     /// Rows per upsert batch statement.
     upsert_batch_size: usize,
+    /// Use binary COPY format.
+    use_binary_copy: bool,
 }
 
 impl PgPool {
@@ -147,6 +150,7 @@ impl PgPool {
         max_conns: usize,
         copy_buffer_rows: usize,
         upsert_batch_size: usize,
+        use_binary_copy: bool,
     ) -> Result<Self> {
         // Build tokio_postgres::Config
         let mut pg_config = PgConfig::new();
@@ -187,6 +191,7 @@ impl PgPool {
             config: config.clone(),
             copy_buffer_rows,
             upsert_batch_size,
+            use_binary_copy,
         })
     }
 
@@ -693,33 +698,50 @@ impl TargetPool for PgPool {
             .await
             .map_err(|e| MigrateError::Pool(e.to_string()))?;
 
+        // Build prepared statement SQL with parameters ($1, $2, ...)
+        let upsert_sql = build_prepared_upsert_sql(schema, table, cols, pk_cols);
+
+        // Prepare the statement once - PostgreSQL will cache the query plan
+        let stmt = client
+            .prepare(&upsert_sql)
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
         let mut total = 0u64;
 
-        for chunk in rows.chunks(self.upsert_batch_size) {
-            let sql = build_upsert_sql_literals(schema, table, cols, pk_cols, chunk);
+        // Execute each row with the prepared statement
+        // Even though sequential, this benefits from plan caching
+        for row in &rows {
+            // Convert SqlValue to params with native types
+            let params: Vec<Box<dyn ToSql + Sync + Send>> = row
+                .iter()
+                .map(sql_value_to_boxed_param)
+                .collect();
 
-            match client.simple_query(&sql).await {
-                Ok(_) => {}
+            // Create references for execute
+            let param_refs: Vec<&(dyn ToSql + Sync)> = params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                .collect();
+
+            match client.execute(&stmt, &param_refs).await {
+                Ok(_) => total += 1,
                 Err(e) => {
-                    if let Some(first_row) = chunk.first() {
-                        let row_preview: Vec<String> = first_row
-                            .iter()
-                            .take(5)
-                            .map(|v| format!("{:?}", v))
-                            .collect();
-                        tracing::error!(
-                            "Upsert failed for {}.{}: {} - first row preview: {:?}",
-                            schema,
-                            table,
-                            e,
-                            row_preview
-                        );
-                    }
+                    let row_preview: Vec<String> = row
+                        .iter()
+                        .take(5)
+                        .map(|v| format!("{:?}", v))
+                        .collect();
+                    tracing::error!(
+                        "Upsert failed for {}.{}: {} - row preview: {:?}",
+                        schema,
+                        table,
+                        e,
+                        row_preview
+                    );
                     return Err(MigrateError::Target(e));
                 }
             }
-
-            total += chunk.len() as u64;
         }
 
         Ok(total)
@@ -747,6 +769,21 @@ impl PgPool {
             return Ok(0);
         }
 
+        if self.use_binary_copy {
+            self.insert_batch_binary(schema, table, cols, rows).await
+        } else {
+            self.insert_batch_text(schema, table, cols, rows).await
+        }
+    }
+
+    /// Insert rows using text COPY format.
+    async fn insert_batch_text(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
         let client = self
             .pool
             .get()
@@ -807,6 +844,182 @@ impl PgPool {
             .map_err(|e| MigrateError::Target(e))?;
 
         Ok(copied)
+    }
+
+    /// Insert rows using binary COPY format (faster for numeric-heavy tables).
+    async fn insert_batch_binary(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+
+        // Build column list
+        let col_list: String = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // COPY statement with binary format
+        let copy_stmt = format!(
+            "COPY \"{}\".\"{}\" ({}) FROM STDIN WITH (FORMAT binary)",
+            schema, table, col_list
+        );
+
+        let sink = client
+            .copy_in(&copy_stmt)
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        futures::pin_mut!(sink);
+
+        // Binary COPY buffer
+        let copy_buffer_rows = self.copy_buffer_rows;
+        let mut buf = BytesMut::with_capacity(2 * 1024 * 1024); // 2MB buffer for binary
+
+        // Write binary COPY header
+        // Signature: PGCOPY\n\377\r\n\0
+        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        // Flags field (32-bit): 0 = no OIDs
+        buf.put_i32(0);
+        // Header extension area length: 0
+        buf.put_i32(0);
+
+        let num_cols = cols.len() as i16;
+
+        for (i, row) in rows.into_iter().enumerate() {
+            // Field count (16-bit)
+            buf.put_i16(num_cols);
+
+            // Write each field
+            for value in row.iter() {
+                write_binary_value(&mut buf, value);
+            }
+
+            // Flush buffer periodically (including header on first flush)
+            if (i + 1) % copy_buffer_rows == 0 {
+                sink.send(buf.split().freeze())
+                    .await
+                    .map_err(|e| MigrateError::Transfer {
+                        table: format!("{}.{}", schema, table),
+                        message: format!("Binary COPY send failed: {}", e),
+                    })?;
+            }
+        }
+
+        // Write trailer: -1 as 16-bit signed integer
+        buf.put_i16(-1);
+
+        // Send remaining data
+        if !buf.is_empty() {
+            sink.send(buf.freeze())
+                .await
+                .map_err(|e| MigrateError::Transfer {
+                    table: format!("{}.{}", schema, table),
+                    message: format!("Binary COPY final send failed: {}", e),
+                })?;
+        }
+
+        // Finalize COPY
+        let copied = sink
+            .finish()
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        Ok(copied)
+    }
+}
+
+/// Write a value in PostgreSQL binary format.
+fn write_binary_value(buf: &mut BytesMut, value: &SqlValue) {
+    match value {
+        SqlValue::Null(_) => {
+            // NULL is represented as -1 length
+            buf.put_i32(-1);
+        }
+        SqlValue::Bool(b) => {
+            buf.put_i32(1); // length
+            buf.put_u8(if *b { 1 } else { 0 });
+        }
+        SqlValue::I16(n) => {
+            buf.put_i32(2); // length
+            buf.put_i16(*n);
+        }
+        SqlValue::I32(n) => {
+            buf.put_i32(4); // length
+            buf.put_i32(*n);
+        }
+        SqlValue::I64(n) => {
+            buf.put_i32(8); // length
+            buf.put_i64(*n);
+        }
+        SqlValue::F32(n) => {
+            buf.put_i32(4); // length
+            buf.put_f32(*n);
+        }
+        SqlValue::F64(n) => {
+            buf.put_i32(8); // length
+            buf.put_f64(*n);
+        }
+        SqlValue::String(s) => {
+            let bytes = s.as_bytes();
+            buf.put_i32(bytes.len() as i32);
+            buf.extend_from_slice(bytes);
+        }
+        SqlValue::Bytes(b) => {
+            buf.put_i32(b.len() as i32);
+            buf.extend_from_slice(b);
+        }
+        SqlValue::Uuid(u) => {
+            buf.put_i32(16); // UUID is always 16 bytes
+            buf.extend_from_slice(u.as_bytes());
+        }
+        SqlValue::Decimal(d) => {
+            // PostgreSQL NUMERIC binary format is complex, fallback to text representation
+            // which PostgreSQL will parse. This is still faster than text COPY for other types.
+            let s = d.to_string();
+            let bytes = s.as_bytes();
+            buf.put_i32(bytes.len() as i32);
+            buf.extend_from_slice(bytes);
+        }
+        SqlValue::DateTime(dt) => {
+            // PostgreSQL timestamp is microseconds since 2000-01-01 00:00:00
+            // Chrono's timestamp is microseconds since 1970-01-01
+            // Difference: 30 years = 946684800 seconds
+            const POSTGRES_EPOCH_OFFSET: i64 = 946_684_800_000_000; // microseconds
+            let micros = dt.and_utc().timestamp_micros() - POSTGRES_EPOCH_OFFSET;
+            buf.put_i32(8);
+            buf.put_i64(micros);
+        }
+        SqlValue::DateTimeOffset(dt) => {
+            // PostgreSQL timestamptz is also stored as microseconds since 2000-01-01 UTC
+            const POSTGRES_EPOCH_OFFSET: i64 = 946_684_800_000_000;
+            let micros = dt.timestamp_micros() - POSTGRES_EPOCH_OFFSET;
+            buf.put_i32(8);
+            buf.put_i64(micros);
+        }
+        SqlValue::Date(d) => {
+            // PostgreSQL date is days since 2000-01-01
+            // Calculate days from 2000-01-01
+            let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+            let days = (*d - epoch).num_days() as i32;
+            buf.put_i32(4);
+            buf.put_i32(days);
+        }
+        SqlValue::Time(t) => {
+            // PostgreSQL time is microseconds since midnight
+            let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
+                + t.nanosecond() as i64 / 1000;
+            buf.put_i32(8);
+            buf.put_i64(micros);
+        }
     }
 }
 
@@ -1166,5 +1379,100 @@ fn sql_value_to_param(value: &SqlValue) -> Box<dyn ToSql + Sync + Send> {
         SqlValue::DateTimeOffset(dt) => Box::new(dt.to_rfc3339()),
         SqlValue::Date(d) => Box::new(d.to_string()),
         SqlValue::Time(t) => Box::new(t.to_string()),
+    }
+}
+
+/// Convert SqlValue to a boxed ToSql parameter with native types.
+/// Uses native PostgreSQL types for better performance with prepared statements.
+fn sql_value_to_boxed_param(value: &SqlValue) -> Box<dyn ToSql + Sync + Send> {
+    match value {
+        SqlValue::Null(null_type) => {
+            // Return properly typed NULL for each type
+            match null_type {
+                SqlNullType::Bool => Box::new(None::<bool>),
+                SqlNullType::I16 => Box::new(None::<i16>),
+                SqlNullType::I32 => Box::new(None::<i32>),
+                SqlNullType::I64 => Box::new(None::<i64>),
+                SqlNullType::F32 => Box::new(None::<f32>),
+                SqlNullType::F64 => Box::new(None::<f64>),
+                SqlNullType::String => Box::new(None::<String>),
+                SqlNullType::Bytes => Box::new(None::<Vec<u8>>),
+                SqlNullType::Uuid => Box::new(None::<uuid::Uuid>),
+                SqlNullType::Decimal => Box::new(None::<rust_decimal::Decimal>),
+                SqlNullType::DateTime => Box::new(None::<chrono::NaiveDateTime>),
+                SqlNullType::DateTimeOffset => Box::new(None::<chrono::NaiveDateTime>),
+                SqlNullType::Date => Box::new(None::<chrono::NaiveDate>),
+                SqlNullType::Time => Box::new(None::<chrono::NaiveTime>),
+            }
+        }
+        SqlValue::Bool(b) => Box::new(*b),
+        SqlValue::I16(n) => Box::new(*n),
+        SqlValue::I32(n) => Box::new(*n),
+        SqlValue::I64(n) => Box::new(*n),
+        SqlValue::F32(n) => Box::new(*n),
+        SqlValue::F64(n) => Box::new(*n),
+        SqlValue::String(s) => Box::new(s.clone()),
+        SqlValue::Bytes(b) => Box::new(b.clone()),
+        SqlValue::Uuid(u) => Box::new(*u),
+        SqlValue::Decimal(d) => Box::new(*d),
+        SqlValue::DateTime(dt) => Box::new(*dt),
+        SqlValue::DateTimeOffset(dt) => Box::new(dt.naive_utc()),
+        SqlValue::Date(d) => Box::new(*d),
+        SqlValue::Time(t) => Box::new(*t),
+    }
+}
+
+/// Build prepared UPSERT SQL statement with parameter placeholders.
+fn build_prepared_upsert_sql(
+    schema: &str,
+    table: &str,
+    cols: &[String],
+    pk_cols: &[String],
+) -> String {
+    let col_list: String = cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let pk_list: String = pk_cols
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build parameter placeholders ($1, $2, ...)
+    let placeholders: String = (1..=cols.len())
+        .map(|i| format!("${}", i))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build UPDATE SET clause (exclude PK columns)
+    let update_cols: Vec<String> = cols
+        .iter()
+        .filter(|c| !pk_cols.contains(c))
+        .map(|c| format!("\"{}\" = EXCLUDED.\"{}\"", c, c))
+        .collect();
+
+    // Build change detection WHERE clause
+    let change_detection: Vec<String> = cols
+        .iter()
+        .filter(|c| !pk_cols.contains(c))
+        .map(|c| format!("\"{}\".\"{}\" IS DISTINCT FROM EXCLUDED.\"{}\"", table, c, c))
+        .collect();
+
+    if update_cols.is_empty() {
+        // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
+        format!(
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({}) ON CONFLICT ({}) DO NOTHING",
+            schema, table, col_list, placeholders, pk_list
+        )
+    } else {
+        format!(
+            "INSERT INTO \"{}\".\"{}\" ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            schema, table, col_list, placeholders, pk_list,
+            update_cols.join(", "),
+            change_detection.join(" OR ")
+        )
     }
 }
