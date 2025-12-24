@@ -400,7 +400,8 @@ impl Orchestrator {
 
                             // Subtract 1 from min_pk so that `WHERE pk > (min_pk - 1)` includes the first row.
                             // For the first partition (min_pk = 1), this becomes `WHERE pk > 0`.
-                            let adjusted_min = partition.min_pk.map(|pk| pk - 1);
+                            // Use saturating_sub to handle edge case of i64::MIN.
+                            let adjusted_min = partition.min_pk.map(|pk| pk.saturating_sub(1));
 
                             let job = TransferJob {
                                 table: table.clone(),
@@ -488,11 +489,13 @@ impl Orchestrator {
                 }
                 Ok(Err(e)) => {
                     error!("{}: failed - {}", job_name, e);
-                    table_errors.insert(base_table.clone(), e.to_string());
+                    // Preserve first error for this table (don't overwrite if partition already failed)
+                    table_errors.entry(base_table.clone()).or_insert_with(|| e.to_string());
                 }
                 Err(e) => {
                     error!("{}: task panicked - {}", job_name, e);
-                    table_errors.insert(base_table.clone(), format!("Task panicked: {}", e));
+                    // Preserve first error for this table (don't overwrite if partition already failed)
+                    table_errors.entry(base_table.clone()).or_insert_with(|| format!("Task panicked: {}", e));
                 }
             }
         }
