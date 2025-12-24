@@ -355,6 +355,19 @@ impl Orchestrator {
         table.row_count >= self.config.migration.get_large_table_threshold()
     }
 
+    /// Compute partition count for a table based on size and configured limits.
+    fn partition_count(&self, table: &Table) -> usize {
+        if !self.should_partition(table) {
+            return 1;
+        }
+
+        let max_partitions = self.config.migration.get_parallel_readers().max(1);
+        let min_rows = self.config.migration.get_min_rows_per_partition().max(1);
+        let by_rows = ((table.row_count.max(0) + min_rows - 1) / min_rows) as usize;
+
+        max_partitions.min(by_rows).max(1)
+    }
+
     /// Transfer data for all tables.
     async fn transfer_data(
         &self,
@@ -409,8 +422,8 @@ impl Orchestrator {
             let table_name = table.full_name();
 
             // Check if table should be partitioned for parallel reads
-            let num_partitions = self.config.migration.get_parallel_readers();
-            if self.should_partition(table) && num_partitions > 1 {
+            let num_partitions = self.partition_count(table);
+            if num_partitions > 1 {
                 // Get partition boundaries
                 match self
                     .source
@@ -616,7 +629,7 @@ impl Orchestrator {
 
         // Create indexes
         if self.config.migration.create_indexes {
-            let max_tasks = self.config.migration.get_workers().max(1);
+            let max_tasks = self.config.migration.get_finalizer_concurrency().max(1);
             info!("Creating indexes with up to {} concurrent tasks", max_tasks);
             let semaphore = Arc::new(Semaphore::new(max_tasks));
             let mut handles = Vec::new();
