@@ -6,13 +6,15 @@ Designed for headless operation in scripted environments, Kubernetes, and Airflo
 
 ## Performance
 
-Tested with Stack Overflow 2010 dataset (~19.3M rows):
+Tested with Stack Overflow 2010 dataset (19.3M rows, 9 tables):
 
-| Mode | Throughput |
-|------|------------|
-| drop_recreate | ~90K rows/sec |
-| truncate | ~92K rows/sec |
-| upsert | ~76K rows/sec |
+| Mode | Duration | Throughput |
+|------|----------|------------|
+| drop_recreate | 228s | 84,388 rows/sec |
+| truncate | 193s | 100,056 rows/sec |
+| upsert | 257s | 74,991 rows/sec |
+
+*Single worker, chunk_size=1000, localhost MSSQL → PostgreSQL*
 
 ## Features
 
