@@ -755,7 +755,18 @@ impl TargetPool for PgPool {
             match client.execute(&stmt, &param_refs).await {
                 Ok(_) => total += 1,
                 Err(e) => {
-                    tracing::error!("Upsert failed for {}.{}: {}", schema, table, e);
+                    // Include row preview (first 5 columns) for debugging
+                    let preview: Vec<String> = row
+                        .iter()
+                        .take(5)
+                        .map(|v| format!("{:?}", v))
+                        .collect();
+                    let preview_str = preview.join(", ");
+                    let suffix = if row.len() > 5 { "..." } else { "" };
+                    tracing::error!(
+                        "Upsert failed for {}.{}: {} | Row preview: [{}{}]",
+                        schema, table, e, preview_str, suffix
+                    );
                     return Err(MigrateError::Target(e));
                 }
             }
