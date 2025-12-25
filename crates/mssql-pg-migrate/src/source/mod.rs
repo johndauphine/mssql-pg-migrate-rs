@@ -751,6 +751,15 @@ impl SourcePool for MssqlPool {
     }
 }
 
+impl MssqlPool {
+    /// Test the connection to the MSSQL database.
+    pub async fn test_connection(&self) -> Result<()> {
+        let mut client = self.get_client().await?;
+        client.simple_query("SELECT 1").await?.into_row().await?;
+        Ok(())
+    }
+}
+
 /// Convert a row value to SqlValue based on the column type.
 fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
     let dt = data_type.to_lowercase();

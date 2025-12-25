@@ -20,7 +20,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = Config::load("config.yaml")?;
 //!     let orchestrator = Orchestrator::new(config).await?;
-//!     let result = orchestrator.run(None).await?;
+//!     let result = orchestrator.run(None, false).await?;
 //!     println!("Migrated {} rows", result.rows_transferred);
 //!     Ok(())
 //! }
@@ -38,7 +38,7 @@ pub mod typemap;
 // Re-exports for convenient access
 pub use config::{Config, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode};
 pub use error::{MigrateError, Result};
-pub use orchestrator::{MigrationResult, Orchestrator};
+pub use orchestrator::{HealthCheckResult, MigrationResult, Orchestrator, ProgressUpdate, TableError};
 pub use source::{MssqlPool, Table};
 pub use state::MigrationState;
 pub use target::{PgPool, SqlNullType, SqlValue};

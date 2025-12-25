@@ -867,6 +867,19 @@ impl TargetPool for PgPool {
 }
 
 impl PgPool {
+    /// Test the connection to the PostgreSQL database.
+    pub async fn test_connection(&self) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e.to_string(), "testing PostgreSQL connection"))?;
+        client.simple_query("SELECT 1").await?;
+        Ok(())
+    }
+}
+
+impl PgPool {
     /// Insert rows using PostgreSQL COPY protocol for maximum performance.
     async fn insert_batch(
         &self,

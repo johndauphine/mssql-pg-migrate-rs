@@ -102,14 +102,14 @@ impl MigrationState {
     /// Load state from a file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let state: Self = serde_yaml::from_str(&content)?;
+        let state: Self = serde_json::from_str(&content)?;
         Ok(state)
     }
 
     /// Save state to a file (atomic write).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let content = serde_yaml::to_string(self)
+        let content = serde_json::to_string_pretty(self)
             .map_err(|e| MigrateError::Config(format!("Failed to serialize state: {}", e)))?;
 
         // Atomic write: write to temp file, then rename
@@ -226,5 +226,93 @@ mod tests {
         let state = MigrationState::new("test-run".into(), "abc123".into());
         assert!(state.validate_config("abc123").is_ok());
         assert!(state.validate_config("different").is_err());
+    }
+
+    #[test]
+    fn test_state_save_load_json() {
+        let mut state = MigrationState::new("test-run".into(), "abc123".into());
+        state.get_or_create_table("dbo.Users", 1000);
+
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        // Verify file is valid JSON
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&content).is_ok(),
+            "State file should be valid JSON"
+        );
+
+        // Verify round-trip
+        let loaded = MigrationState::load(file.path()).unwrap();
+        assert_eq!(loaded.run_id, "test-run");
+        assert_eq!(loaded.config_hash, "abc123");
+        assert!(loaded.tables.contains_key("dbo.Users"));
+    }
+
+    #[test]
+    fn test_state_json_format_pretty() {
+        let state = MigrationState::new("test-run".into(), "hash".into());
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        // Pretty JSON should have newlines and indentation
+        assert!(content.contains('\n'), "JSON should be pretty-printed with newlines");
+        assert!(content.contains("  "), "JSON should have indentation");
+    }
+
+    #[test]
+    fn test_state_file_is_json_not_yaml() {
+        let state = MigrationState::new("test".into(), "hash".into());
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        // Should NOT contain YAML-specific markers
+        assert!(
+            !content.starts_with("---"),
+            "State file should not be YAML (no --- header)"
+        );
+        // Should contain JSON markers
+        assert!(content.contains('{'), "State file should contain JSON object");
+        assert!(content.contains('}'), "State file should contain JSON object");
+        assert!(
+            content.contains("\"run_id\""),
+            "State file should have quoted keys (JSON format)"
+        );
+    }
+
+    #[test]
+    fn test_state_table_state_round_trip() {
+        let mut state = MigrationState::new("test".into(), "hash".into());
+        let table_state = state.get_or_create_table("dbo.Orders", 5000);
+        table_state.rows_transferred = 2500;
+        table_state.last_pk = Some(1234);
+        table_state.status = TaskStatus::InProgress;
+
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        let loaded = MigrationState::load(file.path()).unwrap();
+        let loaded_table = loaded.tables.get("dbo.Orders").unwrap();
+        assert_eq!(loaded_table.rows_transferred, 2500);
+        assert_eq!(loaded_table.last_pk, Some(1234));
+        assert_eq!(loaded_table.status, TaskStatus::InProgress);
+    }
+
+    #[test]
+    fn test_state_with_error() {
+        let mut state = MigrationState::new("test".into(), "hash".into());
+        let table_state = state.get_or_create_table("dbo.Failed", 1000);
+        table_state.mark_failed("Connection timeout");
+
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        let loaded = MigrationState::load(file.path()).unwrap();
+        let loaded_table = loaded.tables.get("dbo.Failed").unwrap();
+        assert_eq!(loaded_table.status, TaskStatus::Failed);
+        assert_eq!(loaded_table.error, Some("Connection timeout".to_string()));
     }
 }

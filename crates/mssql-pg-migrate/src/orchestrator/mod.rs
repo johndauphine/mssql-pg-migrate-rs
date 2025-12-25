@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, error, info, warn};
 
@@ -21,6 +22,7 @@ pub struct Orchestrator {
     state: Option<MigrationState>,
     source: Arc<MssqlPool>,
     target: Arc<PgPool>,
+    progress_enabled: bool,
 }
 
 /// Result of a migration run.
@@ -29,7 +31,7 @@ pub struct MigrationResult {
     /// Unique run identifier.
     pub run_id: String,
 
-    /// Final status.
+    /// Final status: "completed", "failed", "cancelled", "dry_run".
     pub status: String,
 
     /// Total duration in seconds.
@@ -56,8 +58,90 @@ pub struct MigrationResult {
     /// Average throughput (rows/second).
     pub rows_per_second: i64,
 
-    /// List of failed table names.
+    /// List of failed table names (for backward compatibility).
     pub failed_tables: Vec<String>,
+
+    /// Detailed errors per table.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub table_errors: Vec<TableError>,
+
+    /// Top-level error message if migration failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+
+    /// Error type classification for retry logic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+
+    /// Whether this error is potentially recoverable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recoverable: Option<bool>,
+}
+
+/// Detailed error information for a table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableError {
+    /// Table name.
+    pub table: String,
+
+    /// Error type classification.
+    pub error_type: String,
+
+    /// Error message.
+    pub message: String,
+}
+
+/// Result of a health check.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealthCheckResult {
+    /// Overall health status.
+    pub healthy: bool,
+
+    /// Source database connection status.
+    pub source_connected: bool,
+
+    /// Source connection latency in milliseconds.
+    pub source_latency_ms: u64,
+
+    /// Source connection error if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_error: Option<String>,
+
+    /// Target database connection status.
+    pub target_connected: bool,
+
+    /// Target connection latency in milliseconds.
+    pub target_latency_ms: u64,
+
+    /// Target connection error if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_error: Option<String>,
+}
+
+/// Progress update for monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressUpdate {
+    /// Timestamp of the update.
+    pub timestamp: DateTime<Utc>,
+
+    /// Current phase.
+    pub phase: String,
+
+    /// Tables completed so far.
+    pub tables_completed: usize,
+
+    /// Total tables.
+    pub tables_total: usize,
+
+    /// Rows transferred so far.
+    pub rows_transferred: i64,
+
+    /// Current throughput (rows/second).
+    pub rows_per_second: i64,
+
+    /// Table currently being processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_table: Option<String>,
 }
 
 impl Orchestrator {
@@ -84,12 +168,19 @@ impl Orchestrator {
             state: None,
             source: Arc::new(source),
             target: Arc::new(target),
+            progress_enabled: false,
         })
     }
 
     /// Set the state file path for resume capability.
     pub fn with_state_file(mut self, path: PathBuf) -> Self {
         self.state_file = Some(path);
+        self
+    }
+
+    /// Enable progress reporting to stderr as JSON lines.
+    pub fn with_progress(mut self, enabled: bool) -> Self {
+        self.progress_enabled = enabled;
         self
     }
 
@@ -106,8 +197,49 @@ impl Orchestrator {
         Ok(self)
     }
 
+    /// Perform a health check on database connections.
+    pub async fn health_check(&self) -> Result<HealthCheckResult> {
+        let mut result = HealthCheckResult::default();
+
+        // Test MSSQL connection
+        let start = Instant::now();
+        match self.source.test_connection().await {
+            Ok(()) => {
+                result.source_connected = true;
+                result.source_latency_ms = start.elapsed().as_millis() as u64;
+            }
+            Err(e) => {
+                result.source_connected = false;
+                result.source_latency_ms = start.elapsed().as_millis() as u64;
+                result.source_error = Some(e.to_string());
+            }
+        }
+
+        // Test PostgreSQL connection
+        let start = Instant::now();
+        match self.target.test_connection().await {
+            Ok(()) => {
+                result.target_connected = true;
+                result.target_latency_ms = start.elapsed().as_millis() as u64;
+            }
+            Err(e) => {
+                result.target_connected = false;
+                result.target_latency_ms = start.elapsed().as_millis() as u64;
+                result.target_error = Some(e.to_string());
+            }
+        }
+
+        result.healthy = result.source_connected && result.target_connected;
+        Ok(result)
+    }
+
     /// Run the migration.
-    pub async fn run(mut self, cancel: Option<watch::Receiver<bool>>) -> Result<MigrationResult> {
+    /// If dry_run is true, only validates and shows what would happen without transferring data.
+    pub async fn run(
+        mut self,
+        cancel: Option<watch::Receiver<bool>>,
+        dry_run: bool,
+    ) -> Result<MigrationResult> {
         let started_at = Utc::now();
         let run_id = self
             .state
@@ -170,26 +302,39 @@ impl Orchestrator {
                 .or_insert_with(|| TableState::new(table.row_count));
         }
 
-        // Phase 2: Prepare target
-        info!(
-            "Phase 2: Preparing target database (mode: {:?})",
-            self.config.migration.target_mode
-        );
-        self.prepare_target(&tables, &mut state).await?;
+        // Phase 2: Prepare target (skip in dry-run)
+        if !dry_run {
+            info!(
+                "Phase 2: Preparing target database (mode: {:?})",
+                self.config.migration.target_mode
+            );
+            self.prepare_target(&tables, &mut state).await?;
 
-        // Save state after preparation
-        self.save_state(&state)?;
+            // Save state after preparation
+            self.save_state(&state)?;
+        } else {
+            info!(
+                "Phase 2: [DRY RUN] Would prepare target database (mode: {:?})",
+                self.config.migration.target_mode
+            );
+        }
 
-        // Phase 3: Transfer data
-        info!("Phase 3: Transferring data");
-        let transfer_result = self
-            .transfer_data(&tables, &mut state, cancel.clone())
-            .await;
+        // Phase 3: Transfer data (skip in dry-run)
+        let transfer_result = if !dry_run {
+            info!("Phase 3: Transferring data");
+            self.transfer_data(&tables, &mut state, cancel.clone())
+                .await
+        } else {
+            info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
+            Ok(())
+        };
 
-        // Phase 4: Finalize (only on success)
-        if transfer_result.is_ok() {
+        // Phase 4: Finalize (only on success, skip in dry-run)
+        if transfer_result.is_ok() && !dry_run {
             info!("Phase 4: Finalizing (indexes, constraints)");
             self.finalize(&tables).await?;
+        } else if dry_run {
+            info!("Phase 4: [DRY RUN] Would finalize (indexes, constraints)");
         }
 
         // Build result
@@ -221,7 +366,22 @@ impl Orchestrator {
             0
         };
 
-        let status = if tables_failed > 0 {
+        // Build table_errors from state
+        let table_errors: Vec<TableError> = state
+            .tables
+            .iter()
+            .filter_map(|(name, ts)| {
+                ts.error.as_ref().map(|err| TableError {
+                    table: name.clone(),
+                    error_type: "transfer".to_string(),
+                    message: err.clone(),
+                })
+            })
+            .collect();
+
+        let status = if dry_run {
+            "dry_run"
+        } else if tables_failed > 0 {
             state.status = RunStatus::Failed;
             "failed"
         } else if *cancel.borrow() {
@@ -232,8 +392,10 @@ impl Orchestrator {
             "completed"
         };
 
-        // Save final state
-        self.save_state(&state)?;
+        // Save final state (skip in dry-run)
+        if !dry_run {
+            self.save_state(&state)?;
+        }
 
         let result = MigrationResult {
             run_id,
@@ -247,6 +409,10 @@ impl Orchestrator {
             rows_transferred,
             rows_per_second,
             failed_tables,
+            table_errors,
+            error: None,
+            error_type: None,
+            recoverable: None,
         };
 
         info!(
@@ -788,5 +954,231 @@ impl MigrationResult {
     /// Convert to JSON string.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_check_result_serialization() {
+        let result = HealthCheckResult {
+            healthy: true,
+            source_connected: true,
+            source_latency_ms: 15,
+            source_error: None,
+            target_connected: true,
+            target_latency_ms: 8,
+            target_error: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"healthy\":true"));
+        assert!(json.contains("\"source_latency_ms\":15"));
+    }
+
+    #[test]
+    fn test_health_check_result_with_errors() {
+        let result = HealthCheckResult {
+            healthy: false,
+            source_connected: false,
+            source_latency_ms: 0,
+            source_error: Some("Connection refused".into()),
+            target_connected: true,
+            target_latency_ms: 10,
+            target_error: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"healthy\":false"));
+        assert!(json.contains("\"source_error\":\"Connection refused\""));
+    }
+
+    #[test]
+    fn test_table_error_serialization() {
+        let error = TableError {
+            table: "dbo.Orders".into(),
+            error_type: "transfer".into(),
+            message: "Timeout during COPY".into(),
+        };
+
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"table\":\"dbo.Orders\""));
+        assert!(json.contains("\"error_type\":\"transfer\""));
+        assert!(json.contains("\"message\":\"Timeout during COPY\""));
+    }
+
+    #[test]
+    fn test_progress_update_serialization() {
+        let update = ProgressUpdate {
+            timestamp: Utc::now(),
+            phase: "transferring".into(),
+            tables_completed: 5,
+            tables_total: 10,
+            rows_transferred: 50000,
+            rows_per_second: 10000,
+            current_table: Some("dbo.Users".into()),
+        };
+
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("\"phase\":\"transferring\""));
+        assert!(json.contains("\"tables_completed\":5"));
+        assert!(json.contains("\"current_table\":\"dbo.Users\""));
+    }
+
+    #[test]
+    fn test_progress_update_without_current_table() {
+        let update = ProgressUpdate {
+            timestamp: Utc::now(),
+            phase: "finalizing".into(),
+            tables_completed: 10,
+            tables_total: 10,
+            rows_transferred: 100000,
+            rows_per_second: 5000,
+            current_table: None,
+        };
+
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("\"phase\":\"finalizing\""));
+        assert!(json.contains("\"tables_completed\":10"));
+    }
+
+    #[test]
+    fn test_migration_result_success() {
+        let result = MigrationResult {
+            run_id: "test-123".into(),
+            status: "completed".into(),
+            duration_seconds: 45.5,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            tables_total: 10,
+            tables_success: 10,
+            tables_failed: 0,
+            rows_transferred: 100000,
+            rows_per_second: 2200,
+            failed_tables: vec![],
+            table_errors: vec![],
+            error: None,
+            error_type: None,
+            recoverable: None,
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap();
+        assert!(json.contains("\"status\": \"completed\""));
+        assert!(json.contains("\"tables_success\": 10"));
+        // Optional fields should be omitted when None/empty
+        assert!(!json.contains("\"error\":"));
+        assert!(!json.contains("\"table_errors\":"));
+    }
+
+    #[test]
+    fn test_migration_result_with_failures() {
+        let result = MigrationResult {
+            run_id: "test-123".into(),
+            status: "failed".into(),
+            duration_seconds: 45.5,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            tables_total: 10,
+            tables_success: 8,
+            tables_failed: 2,
+            rows_transferred: 80000,
+            rows_per_second: 1777,
+            failed_tables: vec!["dbo.Orders".into(), "dbo.Items".into()],
+            table_errors: vec![
+                TableError {
+                    table: "dbo.Orders".into(),
+                    error_type: "transfer".into(),
+                    message: "Connection lost".into(),
+                },
+            ],
+            error: None,
+            error_type: None,
+            recoverable: Some(true),
+        };
+
+        let json = serde_json::to_string_pretty(&result).unwrap();
+        assert!(json.contains("\"status\": \"failed\""));
+        assert!(json.contains("\"tables_failed\": 2"));
+        assert!(json.contains("\"table_errors\""));
+        assert!(json.contains("\"recoverable\": true"));
+    }
+
+    #[test]
+    fn test_migration_result_dry_run() {
+        let result = MigrationResult {
+            run_id: "dry-run-123".into(),
+            status: "dry_run".into(),
+            duration_seconds: 2.5,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            tables_total: 15,
+            tables_success: 0,
+            tables_failed: 0,
+            rows_transferred: 0,
+            rows_per_second: 0,
+            failed_tables: vec![],
+            table_errors: vec![],
+            error: None,
+            error_type: None,
+            recoverable: None,
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"status\":\"dry_run\""));
+        assert!(json.contains("\"rows_transferred\":0"));
+    }
+
+    #[test]
+    fn test_migration_result_to_json() {
+        let result = MigrationResult {
+            run_id: "test".into(),
+            status: "completed".into(),
+            duration_seconds: 1.0,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            tables_total: 1,
+            tables_success: 1,
+            tables_failed: 0,
+            rows_transferred: 100,
+            rows_per_second: 100,
+            failed_tables: vec![],
+            table_errors: vec![],
+            error: None,
+            error_type: None,
+            recoverable: None,
+        };
+
+        let json = result.to_json().unwrap();
+        assert!(json.contains("\"run_id\": \"test\""));
+        // Should be pretty-printed
+        assert!(json.contains('\n'));
+    }
+
+    #[test]
+    fn test_migration_result_with_top_level_error() {
+        let result = MigrationResult {
+            run_id: "err-123".into(),
+            status: "failed".into(),
+            duration_seconds: 0.5,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            tables_total: 10,
+            tables_success: 0,
+            tables_failed: 0,
+            rows_transferred: 0,
+            rows_per_second: 0,
+            failed_tables: vec![],
+            table_errors: vec![],
+            error: Some("Schema extraction failed".into()),
+            error_type: Some("schema_extraction".into()),
+            recoverable: Some(false),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"error\":\"Schema extraction failed\""));
+        assert!(json.contains("\"error_type\":\"schema_extraction\""));
+        assert!(json.contains("\"recoverable\":false"));
     }
 }
