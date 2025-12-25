@@ -1,9 +1,9 @@
 //! mssql-pg-migrate CLI - High-performance MSSQL to PostgreSQL migration.
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mssql_pg_migrate::{Config, Orchestrator};
+use mssql_pg_migrate::{Config, MigrateError, Orchestrator};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use tokio::sync::watch;
 use tracing::{info, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -63,11 +63,21 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", e.format_detailed());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), MigrateError> {
     let cli = Cli::parse();
 
     // Setup logging
-    setup_logging(&cli.verbosity, &cli.log_format)?;
+    setup_logging(&cli.verbosity, &cli.log_format).map_err(|e| MigrateError::Config(e.to_string()))?;
 
     // Load configuration with initial auto-tuning for connection pool sizes.
     // Will be re-tuned after schema extraction with actual row sizes.
@@ -79,7 +89,8 @@ async fn main() -> Result<()> {
     ctrlc::set_handler(move || {
         eprintln!("\nInterrupted. Shutting down gracefully...");
         let _ = cancel_tx.send(true);
-    })?;
+    })
+    .map_err(|e| MigrateError::Config(format!("Failed to set Ctrl-C handler: {}", e)))?;
 
     match cli.command {
         Commands::Run {
@@ -143,7 +154,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn setup_logging(verbosity: &str, format: &str) -> Result<()> {
+fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
     let level = match verbosity.to_lowercase().as_str() {
         "debug" => Level::DEBUG,
         "info" => Level::INFO,

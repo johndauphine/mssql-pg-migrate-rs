@@ -131,19 +131,19 @@ impl MssqlPool {
             .min_idle(Some(1))
             .build(manager)
             .await
-            .map_err(|e| MigrateError::Pool(format!("Failed to create MSSQL pool: {}", e)))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "creating MSSQL connection pool"))?;
 
         // Test connection
         {
             let mut conn = pool.get().await
-                .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))?;
+                .map_err(|e| MigrateError::pool(e.to_string(), "testing MSSQL connection"))?;
 
             conn.simple_query("SELECT 1")
                 .await
-                .map_err(|e| MigrateError::Source(e))?
+                ?
                 .into_row()
                 .await
-                .map_err(|e| MigrateError::Source(e))?;
+                ?;
         }
 
         info!(
@@ -157,7 +157,7 @@ impl MssqlPool {
     /// Get a pooled connection.
     async fn get_client(&self) -> Result<PooledConnection<'_, TiberiusConnectionManager>> {
         self.pool.get().await
-            .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting MSSQL connection from pool"))
     }
 
     /// Load columns for a table.
@@ -181,8 +181,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let col = Column {
@@ -221,8 +221,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let col_name: &str = row.get(0).unwrap_or_default();
@@ -250,8 +250,8 @@ impl MssqlPool {
     ) -> Result<Vec<Vec<SqlValue>>> {
         let mut client = self.get_client().await?;
 
-        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(sql).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut result = Vec::with_capacity(rows.len());
 
@@ -288,11 +288,11 @@ impl MssqlPool {
         let t_conn = t0.elapsed();
 
         let t1 = Instant::now();
-        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(sql).await?;
         let t_query = t1.elapsed();
 
         let t2 = Instant::now();
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let rows = stream.into_first_result().await?;
         let t_fetch = t2.elapsed();
 
         let t3 = Instant::now();
@@ -331,8 +331,8 @@ impl MssqlPool {
             pk_col, schema, table
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let row = stream.into_row().await?;
 
         Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
@@ -351,8 +351,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let row = stream.into_row().await?;
 
         if let Some(row) = row {
             table.row_count = row.get::<i64, _>(0).unwrap_or(0);
@@ -381,8 +381,8 @@ impl SourcePool for MssqlPool {
         let mut q = Query::new(query);
         q.bind(schema);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut tables = Vec::new();
         for row in rows {
@@ -469,8 +469,8 @@ impl SourcePool for MssqlPool {
             table = table.name
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut partitions = Vec::new();
         for row in rows {
@@ -539,8 +539,8 @@ impl SourcePool for MssqlPool {
         q.bind(&table.schema);
         q.bind(&table.name);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let cols_str: &str = row.get(3).unwrap_or_default();
@@ -601,8 +601,8 @@ impl SourcePool for MssqlPool {
         q.bind(&table.schema);
         q.bind(&table.name);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let cols_str: &str = row.get(1).unwrap_or_default();
@@ -643,8 +643,8 @@ impl SourcePool for MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let constraint = CheckConstraint {
@@ -672,8 +672,8 @@ impl SourcePool for MssqlPool {
             schema, table
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let row = stream.into_row().await?;
 
         // We CAST to BIGINT in the query, so get as i64 directly
         Ok(row

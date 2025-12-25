@@ -248,10 +248,10 @@ impl TransferEngine {
                     };
 
                     if let Err(e) = result {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: format!("Writer {} failed: {}", writer_id, e),
-                        });
+                        return Err(MigrateError::transfer(
+                            table_name_clone.clone(),
+                            format!("Writer {} failed: {}", writer_id, e),
+                        ));
                     }
 
                     local_write_time += write_start.elapsed();

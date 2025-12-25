@@ -275,6 +275,10 @@ pub struct MigrationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upsert_batch_size: Option<usize>,
 
+    /// Number of parallel upsert tasks. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsert_parallel_tasks: Option<usize>,
+
     /// Memory budget as percentage of available RAM (default: 70).
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
@@ -411,10 +415,18 @@ impl MigrationConfig {
             self.copy_buffer_rows = Some(rows);
         }
 
-        // Upsert batch size: scale with RAM
+        // Upsert batch size: scale with RAM (more aggressive for better throughput)
+        // Larger batches reduce round-trips but use more memory
         if self.upsert_batch_size.is_none() {
-            let batch = ((ram_gb / 8.0) as usize * 500).max(500).min(5_000);
+            let batch = ((ram_gb / 4.0) as usize * 1_000).max(1_000).min(10_000);
             self.upsert_batch_size = Some(batch);
+        }
+
+        // Upsert parallel tasks: scale with cores (aggressive parallelism)
+        // More parallel tasks = more concurrent INSERT...ON CONFLICT statements
+        if self.upsert_parallel_tasks.is_none() {
+            let tasks = (cores * 2).max(16).min(32);
+            self.upsert_parallel_tasks = Some(tasks);
         }
 
         // Connection pool sizes: scale with workers and parallelism
@@ -513,7 +525,11 @@ impl MigrationConfig {
     }
 
     pub fn get_upsert_batch_size(&self) -> usize {
-        self.upsert_batch_size.unwrap_or(1_000)
+        self.upsert_batch_size.unwrap_or(2_000)
+    }
+
+    pub fn get_upsert_parallel_tasks(&self) -> usize {
+        self.upsert_parallel_tasks.unwrap_or(16)
     }
 }
 
