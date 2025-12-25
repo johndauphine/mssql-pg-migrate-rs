@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+/mssql-pg-migrate
 
 # Cargo lock (include for binaries, exclude for libraries)
 # We're a workspace with both, so include it
