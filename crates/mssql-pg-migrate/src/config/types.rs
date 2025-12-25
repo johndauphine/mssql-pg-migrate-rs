@@ -264,6 +264,13 @@ pub struct MigrationConfig {
     #[serde(default = "default_true")]
     pub use_binary_copy: bool,
 
+    /// Use UNLOGGED tables during transfer (default: false).
+    /// UNLOGGED tables are faster for writes but not crash-safe.
+    /// If true, tables are created as UNLOGGED and converted to LOGGED after transfer.
+    /// If false (default), tables are created as LOGGED from the start.
+    #[serde(default)]
+    pub use_unlogged_tables: bool,
+
     /// Rows per upsert batch statement. Auto-tuned based on RAM if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upsert_batch_size: Option<usize>,

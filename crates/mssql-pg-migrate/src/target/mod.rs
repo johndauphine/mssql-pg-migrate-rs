@@ -75,6 +75,9 @@ pub trait TargetPool: Send + Sync {
     /// Set table to LOGGED mode.
     async fn set_table_logged(&self, schema: &str, table: &str) -> Result<()>;
 
+    /// Set table to UNLOGGED mode.
+    async fn set_table_unlogged(&self, schema: &str, table: &str) -> Result<()>;
+
     /// Write a chunk of rows using COPY protocol.
     async fn write_chunk(
         &self,
@@ -680,6 +683,26 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::Target(e))?;
 
         debug!("Set table {}.{} to LOGGED", schema, table);
+        Ok(())
+    }
+
+    async fn set_table_unlogged(&self, schema: &str, table: &str) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+
+        let sql = format!(
+            "ALTER TABLE {} SET UNLOGGED",
+            Self::qualify_table(schema, table)
+        );
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|e| MigrateError::Target(e))?;
+
+        debug!("Set table {}.{} to UNLOGGED", schema, table);
         Ok(())
     }
 

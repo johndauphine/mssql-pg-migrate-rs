@@ -281,10 +281,14 @@ impl Orchestrator {
                     self.target.drop_table(target_schema, &table.name).await?;
 
                     debug!("Creating table: {}", table_name);
-                    // Use UNLOGGED for faster inserts, convert to LOGGED after
-                    self.target
-                        .create_table_unlogged(table, target_schema)
-                        .await?;
+                    // Use UNLOGGED for faster inserts if configured, convert to LOGGED after
+                    if self.config.migration.use_unlogged_tables {
+                        self.target
+                            .create_table_unlogged(table, target_schema)
+                            .await?;
+                    } else {
+                        self.target.create_table(table, target_schema).await?;
+                    }
                 }
             }
             TargetMode::Truncate => {
@@ -297,9 +301,21 @@ impl Orchestrator {
                         self.target
                             .truncate_table(target_schema, &table.name)
                             .await?;
+                        // Set to UNLOGGED for faster writes if configured
+                        if self.config.migration.use_unlogged_tables {
+                            self.target
+                                .set_table_unlogged(target_schema, &table.name)
+                                .await?;
+                        }
                     } else {
                         debug!("Creating table: {}", table_name);
-                        self.target.create_table(table, target_schema).await?;
+                        if self.config.migration.use_unlogged_tables {
+                            self.target
+                                .create_table_unlogged(table, target_schema)
+                                .await?;
+                        } else {
+                            self.target.create_table(table, target_schema).await?;
+                        }
                     }
 
                     // Mark as pending for data transfer
@@ -321,8 +337,19 @@ impl Orchestrator {
 
                     if !self.target.table_exists(target_schema, &table.name).await? {
                         debug!("Creating table for upsert: {}", table_name);
-                        self.target.create_table(table, target_schema).await?;
+                        if self.config.migration.use_unlogged_tables {
+                            self.target
+                                .create_table_unlogged(table, target_schema)
+                                .await?;
+                        } else {
+                            self.target.create_table(table, target_schema).await?;
+                        }
                         self.target.create_primary_key(table, target_schema).await?;
+                    } else if self.config.migration.use_unlogged_tables {
+                        // Set existing table to UNLOGGED for faster writes
+                        self.target
+                            .set_table_unlogged(target_schema, &table.name)
+                            .await?;
                     }
                 }
             }
@@ -606,15 +633,6 @@ impl Orchestrator {
     /// Finalize migration (create indexes, FKs, constraints).
     async fn finalize(&self, tables: &[Table]) -> Result<()> {
         let target_schema = &self.config.target.schema;
-
-        // Convert UNLOGGED tables back to LOGGED (if using drop_recreate)
-        if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
-            for table in tables {
-                self.target
-                    .set_table_logged(target_schema, &table.name)
-                    .await?;
-            }
-        }
 
         // Create primary keys (only for drop_recreate - truncate and upsert preserve existing PKs)
         if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
