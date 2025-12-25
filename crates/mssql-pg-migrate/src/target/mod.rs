@@ -483,7 +483,7 @@ impl TargetPool for PgPool {
         for row in rows {
             let index_name: String = row.get(0);
             let drop_sql = format!(
-                "DROP INDEX IF EXISTS {}",
+                "DROP INDEX IF EXISTS {} CASCADE",
                 Self::qualify_table(schema, &index_name)
             );
             client.execute(&drop_sql, &[]).await?;

@@ -346,7 +346,7 @@ impl Orchestrator {
                         }
                         self.target.create_primary_key(table, target_schema).await?;
                     } else {
-                        // Drop non-PK indexes for faster upserts (will be recreated after)
+                        // Drop non-PK indexes for faster upserts (only recreated if create_indexes is enabled)
                         let dropped = self
                             .target
                             .drop_non_pk_indexes(target_schema, &table.name)
