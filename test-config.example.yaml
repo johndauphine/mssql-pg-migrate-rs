@@ -1,0 +1,26 @@
+# Copy to test-config.yaml (gitignored) and fill in real credentials for local runs.
+source:
+  host: localhost
+  port: 1433
+  database: "<mssql_db>"
+  user: "<mssql_user>"
+  password: "<mssql_password>"
+  schema: dbo
+  trust_server_cert: true
+  encrypt: false
+
+target:
+  host: localhost
+  port: 5432
+  database: "<postgres_db>"
+  user: "<postgres_user>"
+  password: "<postgres_password>"
+  schema: public
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  target_mode: drop_recreate
+  parallel_readers: 24
+  parallel_writers: 12
