@@ -19,6 +19,7 @@
 # Config files with secrets
 config.yaml
 !examples/config.yaml
+test-config.yaml
 
 # State files
 *.state

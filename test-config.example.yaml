@@ -1,19 +1,20 @@
+# Copy to test-config.yaml (gitignored) and fill in real credentials for local runs.
 source:
   host: localhost
   port: 1433
-  database: StackOverflow2010
-  user: sa
-  password: "YourStrong@Passw0rd"
+  database: "<mssql_db>"
+  user: "<mssql_user>"
+  password: "<mssql_password>"
   schema: dbo
   trust_server_cert: true
   encrypt: false
 
 target:
   host: localhost
-  port: 5433
-  database: stackoverflow
-  user: postgres
-  password: "PostgresPassword123"
+  port: 5432
+  database: "<postgres_db>"
+  user: "<postgres_user>"
+  password: "<postgres_password>"
   schema: public
   ssl_mode: disable
 
