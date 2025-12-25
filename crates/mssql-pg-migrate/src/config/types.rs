@@ -275,6 +275,10 @@ pub struct MigrationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upsert_batch_size: Option<usize>,
 
+    /// Number of parallel upsert tasks. Auto-tuned based on CPU cores if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upsert_parallel_tasks: Option<usize>,
+
     /// Memory budget as percentage of available RAM (default: 70).
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
@@ -411,12 +415,6 @@ impl MigrationConfig {
             self.copy_buffer_rows = Some(rows);
         }
 
-        // Upsert batch size: scale with RAM
-        if self.upsert_batch_size.is_none() {
-            let batch = ((ram_gb / 8.0) as usize * 500).max(500).min(5_000);
-            self.upsert_batch_size = Some(batch);
-        }
-
         // Connection pool sizes: scale with workers and parallelism
         // Need enough connections for parallel readers + writers + workers
         if self.max_mssql_connections.is_none() {
@@ -429,6 +427,26 @@ impl MigrationConfig {
             let writers = self.write_ahead_writers.unwrap_or(4);
             let conns = (workers * writers + 4).max(8).min(64);
             self.max_pg_connections = Some(conns);
+        }
+
+        // Upsert batch size: scale with RAM (more aggressive for better throughput)
+        // Larger batches reduce round-trips but use more memory
+        if self.upsert_batch_size.is_none() {
+            let batch = ((ram_gb / 4.0) as usize * 1_000).max(1_000).min(10_000);
+            self.upsert_batch_size = Some(batch);
+        }
+
+        // Upsert parallel tasks: bound by available PostgreSQL connections per writer
+        // Prevents upsert tasks from exceeding pool capacity and contending with writers
+        if self.upsert_parallel_tasks.is_none() {
+            let writers = self.write_ahead_writers.unwrap_or(4).max(1);
+            let pg_conns = self.max_pg_connections.unwrap_or(40).max(1);
+            let conns_per_writer = pg_conns / writers;
+            // Reserve one connection per writer for overhead; at least 1 task
+            let safe_tasks = conns_per_writer.saturating_sub(1).max(1);
+            // Also bound by CPU cores to avoid overscheduling
+            let tasks = safe_tasks.min(cores.max(1));
+            self.upsert_parallel_tasks = Some(tasks);
         }
 
         // Calculate estimated memory usage for logging
@@ -513,7 +531,11 @@ impl MigrationConfig {
     }
 
     pub fn get_upsert_batch_size(&self) -> usize {
-        self.upsert_batch_size.unwrap_or(1_000)
+        self.upsert_batch_size.unwrap_or(2_000)
+    }
+
+    pub fn get_upsert_parallel_tasks(&self) -> usize {
+        self.upsert_parallel_tasks.unwrap_or(4)
     }
 }
 

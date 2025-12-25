@@ -64,7 +64,10 @@ impl TiberiusConnectionManager {
         config.host(&self.config.host);
         config.port(self.config.port);
         config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(&self.config.user, &self.config.password));
+        config.authentication(AuthMethod::sql_server(
+            &self.config.user,
+            &self.config.password,
+        ));
 
         // Encryption settings
         match self.config.encrypt.to_lowercase().as_str() {
@@ -90,12 +93,12 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
 
     async fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
         let config = self.build_config();
-        let tcp = TcpStream::connect(config.get_addr())
-            .await
-            .map_err(|e| tiberius::error::Error::Io {
+        let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
+            tiberius::error::Error::Io {
                 kind: e.kind(),
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         tcp.set_nodelay(true).ok();
 
@@ -131,19 +134,16 @@ impl MssqlPool {
             .min_idle(Some(1))
             .build(manager)
             .await
-            .map_err(|e| MigrateError::Pool(format!("Failed to create MSSQL pool: {}", e)))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "creating MSSQL connection pool"))?;
 
         // Test connection
         {
-            let mut conn = pool.get().await
-                .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))?;
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|e| MigrateError::pool(e.to_string(), "testing MSSQL connection"))?;
 
-            conn.simple_query("SELECT 1")
-                .await
-                .map_err(|e| MigrateError::Source(e))?
-                .into_row()
-                .await
-                .map_err(|e| MigrateError::Source(e))?;
+            conn.simple_query("SELECT 1").await?.into_row().await?;
         }
 
         info!(
@@ -156,12 +156,18 @@ impl MssqlPool {
 
     /// Get a pooled connection.
     async fn get_client(&self) -> Result<PooledConnection<'_, TiberiusConnectionManager>> {
-        self.pool.get().await
-            .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))
+        self.pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting MSSQL connection from pool"))
     }
 
     /// Load columns for a table.
-    async fn load_columns(&self, client: &mut Client<Compat<TcpStream>>, table: &mut Table) -> Result<()> {
+    async fn load_columns(
+        &self,
+        client: &mut Client<Compat<TcpStream>>,
+        table: &mut Table,
+    ) -> Result<()> {
         let query = r#"
             SELECT
                 COLUMN_NAME,
@@ -181,8 +187,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let col = Column {
@@ -198,12 +204,20 @@ impl MssqlPool {
             table.columns.push(col);
         }
 
-        debug!("Loaded {} columns for {}", table.columns.len(), table.full_name());
+        debug!(
+            "Loaded {} columns for {}",
+            table.columns.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
     /// Load primary key for a table.
-    async fn load_primary_key(&self, client: &mut Client<Compat<TcpStream>>, table: &mut Table) -> Result<()> {
+    async fn load_primary_key(
+        &self,
+        client: &mut Client<Compat<TcpStream>>,
+        table: &mut Table,
+    ) -> Result<()> {
         let query = r#"
             SELECT c.COLUMN_NAME
             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
@@ -221,8 +235,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let col_name: &str = row.get(0).unwrap_or_default();
@@ -236,7 +250,11 @@ impl MssqlPool {
             }
         }
 
-        debug!("Primary key for {}: {:?}", table.full_name(), table.primary_key);
+        debug!(
+            "Primary key for {}: {:?}",
+            table.full_name(),
+            table.primary_key
+        );
         Ok(())
     }
 
@@ -250,8 +268,8 @@ impl MssqlPool {
     ) -> Result<Vec<Vec<SqlValue>>> {
         let mut client = self.get_client().await?;
 
-        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(sql).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut result = Vec::with_capacity(rows.len());
 
@@ -288,11 +306,11 @@ impl MssqlPool {
         let t_conn = t0.elapsed();
 
         let t1 = Instant::now();
-        let stream = client.simple_query(sql).await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(sql).await?;
         let t_query = t1.elapsed();
 
         let t2 = Instant::now();
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let rows = stream.into_first_result().await?;
         let t_fetch = t2.elapsed();
 
         let t3 = Instant::now();
@@ -315,7 +333,11 @@ impl MssqlPool {
         if result.len() > 1000 {
             debug!(
                 "PROFILE read: {} rows - conn={:?}, query={:?}, fetch={:?}, convert={:?}",
-                result.len(), t_conn, t_query, t_fetch, t_convert
+                result.len(),
+                t_conn,
+                t_query,
+                t_fetch,
+                t_convert
             );
         }
 
@@ -331,14 +353,18 @@ impl MssqlPool {
             pk_col, schema, table
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let row = stream.into_row().await?;
 
         Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
 
     /// Load row count for a table (fast approximate from sys.partitions).
-    async fn load_row_count(&self, client: &mut Client<Compat<TcpStream>>, table: &mut Table) -> Result<()> {
+    async fn load_row_count(
+        &self,
+        client: &mut Client<Compat<TcpStream>>,
+        table: &mut Table,
+    ) -> Result<()> {
         let query = r#"
             SELECT SUM(p.rows)
             FROM sys.partitions p
@@ -351,8 +377,8 @@ impl MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(client).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(client).await?;
+        let row = stream.into_row().await?;
 
         if let Some(row) = row {
             table.row_count = row.get::<i64, _>(0).unwrap_or(0);
@@ -381,8 +407,8 @@ impl SourcePool for MssqlPool {
         let mut q = Query::new(query);
         q.bind(schema);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut tables = Vec::new();
         for row in rows {
@@ -405,25 +431,33 @@ impl SourcePool for MssqlPool {
             self.load_row_count(&mut client, &mut table).await?;
 
             // Estimate row size (simple heuristic: sum of column sizes)
-            table.estimated_row_size = table.columns.iter().map(|c| {
-                match c.data_type.as_str() {
-                    "int" => 4,
-                    "bigint" => 8,
-                    "smallint" => 2,
-                    "tinyint" => 1,
-                    "bit" => 1,
-                    "float" => 8,
-                    "real" => 4,
-                    "datetime" | "datetime2" => 8,
-                    "date" => 3,
-                    "time" => 5,
-                    "uniqueidentifier" => 16,
-                    "varchar" | "nvarchar" | "char" | "nchar" => {
-                        if c.max_length == -1 { 100 } else { c.max_length.min(100) as i64 }
+            table.estimated_row_size = table
+                .columns
+                .iter()
+                .map(|c| {
+                    match c.data_type.as_str() {
+                        "int" => 4,
+                        "bigint" => 8,
+                        "smallint" => 2,
+                        "tinyint" => 1,
+                        "bit" => 1,
+                        "float" => 8,
+                        "real" => 4,
+                        "datetime" | "datetime2" => 8,
+                        "date" => 3,
+                        "time" => 5,
+                        "uniqueidentifier" => 16,
+                        "varchar" | "nvarchar" | "char" | "nchar" => {
+                            if c.max_length == -1 {
+                                100
+                            } else {
+                                c.max_length.min(100) as i64
+                            }
+                        }
+                        _ => 8, // default
                     }
-                    _ => 8, // default
-                }
-            }).sum();
+                })
+                .sum();
 
             tables.push(table);
         }
@@ -469,8 +503,8 @@ impl SourcePool for MssqlPool {
             table = table.name
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let rows = stream.into_first_result().await?;
 
         let mut partitions = Vec::new();
         for row in rows {
@@ -504,7 +538,8 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use subquery approach for ordered string aggregation
-        let query = format!(r#"
+        let query = format!(
+            r#"
             SELECT
                 i.name AS index_name,
                 i.is_unique,
@@ -533,14 +568,15 @@ impl SourcePool for MssqlPool {
               AND i.is_primary_key = 0
               AND i.type > 0
             ORDER BY i.name
-        "#);
+        "#
+        );
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
         q.bind(&table.name);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let cols_str: &str = row.get(3).unwrap_or_default();
@@ -551,13 +587,25 @@ impl SourcePool for MssqlPool {
                 name: row.get::<&str, _>(0).unwrap_or_default().to_string(),
                 is_unique: row.get::<bool, _>(1).unwrap_or(false),
                 is_clustered: type_desc == "CLUSTERED",
-                columns: cols_str.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
-                include_cols: include_str.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+                columns: cols_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+                include_cols: include_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
             };
             table.indexes.push(index);
         }
 
-        debug!("Loaded {} indexes for {}", table.indexes.len(), table.full_name());
+        debug!(
+            "Loaded {} indexes for {}",
+            table.indexes.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
@@ -565,7 +613,8 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use STUFF/FOR XML PATH for ordered string aggregation
-        let query = format!(r#"
+        let query = format!(
+            r#"
             SELECT
                 fk.name AS fk_name,
                 STUFF((
@@ -595,14 +644,15 @@ impl SourcePool for MssqlPool {
             JOIN sys.schemas rs ON rt.schema_id = rs.schema_id
             WHERE ps.name = @P1 AND pt.name = @P2
             ORDER BY fk.name
-        "#);
+        "#
+        );
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
         q.bind(&table.name);
 
-        let stream = q.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = q.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let cols_str: &str = row.get(1).unwrap_or_default();
@@ -610,17 +660,29 @@ impl SourcePool for MssqlPool {
 
             let fk = ForeignKey {
                 name: row.get::<&str, _>(0).unwrap_or_default().to_string(),
-                columns: cols_str.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+                columns: cols_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
                 ref_schema: row.get::<&str, _>(2).unwrap_or_default().to_string(),
                 ref_table: row.get::<&str, _>(3).unwrap_or_default().to_string(),
-                ref_columns: ref_cols_str.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+                ref_columns: ref_cols_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
                 on_delete: row.get::<&str, _>(5).unwrap_or_default().to_string(),
                 on_update: row.get::<&str, _>(6).unwrap_or_default().to_string(),
             };
             table.foreign_keys.push(fk);
         }
 
-        debug!("Loaded {} foreign keys for {}", table.foreign_keys.len(), table.full_name());
+        debug!(
+            "Loaded {} foreign keys for {}",
+            table.foreign_keys.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
@@ -643,8 +705,8 @@ impl SourcePool for MssqlPool {
         query.bind(&table.schema);
         query.bind(&table.name);
 
-        let stream = query.query(&mut client).await.map_err(|e| MigrateError::Source(e))?;
-        let rows = stream.into_first_result().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = query.query(&mut client).await?;
+        let rows = stream.into_first_result().await?;
 
         for row in rows {
             let constraint = CheckConstraint {
@@ -672,13 +734,11 @@ impl SourcePool for MssqlPool {
             schema, table
         );
 
-        let stream = client.simple_query(&query).await.map_err(|e| MigrateError::Source(e))?;
-        let row = stream.into_row().await.map_err(|e| MigrateError::Source(e))?;
+        let stream = client.simple_query(&query).await?;
+        let row = stream.into_row().await?;
 
         // We CAST to BIGINT in the query, so get as i64 directly
-        Ok(row
-            .and_then(|r| r.get::<i64, _>(0))
-            .unwrap_or(0))
+        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
 
     fn db_type(&self) -> &str {
@@ -696,51 +756,42 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
     let dt = data_type.to_lowercase();
 
     match dt.as_str() {
-        "bit" => {
-            row.get::<bool, _>(idx)
-                .map(SqlValue::Bool)
-                .unwrap_or(SqlValue::Null(SqlNullType::Bool))
-        }
-        "tinyint" => {
-            row.get::<u8, _>(idx)
-                .map(|v| SqlValue::I16(v as i16))
-                .unwrap_or(SqlValue::Null(SqlNullType::I16))
-        }
-        "smallint" => {
-            row.get::<i16, _>(idx)
-                .map(SqlValue::I16)
-                .unwrap_or(SqlValue::Null(SqlNullType::I16))
-        }
-        "int" => {
-            row.get::<i32, _>(idx)
-                .map(SqlValue::I32)
-                .unwrap_or(SqlValue::Null(SqlNullType::I32))
-        }
-        "bigint" => {
-            row.get::<i64, _>(idx)
-                .map(SqlValue::I64)
-                .unwrap_or(SqlValue::Null(SqlNullType::I64))
-        }
-        "real" => {
-            row.get::<f32, _>(idx)
-                .map(SqlValue::F32)
-                .unwrap_or(SqlValue::Null(SqlNullType::F32))
-        }
-        "float" => {
-            row.get::<f64, _>(idx)
-                .map(SqlValue::F64)
-                .unwrap_or(SqlValue::Null(SqlNullType::F64))
-        }
-        "uniqueidentifier" => {
-            row.get::<Uuid, _>(idx)
-                .map(SqlValue::Uuid)
-                .unwrap_or(SqlValue::Null(SqlNullType::Uuid))
-        }
-        "datetime" | "datetime2" | "smalldatetime" => {
-            row.get::<NaiveDateTime, _>(idx)
-                .map(SqlValue::DateTime)
-                .unwrap_or(SqlValue::Null(SqlNullType::DateTime))
-        }
+        "bit" => row
+            .get::<bool, _>(idx)
+            .map(SqlValue::Bool)
+            .unwrap_or(SqlValue::Null(SqlNullType::Bool)),
+        "tinyint" => row
+            .get::<u8, _>(idx)
+            .map(|v| SqlValue::I16(v as i16))
+            .unwrap_or(SqlValue::Null(SqlNullType::I16)),
+        "smallint" => row
+            .get::<i16, _>(idx)
+            .map(SqlValue::I16)
+            .unwrap_or(SqlValue::Null(SqlNullType::I16)),
+        "int" => row
+            .get::<i32, _>(idx)
+            .map(SqlValue::I32)
+            .unwrap_or(SqlValue::Null(SqlNullType::I32)),
+        "bigint" => row
+            .get::<i64, _>(idx)
+            .map(SqlValue::I64)
+            .unwrap_or(SqlValue::Null(SqlNullType::I64)),
+        "real" => row
+            .get::<f32, _>(idx)
+            .map(SqlValue::F32)
+            .unwrap_or(SqlValue::Null(SqlNullType::F32)),
+        "float" => row
+            .get::<f64, _>(idx)
+            .map(SqlValue::F64)
+            .unwrap_or(SqlValue::Null(SqlNullType::F64)),
+        "uniqueidentifier" => row
+            .get::<Uuid, _>(idx)
+            .map(SqlValue::Uuid)
+            .unwrap_or(SqlValue::Null(SqlNullType::Uuid)),
+        "datetime" | "datetime2" | "smalldatetime" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(SqlValue::DateTime)
+            .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
         "date" => {
             // Tiberius returns date as NaiveDateTime, extract just the date part
             row.get::<NaiveDateTime, _>(idx)
@@ -753,11 +804,10 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
                 .map(|dt| SqlValue::Time(dt.time()))
                 .unwrap_or(SqlValue::Null(SqlNullType::Time))
         }
-        "binary" | "varbinary" | "image" => {
-            row.get::<&[u8], _>(idx)
-                .map(|v| SqlValue::Bytes(v.to_vec()))
-                .unwrap_or(SqlValue::Null(SqlNullType::Bytes))
-        }
+        "binary" | "varbinary" | "image" => row
+            .get::<&[u8], _>(idx)
+            .map(|v| SqlValue::Bytes(v.to_vec()))
+            .unwrap_or(SqlValue::Null(SqlNullType::Bytes)),
         "decimal" | "numeric" | "money" | "smallmoney" => {
             // For decimal/numeric, try to get as string and parse
             // This is more reliable than trying to convert tiberius Numeric directly

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use futures::SinkExt;
+use futures::{future::try_join_all, SinkExt};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_postgres::{types::ToSql, Config as PgConfig, NoTls};
 use tracing::{debug, info, warn};
@@ -150,6 +151,10 @@ pub struct PgPool {
     copy_buffer_rows: usize,
     /// Use binary COPY format.
     use_binary_copy: bool,
+    /// Rows per upsert batch.
+    upsert_batch_size: usize,
+    /// Number of parallel upsert tasks.
+    upsert_parallel_tasks: usize,
 }
 
 impl PgPool {
@@ -159,6 +164,8 @@ impl PgPool {
         max_conns: usize,
         copy_buffer_rows: usize,
         use_binary_copy: bool,
+        upsert_batch_size: usize,
+        upsert_parallel_tasks: usize,
     ) -> Result<Self> {
         // Build tokio_postgres::Config
         let mut pg_config = PgConfig::new();
@@ -176,18 +183,17 @@ impl PgPool {
         let pool = Pool::builder(mgr)
             .max_size(max_conns)
             .build()
-            .map_err(|e| MigrateError::Pool(format!("Failed to create pool: {}", e)))?;
+            .map_err(|e| {
+                MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+            })?;
 
         // Test connection
         let client = pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(format!("Failed to get connection: {}", e)))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "testing PostgreSQL connection"))?;
 
-        client
-            .simple_query("SELECT 1")
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.simple_query("SELECT 1").await?;
 
         info!(
             "Connected to PostgreSQL: {}:{}/{}",
@@ -198,6 +204,8 @@ impl PgPool {
             pool,
             copy_buffer_rows,
             use_binary_copy,
+            upsert_batch_size,
+            upsert_parallel_tasks,
         })
     }
 
@@ -296,13 +304,10 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema));
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Created schema '{}'", schema);
         Ok(())
@@ -313,13 +318,10 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, false);
-        client
-            .execute(&ddl, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&ddl, &[]).await?;
 
         debug!("Created table {}.{}", target_schema, table.name);
         Ok(())
@@ -330,13 +332,10 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, true);
-        client
-            .execute(&ddl, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&ddl, &[]).await?;
 
         debug!("Created UNLOGGED table {}.{}", target_schema, table.name);
         Ok(())
@@ -347,16 +346,13 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "DROP TABLE IF EXISTS {} CASCADE",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Dropped table {}.{}", schema, table);
         Ok(())
@@ -367,13 +363,10 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Truncated table {}.{}", schema, table);
         Ok(())
@@ -384,7 +377,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let row = client
             .query_one(
@@ -394,8 +387,7 @@ impl TargetPool for PgPool {
                 )",
                 &[&schema, &table],
             )
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+            .await?;
 
         Ok(row.get(0))
     }
@@ -409,7 +401,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let pk_cols: Vec<String> = table
             .primary_key
@@ -423,10 +415,7 @@ impl TargetPool for PgPool {
             pk_cols.join(", ")
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Created primary key for {}.{}", target_schema, table.name);
         Ok(())
@@ -437,7 +426,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
 
@@ -465,10 +454,7 @@ impl TargetPool for PgPool {
             sql.push_str(&format!(" INCLUDE ({})", include_cols.join(", ")));
         }
 
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created index {} for {}.{}",
@@ -487,7 +473,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
         let ref_cols: Vec<String> = fk
@@ -515,10 +501,7 @@ impl TargetPool for PgPool {
             on_update
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created foreign key {} for {}.{}",
@@ -537,7 +520,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let definition = Self::convert_check_definition(&chk.definition);
 
@@ -553,10 +536,7 @@ impl TargetPool for PgPool {
             definition
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created check constraint {} for {}.{}",
@@ -570,7 +550,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let row = client
             .query_one(
@@ -582,8 +562,7 @@ impl TargetPool for PgPool {
                 )",
                 &[&schema, &table],
             )
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+            .await?;
 
         Ok(row.get(0))
     }
@@ -593,16 +572,13 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
             Self::qualify_table(schema, table)
         );
-        let row = client
-            .query_one(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let row = client.query_one(&sql, &[]).await?;
 
         Ok(row.get(0))
     }
@@ -619,7 +595,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         // Get max value (cast to bigint for consistent type)
         let sql = format!(
@@ -627,10 +603,7 @@ impl TargetPool for PgPool {
             Self::quote_ident(&identity_col.name),
             Self::qualify_table(schema, &table.name)
         );
-        let row = client
-            .query_one(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let row = client.query_one(&sql, &[]).await?;
         let max_val: i64 = row.get(0);
 
         if max_val == 0 {
@@ -653,10 +626,7 @@ impl TargetPool for PgPool {
                 identity_col.name,
                 max_val
             );
-            client
-                .execute(&sql, &[])
-                .await
-                .map_err(|e| MigrateError::Target(e))?;
+            client.execute(&sql, &[]).await?;
         }
 
         debug!(
@@ -671,16 +641,13 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "ALTER TABLE {} SET LOGGED",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to LOGGED", schema, table);
         Ok(())
@@ -691,16 +658,13 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "ALTER TABLE {} SET UNLOGGED",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to UNLOGGED", schema, table);
         Ok(())
@@ -739,54 +703,94 @@ impl TargetPool for PgPool {
             return Err(MigrateError::NoPrimaryKey(table.to_string()));
         }
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+        // Build prepared statement SQL once
+        let upsert_sql = Arc::new(build_prepared_upsert_sql(schema, table, cols, pk_cols));
 
-        // Build prepared statement SQL with parameters ($1, $2, ...)
-        let upsert_sql = build_prepared_upsert_sql(schema, table, cols, pk_cols);
+        // Split rows into batches for parallel processing
+        let mut batches: Vec<Vec<Vec<SqlValue>>> = Vec::new();
+        let mut current = Vec::with_capacity(self.upsert_batch_size);
+        for row in rows {
+            current.push(row);
+            if current.len() >= self.upsert_batch_size {
+                batches.push(current);
+                current = Vec::with_capacity(self.upsert_batch_size);
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
 
-        // Prepare the statement once - PostgreSQL will cache the query plan
-        let stmt = client
-            .prepare(&upsert_sql)
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        // Limit concurrent tasks to avoid overwhelming the connection pool
+        let max_parallel = self.upsert_parallel_tasks.min(batches.len());
 
+        // Process batches in parallel groups
         let mut total = 0u64;
+        let mut batch_iter = batches.into_iter();
+        loop {
+            let batch_group: Vec<_> = batch_iter.by_ref().take(max_parallel).collect();
+            if batch_group.is_empty() {
+                break;
+            }
 
-        // Execute each row with the prepared statement
-        // Even though sequential, this benefits from plan caching
-        for row in &rows {
-            // Convert SqlValue to params with native types
-            let params: Vec<Box<dyn ToSql + Sync + Send>> =
-                row.iter().map(sql_value_to_boxed_param).collect();
+            let futures: Vec<_> = batch_group
+                .into_iter()
+                .map(|batch| {
+                    let pool = self.pool.clone();
+                    let sql = Arc::clone(&upsert_sql);
+                    let schema = schema.to_string();
+                    let table = table.to_string();
 
-            // Create references for execute
-            let param_refs: Vec<&(dyn ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                    async move {
+                        let client = pool.get().await.map_err(|e| {
+                            MigrateError::pool(e.to_string(), "getting PostgreSQL connection")
+                        })?;
+
+                        // Prepare statement for this connection
+                        let stmt = client.prepare(&sql).await.map_err(|e| {
+                            MigrateError::transfer(
+                                format!("{}.{}", schema, table),
+                                format!("preparing upsert statement: {}", e),
+                            )
+                        })?;
+
+                        let mut batch_total = 0u64;
+
+                        for row in &batch {
+                            let params: Vec<Box<dyn ToSql + Sync + Send>> =
+                                row.iter().map(sql_value_to_boxed_param).collect();
+
+                            let param_refs: Vec<&(dyn ToSql + Sync)> = params
+                                .iter()
+                                .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                                .collect();
+
+                            match client.execute(&stmt, &param_refs).await {
+                                Ok(_) => batch_total += 1,
+                                Err(e) => {
+                                    let preview: Vec<String> =
+                                        row.iter().take(5).map(|v| format!("{:?}", v)).collect();
+                                    let preview_str = preview.join(", ");
+                                    let suffix = if row.len() > 5 { "..." } else { "" };
+                                    tracing::error!(
+                                        "Upsert failed for {}.{}: {} | Row preview: [{}{}]",
+                                        schema,
+                                        table,
+                                        e,
+                                        preview_str,
+                                        suffix
+                                    );
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+
+                        Ok::<u64, MigrateError>(batch_total)
+                    }
+                })
                 .collect();
 
-            match client.execute(&stmt, &param_refs).await {
-                Ok(_) => total += 1,
-                Err(e) => {
-                    // Include row preview (first 5 columns) for debugging
-                    let preview: Vec<String> = row
-                        .iter()
-                        .take(5)
-                        .map(|v| format!("{:?}", v))
-                        .collect();
-                    let preview_str = preview.join(", ");
-                    let suffix = if row.len() > 5 { "..." } else { "" };
-                    tracing::error!(
-                        "Upsert failed for {}.{}: {} | Row preview: [{}{}]",
-                        schema, table, e, preview_str, suffix
-                    );
-                    return Err(MigrateError::Target(e));
-                }
-            }
+            let results = try_join_all(futures).await?;
+            total += results.iter().sum::<u64>();
         }
 
         Ok(total)
@@ -829,11 +833,12 @@ impl PgPool {
         cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e.to_string(),
+                format!("getting connection for COPY to {}.{}", schema, table),
+            )
+        })?;
 
         // Build column list
         let col_list: String = cols
@@ -849,10 +854,7 @@ impl PgPool {
             col_list
         );
 
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let sink = client.copy_in(&copy_stmt).await?;
 
         futures::pin_mut!(sink);
 
@@ -884,7 +886,7 @@ impl PgPool {
         }
 
         // Finalize COPY
-        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await?;
 
         Ok(copied)
     }
@@ -911,11 +913,12 @@ impl PgPool {
 
         let t0 = Instant::now();
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e.to_string(),
+                format!("getting connection for binary COPY to {}.{}", schema, table),
+            )
+        })?;
         let t_conn = t0.elapsed();
 
         // Build column list
@@ -933,10 +936,7 @@ impl PgPool {
         );
 
         let t1 = Instant::now();
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let sink = client.copy_in(&copy_stmt).await?;
         let t_copy_init = t1.elapsed();
 
         futures::pin_mut!(sink);
@@ -1032,7 +1032,7 @@ impl PgPool {
 
         // Finalize COPY
         let t3 = Instant::now();
-        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await?;
         let t_finish = t3.elapsed();
 
         // Log timing breakdown for chunks with significant data
@@ -1062,7 +1062,7 @@ impl PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::Pool(e.to_string()))?;
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         // Build column list
         let col_list: String = cols
@@ -1077,10 +1077,7 @@ impl PgPool {
             schema, table, col_list
         );
 
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            .map_err(|e| MigrateError::Target(e))?;
+        let sink = client.copy_in(&copy_stmt).await?;
 
         futures::pin_mut!(sink);
 
@@ -1164,7 +1161,7 @@ impl PgPool {
         };
 
         // Finalize COPY
-        let copied = sink.finish().await.map_err(|e| MigrateError::Target(e))?;
+        let copied = sink.finish().await?;
 
         if copied != row_count {
             warn!(

@@ -248,10 +248,10 @@ impl TransferEngine {
                     };
 
                     if let Err(e) = result {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: format!("Writer {} failed: {}", writer_id, e),
-                        });
+                        return Err(MigrateError::transfer(
+                            table_name_clone.clone(),
+                            format!("Writer {} failed: {}", writer_id, e),
+                        ));
                     }
 
                     local_write_time += write_start.elapsed();
@@ -289,9 +289,7 @@ impl TransferEngine {
                 (Some(a), Some(b)) => Some(a.min(b)),
             };
 
-            let write_job = WriteJob {
-                rows: chunk.rows,
-            };
+            let write_job = WriteJob { rows: chunk.rows };
 
             if write_tx.send(write_job).await.is_err() {
                 // Writers have all failed

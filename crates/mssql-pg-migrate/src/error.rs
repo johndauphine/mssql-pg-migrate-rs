@@ -17,9 +17,9 @@ pub enum MigrateError {
     #[error("Target database error: {0}")]
     Target(#[from] tokio_postgres::Error),
 
-    /// Connection pool error
-    #[error("Pool error: {0}")]
-    Pool(String),
+    /// Connection pool error with context
+    #[error("Pool error: {message}\n  Context: {context}")]
+    Pool { message: String, context: String },
 
     /// Schema extraction failed
     #[error("Schema extraction failed: {0}")]
@@ -60,6 +60,40 @@ pub enum MigrateError {
     /// Migration was cancelled (SIGINT, etc.)
     #[error("Migration cancelled")]
     Cancelled,
+}
+
+impl MigrateError {
+    /// Create a Pool error with context about where it occurred
+    pub fn pool(message: impl Into<String>, context: impl Into<String>) -> Self {
+        MigrateError::Pool {
+            message: message.into(),
+            context: context.into(),
+        }
+    }
+
+    /// Create a Transfer error
+    pub fn transfer(table: impl Into<String>, message: impl Into<String>) -> Self {
+        MigrateError::Transfer {
+            table: table.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Format error with full details including error chain
+    pub fn format_detailed(&self) -> String {
+        let mut output = format!("Error: {}\n", self);
+
+        // Add error chain for wrapped errors
+        let mut source = std::error::Error::source(self);
+        let mut depth = 1;
+        while let Some(err) = source {
+            output.push_str(&format!("\nCaused by:\n  {}: {}", depth, err));
+            source = err.source();
+            depth += 1;
+        }
+
+        output
+    }
 }
 
 /// Result type alias for migration operations.
