@@ -17,6 +17,10 @@ struct Cli {
     #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
 
+    /// Path to state file for resume capability
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+
     /// Output JSON result to stdout
     #[arg(long)]
     output_json: bool,
@@ -37,14 +41,21 @@ struct Cli {
 enum Commands {
     /// Start a new migration
     Run {
-        /// Path to state file for resume capability
+        /// Override source schema
         #[arg(long)]
-        state_file: Option<PathBuf>,
+        source_schema: Option<String>,
 
-        /// Resume from previous state
+        /// Override target schema
         #[arg(long)]
-        resume: bool,
+        target_schema: Option<String>,
 
+        /// Override number of workers
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+
+    /// Resume a previously interrupted migration
+    Resume {
         /// Override source schema
         #[arg(long)]
         source_schema: Option<String>,
@@ -95,8 +106,6 @@ async fn run() -> Result<(), MigrateError> {
 
     match cli.command {
         Commands::Run {
-            state_file,
-            resume,
             source_schema,
             target_schema,
             workers,
@@ -115,14 +124,68 @@ async fn run() -> Result<(), MigrateError> {
             // Create orchestrator
             let mut orchestrator = Orchestrator::new(config).await?;
 
-            if let Some(path) = state_file {
-                orchestrator = orchestrator.with_state_file(path);
+            // Apply global state_file if provided
+            if let Some(ref path) = cli.state_file {
+                orchestrator = orchestrator.with_state_file(path.clone());
             }
 
-            if resume {
-                orchestrator = orchestrator.resume()?;
-                info!("Resuming from previous state");
+            // Run fresh migration
+            let result = orchestrator.run(Some(cancel_rx)).await?;
+
+            if cli.output_json {
+                println!("{}", result.to_json()?);
+            } else {
+                println!("\nMigration completed!");
+                println!("  Run ID: {}", result.run_id);
+                println!("  Duration: {:.2}s", result.duration_seconds);
+                println!(
+                    "  Tables: {}/{}",
+                    result.tables_success, result.tables_total
+                );
+                println!("  Rows: {}", result.rows_transferred);
+                println!("  Throughput: {} rows/sec", result.rows_per_second);
+                if !result.failed_tables.is_empty() {
+                    println!("  Failed tables: {:?}", result.failed_tables);
+                }
             }
+        }
+
+        Commands::Resume {
+            source_schema,
+            target_schema,
+            workers,
+        } => {
+            // State file is required for resume
+            let state_file = cli.state_file.ok_or_else(|| {
+                MigrateError::Config("--state-file is required for resume".to_string())
+            })?;
+
+            // Verify state file exists
+            if !state_file.exists() {
+                return Err(MigrateError::Config(format!(
+                    "State file not found: {:?}",
+                    state_file
+                )));
+            }
+
+            // Apply overrides
+            if let Some(schema) = source_schema {
+                config.source.schema = schema;
+            }
+            if let Some(schema) = target_schema {
+                config.target.schema = schema;
+            }
+            if let Some(w) = workers {
+                config.migration.workers = Some(w);
+            }
+
+            // Create orchestrator with resume
+            let orchestrator = Orchestrator::new(config)
+                .await?
+                .with_state_file(state_file)
+                .resume()?;
+
+            info!("Resuming from previous state");
 
             // Run migration
             let result = orchestrator.run(Some(cancel_rx)).await?;
@@ -130,7 +193,7 @@ async fn run() -> Result<(), MigrateError> {
             if cli.output_json {
                 println!("{}", result.to_json()?);
             } else {
-                println!("\nMigration completed!");
+                println!("\nMigration resumed and completed!");
                 println!("  Run ID: {}", result.run_id);
                 println!("  Duration: {:.2}s", result.duration_seconds);
                 println!(

@@ -102,14 +102,15 @@ impl MigrationState {
     /// Load state from a file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let state: Self = serde_json::from_str(&content)?;
+        let state: Self = serde_yaml::from_str(&content)?;
         Ok(state)
     }
 
     /// Save state to a file (atomic write).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        let content = serde_json::to_string_pretty(self)?;
+        let content = serde_yaml::to_string(self)
+            .map_err(|e| MigrateError::Config(format!("Failed to serialize state: {}", e)))?;
 
         // Atomic write: write to temp file, then rename
         let temp_path = path.with_extension("tmp");
