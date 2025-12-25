@@ -5,20 +5,45 @@ mod validation;
 
 pub use types::*;
 
-use crate::error::Result;
+use crate::error::{MigrateError, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
 impl Config {
-    /// Load configuration from a YAML file.
+    /// Load configuration from a file.
+    ///
+    /// Automatically detects the format based on file extension:
+    /// - `.json` files are parsed as JSON
+    /// - `.yaml` or `.yml` files are parsed as YAML
+    /// - Other extensions default to YAML for backward compatibility
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
-        Self::from_yaml(&content)
+
+        // Detect format from extension
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase());
+
+        match extension.as_deref() {
+            Some("json") => Self::from_json(&content),
+            _ => Self::from_yaml(&content), // Default to YAML for .yaml, .yml, or unknown
+        }
     }
 
     /// Parse configuration from a YAML string.
     pub fn from_yaml(yaml: &str) -> Result<Self> {
         let config: Config = serde_yaml::from_str(yaml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Parse configuration from a JSON string.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let config: Config = serde_json::from_str(json).map_err(|e| {
+            MigrateError::Config(format!("Failed to parse JSON config: {}", e))
+        })?;
         config.validate()?;
         Ok(config)
     }

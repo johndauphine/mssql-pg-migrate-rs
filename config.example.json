@@ -1,0 +1,33 @@
+{
+  "_comment": "Example MSSQL to PostgreSQL Migration Configuration (JSON)",
+  "_usage": "Copy to config.json and fill in your database credentials",
+
+  "source": {
+    "type": "mssql",
+    "host": "localhost",
+    "port": 1433,
+    "database": "your_source_database",
+    "user": "your_mssql_user",
+    "password": "your_mssql_password",
+    "schema": "dbo",
+    "trust_server_cert": true,
+    "encrypt": "false"
+  },
+
+  "target": {
+    "type": "postgres",
+    "host": "localhost",
+    "port": 5432,
+    "database": "your_target_database",
+    "user": "your_postgres_user",
+    "password": "your_postgres_password",
+    "schema": "public",
+    "ssl_mode": "disable"
+  },
+
+  "migration": {
+    "workers": 4,
+    "chunk_size": 100000,
+    "target_mode": "drop_recreate"
+  }
+}
