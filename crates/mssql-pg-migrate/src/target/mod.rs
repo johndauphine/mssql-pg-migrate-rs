@@ -47,6 +47,9 @@ pub trait TargetPool: Send + Sync {
     /// Create an index.
     async fn create_index(&self, table: &Table, idx: &Index, target_schema: &str) -> Result<()>;
 
+    /// Drop all non-PK indexes on a table.
+    async fn drop_non_pk_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>>;
+
     /// Create a foreign key constraint.
     async fn create_foreign_key(
         &self,
@@ -452,6 +455,43 @@ impl TargetPool for PgPool {
             idx_name, target_schema, table.name
         );
         Ok(())
+    }
+
+    async fn drop_non_pk_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+
+        // Query to find all non-PK indexes on the table
+        let sql = r#"
+            SELECT i.relname AS index_name
+            FROM pg_index idx
+            JOIN pg_class i ON i.oid = idx.indexrelid
+            JOIN pg_class t ON t.oid = idx.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = $1
+              AND t.relname = $2
+              AND NOT idx.indisprimary
+              AND NOT idx.indisunique
+        "#;
+
+        let rows = client.query(sql, &[&schema, &table]).await?;
+
+        let mut dropped = Vec::new();
+        for row in rows {
+            let index_name: String = row.get(0);
+            let drop_sql = format!(
+                "DROP INDEX IF EXISTS {}",
+                Self::qualify_table(schema, &index_name)
+            );
+            client.execute(&drop_sql, &[]).await?;
+            debug!("Dropped index {}.{}", schema, index_name);
+            dropped.push(index_name);
+        }
+
+        Ok(dropped)
     }
 
     async fn create_foreign_key(

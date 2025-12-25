@@ -326,7 +326,7 @@ impl Orchestrator {
                 }
             }
             TargetMode::Upsert => {
-                // For upsert, just ensure tables exist
+                // For upsert, ensure tables exist and drop non-PK indexes for performance
                 for table in tables {
                     let table_name = table.full_name();
 
@@ -345,11 +345,26 @@ impl Orchestrator {
                             self.target.create_table(table, target_schema).await?;
                         }
                         self.target.create_primary_key(table, target_schema).await?;
-                    } else if self.config.migration.use_unlogged_tables {
-                        // Set existing table to UNLOGGED for faster writes
-                        self.target
-                            .set_table_unlogged(target_schema, &table.name)
+                    } else {
+                        // Drop non-PK indexes for faster upserts (will be recreated after)
+                        let dropped = self
+                            .target
+                            .drop_non_pk_indexes(target_schema, &table.name)
                             .await?;
+                        if !dropped.is_empty() {
+                            info!(
+                                "Dropped {} non-PK indexes on {} for faster upserts",
+                                dropped.len(),
+                                table_name
+                            );
+                        }
+
+                        if self.config.migration.use_unlogged_tables {
+                            // Set existing table to UNLOGGED for faster writes
+                            self.target
+                                .set_table_unlogged(target_schema, &table.name)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -644,7 +659,7 @@ impl Orchestrator {
             }
         }
 
-        // Create indexes
+        // Create indexes (only if explicitly enabled)
         if self.config.migration.create_indexes {
             let max_tasks = self.config.migration.get_finalizer_concurrency().max(1);
             info!("Creating indexes with up to {} concurrent tasks", max_tasks);

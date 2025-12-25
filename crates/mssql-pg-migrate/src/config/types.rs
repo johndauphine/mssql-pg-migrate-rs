@@ -228,16 +228,16 @@ pub struct MigrationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_readers: Option<usize>,
 
-    /// Create indexes after transfer (default: true).
-    #[serde(default = "default_true")]
+    /// Create indexes after transfer (default: false for data warehouse use cases).
+    #[serde(default)]
     pub create_indexes: bool,
 
-    /// Create foreign keys after transfer (default: true).
-    #[serde(default = "default_true")]
+    /// Create foreign keys after transfer (default: false for data warehouse use cases).
+    #[serde(default)]
     pub create_foreign_keys: bool,
 
-    /// Create check constraints after transfer (default: true).
-    #[serde(default = "default_true")]
+    /// Create check constraints after transfer (default: false for data warehouse use cases).
+    #[serde(default)]
     pub create_check_constraints: bool,
 
     /// Maximum MSSQL connections. Auto-tuned based on workers if not set.
