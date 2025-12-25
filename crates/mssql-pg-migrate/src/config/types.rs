@@ -217,7 +217,11 @@ pub struct MigrationConfig {
     pub read_ahead_buffers: Option<usize>,
 
     /// Parallel writers. Auto-tuned based on CPU cores if not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "parallel_writers"
+    )]
     pub write_ahead_writers: Option<usize>,
 
     /// Parallel readers per large table. Auto-tuned based on CPU cores if not set.
@@ -243,6 +247,14 @@ pub struct MigrationConfig {
     /// Maximum PostgreSQL connections. Auto-tuned based on workers if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pg_connections: Option<usize>,
+
+    /// Minimum rows per partition when splitting large tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows_per_partition: Option<i64>,
+
+    /// Concurrency for finalization tasks (indexes, constraints).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizer_concurrency: Option<usize>,
 
     /// Rows per COPY buffer flush. Auto-tuned based on RAM if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,12 +467,21 @@ impl MigrationConfig {
         self.large_table_threshold.unwrap_or(5_000_000)
     }
 
+    pub fn get_min_rows_per_partition(&self) -> i64 {
+        self.min_rows_per_partition.unwrap_or(200_000)
+    }
+
     pub fn get_read_ahead_buffers(&self) -> usize {
         self.read_ahead_buffers.unwrap_or(10)
     }
 
     pub fn get_write_ahead_writers(&self) -> usize {
         self.write_ahead_writers.unwrap_or(2)
+    }
+
+    pub fn get_finalizer_concurrency(&self) -> usize {
+        self.finalizer_concurrency
+            .unwrap_or_else(|| self.get_workers())
     }
 
     pub fn get_parallel_readers(&self) -> usize {

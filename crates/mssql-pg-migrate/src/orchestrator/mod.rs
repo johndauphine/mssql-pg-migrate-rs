@@ -65,7 +65,8 @@ impl Orchestrator {
     pub async fn new(config: Config) -> Result<Self> {
         // Create source pool with configurable size
         let mssql_pool_size = config.migration.get_max_mssql_connections() as u32;
-        let source = MssqlPool::with_max_connections(config.source.clone(), mssql_pool_size).await?;
+        let source =
+            MssqlPool::with_max_connections(config.source.clone(), mssql_pool_size).await?;
 
         // Create target pool
         let max_conns = config.migration.get_max_pg_connections();
@@ -75,7 +76,8 @@ impl Orchestrator {
             config.migration.get_copy_buffer_rows(),
             config.migration.get_upsert_batch_size(),
             config.migration.use_binary_copy,
-        ).await?;
+        )
+        .await?;
 
         Ok(Self {
             config,
@@ -106,10 +108,7 @@ impl Orchestrator {
     }
 
     /// Run the migration.
-    pub async fn run(
-        mut self,
-        cancel: Option<watch::Receiver<bool>>,
-    ) -> Result<MigrationResult> {
+    pub async fn run(mut self, cancel: Option<watch::Receiver<bool>>) -> Result<MigrationResult> {
         let started_at = Utc::now();
         let run_id = self
             .state
@@ -126,7 +125,10 @@ impl Orchestrator {
 
         // Phase 1: Extract schema
         info!("Phase 1: Extracting schema from source");
-        let mut tables = self.source.extract_schema(&self.config.source.schema).await?;
+        let mut tables = self
+            .source
+            .extract_schema(&self.config.source.schema)
+            .await?;
 
         // Load additional metadata
         for table in &mut tables {
@@ -144,7 +146,8 @@ impl Orchestrator {
         info!("Found {} tables to migrate", tables.len());
 
         // Apply auto-tuning now that we know actual table sizes
-        let table_stats: Vec<TableStats> = tables.iter()
+        let table_stats: Vec<TableStats> = tables
+            .iter()
             .map(|t| TableStats {
                 name: t.full_name(),
                 row_count: t.row_count,
@@ -154,20 +157,25 @@ impl Orchestrator {
         self.config.apply_auto_tuning_from_tables(&table_stats);
 
         // Initialize or update state
-        let mut state = self.state.take().unwrap_or_else(|| {
-            MigrationState::new(run_id.clone(), self.config.hash())
-        });
+        let mut state = self
+            .state
+            .take()
+            .unwrap_or_else(|| MigrationState::new(run_id.clone(), self.config.hash()));
 
         // Initialize table states
         for table in &tables {
             let table_name = table.full_name();
-            state.tables.entry(table_name.clone()).or_insert_with(|| {
-                TableState::new(table.row_count)
-            });
+            state
+                .tables
+                .entry(table_name.clone())
+                .or_insert_with(|| TableState::new(table.row_count));
         }
 
         // Phase 2: Prepare target
-        info!("Phase 2: Preparing target database (mode: {:?})", self.config.migration.target_mode);
+        info!(
+            "Phase 2: Preparing target database (mode: {:?})",
+            self.config.migration.target_mode
+        );
         self.prepare_target(&tables, &mut state).await?;
 
         // Save state after preparation
@@ -175,7 +183,9 @@ impl Orchestrator {
 
         // Phase 3: Transfer data
         info!("Phase 3: Transferring data");
-        let transfer_result = self.transfer_data(&tables, &mut state, cancel.clone()).await;
+        let transfer_result = self
+            .transfer_data(&tables, &mut state, cancel.clone())
+            .await;
 
         // Phase 4: Finalize (only on success)
         if transfer_result.is_ok() {
@@ -273,7 +283,9 @@ impl Orchestrator {
 
                     debug!("Creating table: {}", table_name);
                     // Use UNLOGGED for faster inserts, convert to LOGGED after
-                    self.target.create_table_unlogged(table, target_schema).await?;
+                    self.target
+                        .create_table_unlogged(table, target_schema)
+                        .await?;
                 }
             }
             TargetMode::Truncate => {
@@ -283,7 +295,9 @@ impl Orchestrator {
                     // Create if not exists, truncate if exists
                     if self.target.table_exists(target_schema, &table.name).await? {
                         debug!("Truncating table: {}", table_name);
-                        self.target.truncate_table(target_schema, &table.name).await?;
+                        self.target
+                            .truncate_table(target_schema, &table.name)
+                            .await?;
                     } else {
                         debug!("Creating table: {}", table_name);
                         self.target.create_table(table, target_schema).await?;
@@ -325,14 +339,13 @@ impl Orchestrator {
             return false;
         }
 
-        let pk_type = table.pk_columns.first()
+        let pk_type = table
+            .pk_columns
+            .first()
             .map(|c| c.data_type.to_lowercase())
             .unwrap_or_default();
 
-        let is_sortable = matches!(
-            pk_type.as_str(),
-            "int" | "bigint" | "smallint" | "tinyint"
-        );
+        let is_sortable = matches!(pk_type.as_str(), "int" | "bigint" | "smallint" | "tinyint");
 
         if !is_sortable {
             return false;
@@ -340,6 +353,19 @@ impl Orchestrator {
 
         // Only partition large tables
         table.row_count >= self.config.migration.get_large_table_threshold()
+    }
+
+    /// Compute partition count for a table based on size and configured limits.
+    fn partition_count(&self, table: &Table) -> usize {
+        if !self.should_partition(table) {
+            return 1;
+        }
+
+        let max_partitions = self.config.migration.get_parallel_readers().max(1);
+        let min_rows = self.config.migration.get_min_rows_per_partition().max(1);
+        let by_rows = ((table.row_count.max(0) + min_rows - 1) / min_rows) as usize;
+
+        max_partitions.min(by_rows).max(1)
     }
 
     /// Transfer data for all tables.
@@ -370,13 +396,19 @@ impl Orchestrator {
             .iter()
             .filter(|t| {
                 let table_name = t.full_name();
-                state.tables.get(&table_name)
+                state
+                    .tables
+                    .get(&table_name)
                     .map(|ts| ts.status != TaskStatus::Completed)
                     .unwrap_or(true)
             })
             .collect();
 
-        info!("Transferring {} tables with {} workers", pending_tables.len(), workers);
+        info!(
+            "Transferring {} tables with {} workers",
+            pending_tables.len(),
+            workers
+        );
 
         let mut handles = Vec::new();
 
@@ -390,14 +422,20 @@ impl Orchestrator {
             let table_name = table.full_name();
 
             // Check if table should be partitioned for parallel reads
-            let num_partitions = self.config.migration.get_parallel_readers();
-            if self.should_partition(table) && num_partitions > 1 {
+            let num_partitions = self.partition_count(table);
+            if num_partitions > 1 {
                 // Get partition boundaries
-                match self.source.get_partition_boundaries(table, num_partitions).await {
+                match self
+                    .source
+                    .get_partition_boundaries(table, num_partitions)
+                    .await
+                {
                     Ok(partitions) => {
                         info!(
                             "{}: partitioning into {} parallel reads ({} rows)",
-                            table_name, partitions.len(), table.row_count
+                            table_name,
+                            partitions.len(),
+                            table.row_count
                         );
 
                         // Update state
@@ -426,7 +464,8 @@ impl Orchestrator {
                             };
 
                             let engine_clone = engine.clone();
-                            let partition_name = format!("{}:p{}", table_name, partition.partition_id);
+                            let partition_name =
+                                format!("{}:p{}", table_name, partition.partition_id);
 
                             let handle = tokio::spawn(async move {
                                 let result = engine_clone.execute(job).await;
@@ -439,7 +478,10 @@ impl Orchestrator {
                         continue;
                     }
                     Err(e) => {
-                        warn!("{}: failed to partition, using single reader: {}", table_name, e);
+                        warn!(
+                            "{}: failed to partition, using single reader: {}",
+                            table_name, e
+                        );
                         // Fall through to single-job path
                     }
                 }
@@ -459,8 +501,7 @@ impl Orchestrator {
                 partition_id: None,
                 min_pk: None,
                 max_pk: None,
-                resume_from_pk: state.tables.get(&table_name)
-                    .and_then(|ts| ts.last_pk),
+                resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
                 target_mode: self.config.migration.target_mode.clone(),
                 target_schema: self.config.target.schema.clone(),
             };
@@ -502,12 +543,16 @@ impl Orchestrator {
                 Ok(Err(e)) => {
                     error!("{}: failed - {}", job_name, e);
                     // Preserve first error for this table (don't overwrite if partition already failed)
-                    table_errors.entry(base_table.clone()).or_insert_with(|| e.to_string());
+                    table_errors
+                        .entry(base_table.clone())
+                        .or_insert_with(|| e.to_string());
                 }
                 Err(e) => {
                     error!("{}: task panicked - {}", job_name, e);
                     // Preserve first error for this table (don't overwrite if partition already failed)
-                    table_errors.entry(base_table.clone()).or_insert_with(|| format!("Task panicked: {}", e));
+                    table_errors
+                        .entry(base_table.clone())
+                        .or_insert_with(|| format!("Task panicked: {}", e));
                 }
             }
         }
@@ -542,7 +587,9 @@ impl Orchestrator {
         self.save_state(state)?;
 
         // Check for failures
-        let failed: Vec<_> = state.tables.iter()
+        let failed: Vec<_> = state
+            .tables
+            .iter()
             .filter(|(_, ts)| ts.status == TaskStatus::Failed)
             .map(|(name, _)| name.clone())
             .collect();
@@ -564,7 +611,9 @@ impl Orchestrator {
         // Convert UNLOGGED tables back to LOGGED (if using drop_recreate)
         if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
             for table in tables {
-                self.target.set_table_logged(target_schema, &table.name).await?;
+                self.target
+                    .set_table_logged(target_schema, &table.name)
+                    .await?;
             }
         }
 
@@ -580,12 +629,36 @@ impl Orchestrator {
 
         // Create indexes
         if self.config.migration.create_indexes {
-            for table in tables {
-                for index in &table.indexes {
-                    debug!("Creating index: {}.{}", table.name, index.name);
-                    if let Err(e) = self.target.create_index(table, index, target_schema).await {
-                        warn!("Failed to create index {}: {}", index.name, e);
+            let max_tasks = self.config.migration.get_finalizer_concurrency().max(1);
+            info!("Creating indexes with up to {} concurrent tasks", max_tasks);
+            let semaphore = Arc::new(Semaphore::new(max_tasks));
+            let mut handles = Vec::new();
+
+            for table in tables.iter().cloned() {
+                if table.indexes.is_empty() {
+                    continue;
+                }
+
+                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                let target = self.target.clone();
+                let schema = target_schema.to_string();
+
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    for index in &table.indexes {
+                        debug!("Creating index: {}.{}", table.name, index.name);
+                        if let Err(e) = target.create_index(&table, index, &schema).await {
+                            warn!("Failed to create index {}: {}", index.name, e);
+                        }
                     }
+                });
+
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    warn!("Index creation task panicked: {}", e);
                 }
             }
         }
@@ -595,7 +668,11 @@ impl Orchestrator {
             for table in tables {
                 for fk in &table.foreign_keys {
                     debug!("Creating FK: {}.{}", table.name, fk.name);
-                    if let Err(e) = self.target.create_foreign_key(table, fk, target_schema).await {
+                    if let Err(e) = self
+                        .target
+                        .create_foreign_key(table, fk, target_schema)
+                        .await
+                    {
                         warn!("Failed to create FK {}: {}", fk.name, e);
                     }
                 }
@@ -607,7 +684,11 @@ impl Orchestrator {
             for table in tables {
                 for chk in &table.check_constraints {
                     debug!("Creating check: {}.{}", table.name, chk.name);
-                    if let Err(e) = self.target.create_check_constraint(table, chk, target_schema).await {
+                    if let Err(e) = self
+                        .target
+                        .create_check_constraint(table, chk, target_schema)
+                        .await
+                    {
                         warn!("Failed to create check {}: {}", chk.name, e);
                     }
                 }
@@ -642,8 +723,14 @@ impl Orchestrator {
         let mut results = HashMap::new();
 
         for table in &tables {
-            let source_count = self.source.get_row_count(source_schema, &table.name).await?;
-            let target_count = self.target.get_row_count(target_schema, &table.name).await
+            let source_count = self
+                .source
+                .get_row_count(source_schema, &table.name)
+                .await?;
+            let target_count = self
+                .target
+                .get_row_count(target_schema, &table.name)
+                .await
                 .unwrap_or(0);
 
             let matches = source_count == target_count;
@@ -654,7 +741,9 @@ impl Orchestrator {
             } else {
                 warn!(
                     "{}: source={} target={} (MISMATCH)",
-                    table.full_name(), source_count, target_count
+                    table.full_name(),
+                    source_count,
+                    target_count
                 );
             }
         }
