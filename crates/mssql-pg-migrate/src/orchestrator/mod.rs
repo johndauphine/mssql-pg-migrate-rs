@@ -281,7 +281,7 @@ impl Orchestrator {
                     self.target.drop_table(target_schema, &table.name).await?;
 
                     debug!("Creating table: {}", table_name);
-                    // Use UNLOGGED for faster inserts if configured, convert to LOGGED after
+                    // Use UNLOGGED for faster inserts if configured (tables stay UNLOGGED)
                     if self.config.migration.use_unlogged_tables {
                         self.target
                             .create_table_unlogged(table, target_schema)

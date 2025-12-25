@@ -174,7 +174,7 @@ The tool automatically tunes parameters based on system resources. The formulas 
 | System | Cores | RAM | Workers | Readers | Writers | Chunk |
 |--------|-------|-----|---------|---------|---------|-------|
 | Small | 4 | 8GB | 4 | 8 | 6 | 100K |
-| Medium | 8 | 16GB | 4 | 8 | 6 | 122K |
+| Medium | 8 | 16GB | 4 | 8 | 6 | 125K |
 | Large | 16 | 32GB | 8 | 16 | 10 | 175K |
 
 To override auto-tuning, specify values explicitly in your config file.

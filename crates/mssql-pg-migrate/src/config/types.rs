@@ -266,7 +266,7 @@ pub struct MigrationConfig {
 
     /// Use UNLOGGED tables during transfer (default: false).
     /// UNLOGGED tables are faster for writes but not crash-safe.
-    /// If true, tables are created as UNLOGGED and converted to LOGGED after transfer.
+    /// If true, tables are created as UNLOGGED and remain UNLOGGED.
     /// If false (default), tables are created as LOGGED from the start.
     #[serde(default)]
     pub use_unlogged_tables: bool,
@@ -501,11 +501,11 @@ impl MigrationConfig {
     }
 
     pub fn get_max_mssql_connections(&self) -> usize {
-        self.max_mssql_connections.unwrap_or(50) // workers * readers + overhead
+        self.max_mssql_connections.unwrap_or(50)
     }
 
     pub fn get_max_pg_connections(&self) -> usize {
-        self.max_pg_connections.unwrap_or(40) // workers * writers + overhead
+        self.max_pg_connections.unwrap_or(40)
     }
 
     pub fn get_copy_buffer_rows(&self) -> usize {
