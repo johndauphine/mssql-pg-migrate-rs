@@ -32,6 +32,20 @@ This document provides guidance on tuning `mssql-pg-migrate` for optimal perform
 | Finalization | 63s | 5s | 92% faster |
 | Total time | 3m 2s | 61.7s | 66% faster |
 
+### Upsert Mode Performance
+
+Upsert mode (`target_mode: upsert`) uses a staging table approach for optimal performance:
+
+| Approach | Chunk Size | Throughput |
+|----------|-----------|------------|
+| Row-by-row INSERT...ON CONFLICT | N/A | 59K rows/sec |
+| Staging table + 123K chunk (auto) | 123K | 113K rows/sec |
+| Staging table + 25K chunk | 25K | 157K rows/sec |
+| Staging table + 50K chunk | 50K | 154K rows/sec |
+| **Staging table + 50K (optimized auto)** | 50K | **126-157K rows/sec** |
+
+**Key insight**: Smaller chunks (25K-75K) perform better for upsert due to reduced lock contention on the target table during MERGE operations.
+
 ## Key Findings
 
 ### 1. UNLOGGED Tables (`use_unlogged_tables: true`)
@@ -73,11 +87,17 @@ migration:
 
 ### 4. Chunk Size
 
-Larger chunks reduce overhead but increase memory usage:
+Chunk size recommendations differ by target mode:
 
+**Bulk Load (drop_recreate/truncate)**:
 - **100K-120K**: Optimal for most workloads
 - **150K+**: Diminishing returns, higher memory usage
 - **50K or less**: Too much overhead from frequent commits
+
+**Upsert Mode**:
+- **25K-75K**: Optimal range due to reduced lock contention
+- **50K**: Default auto-tuned value for upsert
+- **100K+**: Slower due to longer lock hold times during MERGE
 
 ### 5. Connection Pool Sizing
 
@@ -136,6 +156,23 @@ migration:
   use_unlogged_tables: false
 ```
 
+### Upsert Mode
+
+For incremental syncs using upsert:
+
+```yaml
+migration:
+  target_mode: upsert
+  workers: 6
+  chunk_size: 50000  # Smaller chunks for better upsert performance
+  parallel_readers: 8
+  parallel_writers: 6
+  max_mssql_connections: 48
+  max_pg_connections: 36
+```
+
+**Note**: Upsert mode uses a staging table approach: rows are COPY'd to a temp table, then merged into the target with `INSERT...ON CONFLICT DO UPDATE`. This is 2-3x faster than row-by-row upserts.
+
 ## Troubleshooting
 
 ### Slow Performance
@@ -167,7 +204,8 @@ The tool automatically tunes parameters based on system resources. The formulas 
 | `workers` | cores / 2 | [4, 8] |
 | `parallel_readers` | cores | [8, 16] |
 | `parallel_writers` | cores × 2/3 | [6, 12] |
-| `chunk_size` | 75K + (RAM_GB × 25K / 8) | [50K, 200K] |
+| `chunk_size` (bulk load) | 75K + (RAM_GB × 25K / 8) | [50K, 200K] |
+| `chunk_size` (upsert) | 50K (fixed) | [10K, memory limit] |
 
 ### Example Auto-Tuned Values
 
