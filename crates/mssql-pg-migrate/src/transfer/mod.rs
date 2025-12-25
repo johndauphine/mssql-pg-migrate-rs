@@ -289,9 +289,7 @@ impl TransferEngine {
                 (Some(a), Some(b)) => Some(a.min(b)),
             };
 
-            let write_job = WriteJob {
-                rows: chunk.rows,
-            };
+            let write_job = WriteJob { rows: chunk.rows };
 
             if write_tx.send(write_job).await.is_err() {
                 // Writers have all failed

@@ -77,7 +77,8 @@ async fn run() -> Result<(), MigrateError> {
     let cli = Cli::parse();
 
     // Setup logging
-    setup_logging(&cli.verbosity, &cli.log_format).map_err(|e| MigrateError::Config(e.to_string()))?;
+    setup_logging(&cli.verbosity, &cli.log_format)
+        .map_err(|e| MigrateError::Config(e.to_string()))?;
 
     // Load configuration with initial auto-tuning for connection pool sizes.
     // Will be re-tuned after schema extraction with actual row sizes.
@@ -132,12 +133,12 @@ async fn run() -> Result<(), MigrateError> {
                 println!("\nMigration completed!");
                 println!("  Run ID: {}", result.run_id);
                 println!("  Duration: {:.2}s", result.duration_seconds);
-                println!("  Tables: {}/{}", result.tables_success, result.tables_total);
-                println!("  Rows: {}", result.rows_transferred);
                 println!(
-                    "  Throughput: {} rows/sec",
-                    result.rows_per_second
+                    "  Tables: {}/{}",
+                    result.tables_success, result.tables_total
                 );
+                println!("  Rows: {}", result.rows_transferred);
+                println!("  Throughput: {} rows/sec", result.rows_per_second);
                 if !result.failed_tables.is_empty() {
                     println!("  Failed tables: {:?}", result.failed_tables);
                 }

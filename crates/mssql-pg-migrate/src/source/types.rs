@@ -63,10 +63,7 @@ impl Table {
             return false;
         }
         let pk_type = self.pk_columns[0].data_type.to_lowercase();
-        matches!(
-            pk_type.as_str(),
-            "int" | "bigint" | "smallint" | "tinyint"
-        )
+        matches!(pk_type.as_str(), "int" | "bigint" | "smallint" | "tinyint")
     }
 }
 

@@ -183,7 +183,9 @@ impl PgPool {
         let pool = Pool::builder(mgr)
             .max_size(max_conns)
             .build()
-            .map_err(|e| MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool"))?;
+            .map_err(|e| {
+                MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+            })?;
 
         // Test connection
         let client = pool
@@ -191,10 +193,7 @@ impl PgPool {
             .await
             .map_err(|e| MigrateError::pool(e.to_string(), "testing PostgreSQL connection"))?;
 
-        client
-            .simple_query("SELECT 1")
-            .await
-            ?;
+        client.simple_query("SELECT 1").await?;
 
         info!(
             "Connected to PostgreSQL: {}:{}/{}",
@@ -308,10 +307,7 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema));
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Created schema '{}'", schema);
         Ok(())
@@ -325,10 +321,7 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, false);
-        client
-            .execute(&ddl, &[])
-            .await
-            ?;
+        client.execute(&ddl, &[]).await?;
 
         debug!("Created table {}.{}", target_schema, table.name);
         Ok(())
@@ -342,10 +335,7 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, true);
-        client
-            .execute(&ddl, &[])
-            .await
-            ?;
+        client.execute(&ddl, &[]).await?;
 
         debug!("Created UNLOGGED table {}.{}", target_schema, table.name);
         Ok(())
@@ -362,10 +352,7 @@ impl TargetPool for PgPool {
             "DROP TABLE IF EXISTS {} CASCADE",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Dropped table {}.{}", schema, table);
         Ok(())
@@ -379,10 +366,7 @@ impl TargetPool for PgPool {
             .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
 
         let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Truncated table {}.{}", schema, table);
         Ok(())
@@ -403,8 +387,7 @@ impl TargetPool for PgPool {
                 )",
                 &[&schema, &table],
             )
-            .await
-            ?;
+            .await?;
 
         Ok(row.get(0))
     }
@@ -432,10 +415,7 @@ impl TargetPool for PgPool {
             pk_cols.join(", ")
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Created primary key for {}.{}", target_schema, table.name);
         Ok(())
@@ -474,10 +454,7 @@ impl TargetPool for PgPool {
             sql.push_str(&format!(" INCLUDE ({})", include_cols.join(", ")));
         }
 
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created index {} for {}.{}",
@@ -524,10 +501,7 @@ impl TargetPool for PgPool {
             on_update
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created foreign key {} for {}.{}",
@@ -562,10 +536,7 @@ impl TargetPool for PgPool {
             definition
         );
 
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!(
             "Created check constraint {} for {}.{}",
@@ -591,8 +562,7 @@ impl TargetPool for PgPool {
                 )",
                 &[&schema, &table],
             )
-            .await
-            ?;
+            .await?;
 
         Ok(row.get(0))
     }
@@ -608,10 +578,7 @@ impl TargetPool for PgPool {
             "SELECT COUNT(*) FROM {}",
             Self::qualify_table(schema, table)
         );
-        let row = client
-            .query_one(&sql, &[])
-            .await
-            ?;
+        let row = client.query_one(&sql, &[]).await?;
 
         Ok(row.get(0))
     }
@@ -636,10 +603,7 @@ impl TargetPool for PgPool {
             Self::quote_ident(&identity_col.name),
             Self::qualify_table(schema, &table.name)
         );
-        let row = client
-            .query_one(&sql, &[])
-            .await
-            ?;
+        let row = client.query_one(&sql, &[]).await?;
         let max_val: i64 = row.get(0);
 
         if max_val == 0 {
@@ -662,10 +626,7 @@ impl TargetPool for PgPool {
                 identity_col.name,
                 max_val
             );
-            client
-                .execute(&sql, &[])
-                .await
-                ?;
+            client.execute(&sql, &[]).await?;
         }
 
         debug!(
@@ -686,10 +647,7 @@ impl TargetPool for PgPool {
             "ALTER TABLE {} SET LOGGED",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to LOGGED", schema, table);
         Ok(())
@@ -706,10 +664,7 @@ impl TargetPool for PgPool {
             "ALTER TABLE {} SET UNLOGGED",
             Self::qualify_table(schema, table)
         );
-        client
-            .execute(&sql, &[])
-            .await
-            ?;
+        client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to UNLOGGED", schema, table);
         Ok(())
@@ -752,37 +707,51 @@ impl TargetPool for PgPool {
         let upsert_sql = Arc::new(build_prepared_upsert_sql(schema, table, cols, pk_cols));
 
         // Split rows into batches for parallel processing
-        let batches: Vec<Vec<Vec<SqlValue>>> = rows
-            .chunks(self.upsert_batch_size)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let mut batches: Vec<Vec<Vec<SqlValue>>> = Vec::new();
+        let mut current = Vec::with_capacity(self.upsert_batch_size);
+        for row in rows {
+            current.push(row);
+            if current.len() >= self.upsert_batch_size {
+                batches.push(current);
+                current = Vec::with_capacity(self.upsert_batch_size);
+            }
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
 
         // Limit concurrent tasks to avoid overwhelming the connection pool
         let max_parallel = self.upsert_parallel_tasks.min(batches.len());
 
         // Process batches in parallel groups
         let mut total = 0u64;
-        for batch_group in batches.chunks(max_parallel) {
+        let mut batch_iter = batches.into_iter();
+        loop {
+            let batch_group: Vec<_> = batch_iter.by_ref().take(max_parallel).collect();
+            if batch_group.is_empty() {
+                break;
+            }
+
             let futures: Vec<_> = batch_group
-                .iter()
+                .into_iter()
                 .map(|batch| {
                     let pool = self.pool.clone();
                     let sql = Arc::clone(&upsert_sql);
-                    let batch = batch.clone();
                     let schema = schema.to_string();
                     let table = table.to_string();
 
                     async move {
-                        let client = pool
-                            .get()
-                            .await
-                            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+                        let client = pool.get().await.map_err(|e| {
+                            MigrateError::pool(e.to_string(), "getting PostgreSQL connection")
+                        })?;
 
                         // Prepare statement for this connection
-                        let stmt = client
-                            .prepare(&sql)
-                            .await
-                            ?;
+                        let stmt = client.prepare(&sql).await.map_err(|e| {
+                            MigrateError::transfer(
+                                format!("{}.{}", schema, table),
+                                format!("preparing upsert statement: {}", e),
+                            )
+                        })?;
 
                         let mut batch_total = 0u64;
 
@@ -798,16 +767,17 @@ impl TargetPool for PgPool {
                             match client.execute(&stmt, &param_refs).await {
                                 Ok(_) => batch_total += 1,
                                 Err(e) => {
-                                    let preview: Vec<String> = row
-                                        .iter()
-                                        .take(5)
-                                        .map(|v| format!("{:?}", v))
-                                        .collect();
+                                    let preview: Vec<String> =
+                                        row.iter().take(5).map(|v| format!("{:?}", v)).collect();
                                     let preview_str = preview.join(", ");
                                     let suffix = if row.len() > 5 { "..." } else { "" };
                                     tracing::error!(
                                         "Upsert failed for {}.{}: {} | Row preview: [{}{}]",
-                                        schema, table, e, preview_str, suffix
+                                        schema,
+                                        table,
+                                        e,
+                                        preview_str,
+                                        suffix
                                     );
                                     return Err(e.into());
                                 }
@@ -863,11 +833,12 @@ impl PgPool {
         cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e.to_string(), format!("getting connection for COPY to {}.{}", schema, table)))?;
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e.to_string(),
+                format!("getting connection for COPY to {}.{}", schema, table),
+            )
+        })?;
 
         // Build column list
         let col_list: String = cols
@@ -883,10 +854,7 @@ impl PgPool {
             col_list
         );
 
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            ?;
+        let sink = client.copy_in(&copy_stmt).await?;
 
         futures::pin_mut!(sink);
 
@@ -945,11 +913,12 @@ impl PgPool {
 
         let t0 = Instant::now();
 
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e.to_string(), format!("getting connection for binary COPY to {}.{}", schema, table)))?;
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e.to_string(),
+                format!("getting connection for binary COPY to {}.{}", schema, table),
+            )
+        })?;
         let t_conn = t0.elapsed();
 
         // Build column list
@@ -967,10 +936,7 @@ impl PgPool {
         );
 
         let t1 = Instant::now();
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            ?;
+        let sink = client.copy_in(&copy_stmt).await?;
         let t_copy_init = t1.elapsed();
 
         futures::pin_mut!(sink);
@@ -1111,10 +1077,7 @@ impl PgPool {
             schema, table, col_list
         );
 
-        let sink = client
-            .copy_in(&copy_stmt)
-            .await
-            ?;
+        let sink = client.copy_in(&copy_stmt).await?;
 
         futures::pin_mut!(sink);
 
