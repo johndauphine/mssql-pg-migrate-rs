@@ -9,7 +9,7 @@ use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, Table};
 use crate::target::{PgPool, SqlValue, TargetPool};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -77,10 +77,6 @@ struct RowChunk {
 struct WriteJob {
     /// Row data to write.
     rows: Vec<Vec<SqlValue>>,
-    /// Read time for stats tracking.
-    read_time: Duration,
-    /// Last PK for stats tracking.
-    last_pk: Option<i64>,
 }
 
 /// Transfer engine configuration.
@@ -113,7 +109,6 @@ pub struct TransferEngine {
     target: Arc<PgPool>,
     config: TransferConfig,
     rows_transferred: AtomicI64,
-    bytes_transferred: AtomicU64,
 }
 
 impl TransferEngine {
@@ -124,7 +119,6 @@ impl TransferEngine {
             target,
             config,
             rows_transferred: AtomicI64::new(0),
-            bytes_transferred: AtomicU64::new(0),
         }
     }
 
@@ -297,8 +291,6 @@ impl TransferEngine {
 
             let write_job = WriteJob {
                 rows: chunk.rows,
-                read_time: chunk.read_time,
-                last_pk: chunk.last_pk,
             };
 
             if write_tx.send(write_job).await.is_err() {
