@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "mssql-pg-migrate"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "mssql-pg-migrate-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
