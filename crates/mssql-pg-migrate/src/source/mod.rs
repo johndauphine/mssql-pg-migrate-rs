@@ -70,16 +70,13 @@ impl TiberiusConnectionManager {
         ));
 
         // Encryption settings
-        match self.config.encrypt.to_lowercase().as_str() {
-            "false" | "no" | "0" | "disable" => {
-                config.encryption(EncryptionLevel::NotSupported);
+        if self.config.encrypt {
+            if self.config.trust_server_cert {
+                config.trust_cert();
             }
-            _ => {
-                if self.config.trust_server_cert {
-                    config.trust_cert();
-                }
-                config.encryption(EncryptionLevel::Required);
-            }
+            config.encryption(EncryptionLevel::Required);
+        } else {
+            config.encryption(EncryptionLevel::NotSupported);
         }
 
         config

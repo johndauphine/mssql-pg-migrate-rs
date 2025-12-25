@@ -16,7 +16,7 @@ source:
   schema: dbo
   # SSL/TLS settings
   trust_server_cert: true
-  encrypt: "false"
+  encrypt: false
 
 # Target database (PostgreSQL)
 target:

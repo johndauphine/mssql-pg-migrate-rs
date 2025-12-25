@@ -138,9 +138,9 @@ pub struct SourceConfig {
     #[serde(default = "default_dbo_schema")]
     pub schema: String,
 
-    /// Encrypt connection (default: "true").
-    #[serde(default = "default_true_string")]
-    pub encrypt: String,
+    /// Encrypt connection (default: true).
+    #[serde(default = "default_true")]
+    pub encrypt: bool,
 
     /// Trust server certificate (default: false).
     #[serde(default)]
@@ -589,10 +589,6 @@ fn default_dbo_schema() -> String {
 
 fn default_public_schema() -> String {
     "public".to_string()
-}
-
-fn default_true_string() -> String {
-    "true".to_string()
 }
 
 fn default_require() -> String {

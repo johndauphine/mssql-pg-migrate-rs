@@ -11,7 +11,7 @@
     "password": "your_mssql_password",
     "schema": "dbo",
     "trust_server_cert": true,
-    "encrypt": "false"
+    "encrypt": false
   },
 
   "target": {

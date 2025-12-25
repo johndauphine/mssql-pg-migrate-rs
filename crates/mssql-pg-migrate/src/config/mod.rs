@@ -65,12 +65,6 @@ impl Config {
 impl SourceConfig {
     /// Build a connection string for tiberius.
     pub fn connection_string(&self) -> String {
-        let encrypt = match self.encrypt.to_lowercase().as_str() {
-            "true" | "yes" | "1" => "true",
-            "false" | "no" | "0" | "disable" => "false",
-            _ => "true",
-        };
-
         format!(
             "Server=tcp:{},{};Database={};User Id={};Password={};Encrypt={};TrustServerCertificate={}",
             self.host,
@@ -78,7 +72,7 @@ impl SourceConfig {
             self.database,
             self.user,
             self.password,
-            encrypt,
+            self.encrypt,
             self.trust_server_cert
         )
     }
@@ -109,7 +103,7 @@ source:
   user: sa
   password: password
   schema: dbo
-  encrypt: "false"
+  encrypt: false
   trust_server_cert: true
 
 target:
@@ -136,7 +130,7 @@ migration:
     "user": "sa",
     "password": "password",
     "schema": "dbo",
-    "encrypt": "false",
+    "encrypt": false,
     "trust_server_cert": true
   },
   "target": {

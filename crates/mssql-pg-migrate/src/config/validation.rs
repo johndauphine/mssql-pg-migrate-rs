@@ -79,7 +79,7 @@ mod tests {
                 user: "sa".to_string(),
                 password: "password".to_string(),
                 schema: "dbo".to_string(),
-                encrypt: "false".to_string(),
+                encrypt: false,
                 trust_server_cert: true,
             },
             target: TargetConfig {
