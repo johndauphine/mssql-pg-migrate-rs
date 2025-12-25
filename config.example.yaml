@@ -1,0 +1,59 @@
+# Example MSSQL to PostgreSQL Migration Configuration (YAML)
+#
+# Copy this file to config.yaml and fill in your database credentials.
+# The application auto-detects format based on file extension:
+#   - .yaml or .yml -> YAML format
+#   - .json -> JSON format
+
+# Source database (Microsoft SQL Server)
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: your_source_database
+  user: your_mssql_user
+  password: your_mssql_password
+  schema: dbo
+  # SSL/TLS settings
+  trust_server_cert: true
+  encrypt: "false"
+
+# Target database (PostgreSQL)
+target:
+  type: postgres
+  host: localhost
+  port: 5432
+  database: your_target_database
+  user: your_postgres_user
+  password: your_postgres_password
+  schema: public
+  ssl_mode: disable  # Options: disable, require, verify-ca, verify-full
+
+# Migration settings
+migration:
+  # Number of concurrent table transfers
+  workers: 4
+
+  # Rows per batch for COPY operations
+  chunk_size: 100000
+
+  # Target mode for handling existing data:
+  #   - drop_recreate: Drop and recreate tables (fastest, destructive)
+  #   - truncate: Truncate existing tables before insert
+  #   - upsert: Insert or update based on primary key (incremental sync)
+  target_mode: drop_recreate
+
+  # Parallel readers per large table (auto-tuned if not set)
+  # parallel_readers: 24
+
+  # Parallel writers per large table (auto-tuned if not set)
+  # parallel_writers: 12
+
+  # Memory budget percentage for auto-tuning (default: 70)
+  # memory_budget_percent: 70
+
+  # Optional: Filter specific tables (if omitted, all tables are migrated)
+  # tables:
+  #   - Users
+  #   - Orders
+  #   - Products
