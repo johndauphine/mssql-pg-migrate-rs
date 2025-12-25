@@ -74,7 +74,6 @@ impl Orchestrator {
             &config.target,
             max_conns,
             config.migration.get_copy_buffer_rows(),
-            config.migration.get_upsert_batch_size(),
             config.migration.use_binary_copy,
         )
         .await?;

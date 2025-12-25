@@ -115,7 +115,6 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
 /// MSSQL source pool implementation with connection pooling.
 pub struct MssqlPool {
     pool: Pool<TiberiusConnectionManager>,
-    config: SourceConfig,
 }
 
 impl MssqlPool {
@@ -152,7 +151,7 @@ impl MssqlPool {
             config.host, config.port, config.database, max_size
         );
 
-        Ok(Self { pool, config })
+        Ok(Self { pool })
     }
 
     /// Get a pooled connection.

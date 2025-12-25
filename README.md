@@ -6,23 +6,27 @@ Designed for headless operation in scripted environments, Kubernetes, and Airflo
 
 ## Performance
 
-Tested with Stack Overflow 2010 dataset (19.3M rows, 9 tables):
+Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 
 | Mode | Duration | Throughput |
 |------|----------|------------|
-| truncate | 104s | 185,680 rows/sec |
-| drop_recreate | 137s | 141,323 rows/sec |
-| upsert | 243s | 79,627 rows/sec |
+| drop_recreate | 119s | 162,452 rows/sec |
+| truncate | ~100s | ~193,000 rows/sec |
+| upsert | ~240s | ~80,000 rows/sec |
 
-*Single worker, chunk_size=50000, localhost MSSQL → PostgreSQL, COPY protocol*
+*Auto-tuned parallelism, localhost MSSQL → PostgreSQL, binary COPY protocol*
 
 ## Features
 
-- **High throughput** - Read-ahead pipeline with concurrent reading/writing
+- **High throughput** - Parallel readers/writers with read-ahead pipeline
+- **Auto-tuning** - Memory-aware configuration based on system RAM and CPU cores
+- **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
+- **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
 - **Automatic type mapping** - MSSQL to PostgreSQL type conversion
 - **Keyset pagination** - Efficient chunked reads using `WHERE pk > last_pk`
 - **Resume capability** - JSON state file for process restartability
+- **Parallel finalization** - Concurrent index and constraint creation
 - **Static binary** - No runtime dependencies, ideal for containers
 - **Airflow integration** - JSON output for XCom, automatic retry support
 
@@ -102,12 +106,25 @@ target:
 
 migration:
   target_mode: drop_recreate  # or truncate, upsert
-  workers: 4
-  chunk_size: 50000
+  workers: 4                  # auto-tuned if not set
+  chunk_size: 50000           # auto-tuned based on RAM
+  parallel_readers: 8         # auto-tuned based on CPU cores
+  parallel_writers: 4         # auto-tuned based on CPU cores
+  memory_budget_percent: 70   # % of RAM for buffers (default: 70)
   create_indexes: true
   create_foreign_keys: true
   create_check_constraints: true
 ```
+
+### Auto-Tuning
+
+When `workers`, `chunk_size`, `parallel_readers`, or `parallel_writers` are not specified, the tool automatically tunes them based on:
+
+- **CPU cores**: Determines worker count and parallelism levels
+- **Available RAM**: Sets chunk sizes and buffer counts to fit within memory budget
+- **Memory budget**: Configurable percentage (default 70%) of system RAM for transfer buffers
+
+This allows optimal performance across different hardware without manual configuration.
 
 ## Target Modes
 
