@@ -376,14 +376,26 @@ impl MigrationConfig {
         let max_chunk_from_memory = max_chunk_from_memory.max(10_000); // Minimum viable chunk size
 
         // Chunk size: scale with RAM but respect memory budget.
-        // Benchmarking shows 100K-120K is optimal for most workloads.
-        // Formula: 75K base + 25K per 8GB RAM → 100K at 8GB, 125K at 16GB
+        // For upsert mode, smaller chunks (25K-75K) are faster due to less lock contention.
+        // For bulk load, larger chunks (100K-120K) are optimal.
         if self.chunk_size.is_none() {
-            let desired_chunk = 75_000 + ((ram_gb * 25_000.0 / 8.0) as usize);
-            let chunk = desired_chunk
-                .min(max_chunk_from_memory)
-                .max(50_000)
-                .min(200_000);
+            let chunk = match self.target_mode {
+                TargetMode::Upsert => {
+                    // Upsert: smaller chunks for faster MERGE statements
+                    // Benchmarking shows 25K-75K is optimal, use 50K as default
+                    50_000_usize.min(max_chunk_from_memory)
+                }
+                _ => {
+                    // Bulk load: larger chunks for better COPY throughput
+                    // Formula: 75K base + 25K per 8GB RAM → 100K at 8GB, 125K at 16GB
+                    // Order: apply floor first, then respect memory budget ceiling
+                    let desired_chunk = 75_000 + ((ram_gb * 25_000.0 / 8.0) as usize);
+                    desired_chunk
+                        .max(50_000)
+                        .min(max_chunk_from_memory)
+                        .min(200_000)
+                }
+            };
             self.chunk_size = Some(chunk);
         }
 
