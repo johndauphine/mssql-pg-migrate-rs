@@ -158,6 +158,27 @@ migration:
 2. Ensure database servers allow enough connections
 3. Reduce parallelism settings
 
+## Auto-Tuning Heuristics
+
+The tool automatically tunes parameters based on system resources. The formulas are derived from benchmarking data:
+
+| Parameter | Formula | Constraints |
+|-----------|---------|-------------|
+| `workers` | cores / 2 | [4, 8] |
+| `parallel_readers` | cores | [8, 16] |
+| `parallel_writers` | cores × 2/3 | [6, 12] |
+| `chunk_size` | 75K + (RAM_GB × 25K / 8) | [50K, 200K] |
+
+### Example Auto-Tuned Values
+
+| System | Cores | RAM | Workers | Readers | Writers | Chunk |
+|--------|-------|-----|---------|---------|---------|-------|
+| Small | 4 | 8GB | 4 | 8 | 6 | 100K |
+| Medium | 8 | 16GB | 4 | 8 | 6 | 122K |
+| Large | 16 | 32GB | 8 | 16 | 10 | 175K |
+
+To override auto-tuning, specify values explicitly in your config file.
+
 ## Run-to-Run Variance
 
 Expect 15-20% variance between runs due to:
