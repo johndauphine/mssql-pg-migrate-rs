@@ -122,4 +122,34 @@ mod tests {
         config.target.r#type = "mssql".to_string();
         assert!(validate(&config).is_err());
     }
+
+    #[test]
+    fn test_source_config_debug_redacts_password() {
+        let mut config = valid_config();
+        config.source.password = "super_secret_password_123".to_string();
+        let debug_output = format!("{:?}", config.source);
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+        assert!(
+            !debug_output.contains("super_secret_password_123"),
+            "Debug output should not contain actual password value"
+        );
+    }
+
+    #[test]
+    fn test_target_config_debug_redacts_password() {
+        let mut config = valid_config();
+        config.target.password = "super_secret_password_456".to_string();
+        let debug_output = format!("{:?}", config.target);
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]"
+        );
+        assert!(
+            !debug_output.contains("super_secret_password_456"),
+            "Debug output should not contain actual password value"
+        );
+    }
 }
