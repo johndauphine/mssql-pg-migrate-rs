@@ -848,9 +848,17 @@ impl Orchestrator {
                         let completed = partition_completed[&base_table];
                         let total = partition_counts[&base_table];
 
-                        // Emit progress when all partitions of a table are done
+                        // When all partitions of a table are done, update state and checkpoint
                         if completed == total {
                             let total_rows = table_rows[&base_table];
+                            // Update state for completed partitioned table
+                            if let Some(ts) = state.tables.get_mut(&base_table) {
+                                ts.status = TaskStatus::Completed;
+                                ts.rows_transferred = total_rows;
+                                ts.completed_at = Some(Utc::now());
+                            }
+                            // Checkpoint state
+                            self.save_state(state)?;
                             progress.complete_table(total_rows);
                             progress.emit("transferring", Some(base_table.clone()));
                         }
@@ -862,6 +870,8 @@ impl Orchestrator {
                             ts.last_pk = stats.last_pk;
                             ts.completed_at = Some(Utc::now());
                         }
+                        // Checkpoint state after each table completion
+                        self.save_state(state)?;
                         progress.complete_table(stats.rows);
                         progress.emit("transferring", Some(base_table.clone()));
                     }
@@ -879,23 +889,34 @@ impl Orchestrator {
                         let completed = partition_completed[&base_table];
                         let total = partition_counts[&base_table];
 
-                        // Emit progress when all partitions are done (even with failures)
+                        // When all partitions are done (even with failures), update state and checkpoint
                         if completed == total {
+                            if let Some(ts) = state.tables.get_mut(&base_table) {
+                                ts.status = TaskStatus::Failed;
+                                ts.error = table_errors.get(&base_table).cloned();
+                            }
+                            self.save_state(state)?;
                             progress.increment_table_count();
                             progress.emit("transferring", Some(base_table.clone()));
                         }
                     } else {
-                        // Non-partitioned table failed
+                        // Non-partitioned table failed - update state and checkpoint
+                        if let Some(ts) = state.tables.get_mut(&base_table) {
+                            ts.status = TaskStatus::Failed;
+                            ts.error = Some(e.to_string());
+                        }
+                        self.save_state(state)?;
                         progress.increment_table_count();
                         progress.emit("transferring", Some(base_table.clone()));
                     }
                 }
                 Err(e) => {
                     error!("{}: task panicked - {}", job_name, e);
+                    let panic_msg = format!("Task panicked: {}", e);
                     // Preserve first error for this table (don't overwrite if partition already failed)
                     table_errors
                         .entry(base_table.clone())
-                        .or_insert_with(|| format!("Task panicked: {}", e));
+                        .or_insert_with(|| panic_msg.clone());
 
                     // Track partition completion even on panic
                     if is_partitioned {
@@ -903,13 +924,23 @@ impl Orchestrator {
                         let completed = partition_completed[&base_table];
                         let total = partition_counts[&base_table];
 
-                        // Emit progress when all partitions are done (even with panics)
+                        // When all partitions are done (even with panics), update state and checkpoint
                         if completed == total {
+                            if let Some(ts) = state.tables.get_mut(&base_table) {
+                                ts.status = TaskStatus::Failed;
+                                ts.error = table_errors.get(&base_table).cloned();
+                            }
+                            self.save_state(state)?;
                             progress.increment_table_count();
                             progress.emit("transferring", Some(base_table.clone()));
                         }
                     } else {
-                        // Non-partitioned table panicked
+                        // Non-partitioned table panicked - update state and checkpoint
+                        if let Some(ts) = state.tables.get_mut(&base_table) {
+                            ts.status = TaskStatus::Failed;
+                            ts.error = Some(panic_msg);
+                        }
+                        self.save_state(state)?;
                         progress.increment_table_count();
                         progress.emit("transferring", Some(base_table.clone()));
                     }
