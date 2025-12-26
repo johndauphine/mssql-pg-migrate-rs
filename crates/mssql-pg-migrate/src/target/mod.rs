@@ -108,6 +108,19 @@ pub trait TargetPool: Send + Sync {
         writer_id: usize,
     ) -> Result<u64>;
 
+    /// Upsert a chunk of rows (used when hash-based change detection pre-filtered rows).
+    /// This is identical to upsert_chunk but exists for API clarity - hash filtering
+    /// reduces network transfer, while the DB-side WHERE clause prevents unnecessary writes.
+    async fn upsert_chunk_with_hash(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+        writer_id: usize,
+    ) -> Result<u64>;
+
     /// Get the database type.
     fn db_type(&self) -> &str;
 
@@ -1236,7 +1249,7 @@ impl TargetPool for PgPool {
         })?;
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, false);
+        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1250,6 +1263,21 @@ impl TargetPool for PgPool {
         // the connection is returned to the pool).
 
         Ok(row_count)
+    }
+
+    async fn upsert_chunk_with_hash(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+        writer_id: usize,
+    ) -> Result<u64> {
+        // Hash filtering reduces network transfer, but we still use the DB-side
+        // WHERE clause to prevent unnecessary writes (WAL, triggers, etc.)
+        self.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
+            .await
     }
 
     fn db_type(&self) -> &str {
@@ -1769,18 +1797,17 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
 }
 
 /// Build SQL to merge from staging table into target table.
-/// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE.
+/// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
 ///
-/// When `skip_change_detection` is true, the WHERE clause is omitted because
-/// rows have already been pre-filtered using hash comparison. This is more
-/// efficient as we don't need to compare all columns again.
+/// The WHERE clause uses IS DISTINCT FROM to only update rows where at least
+/// one non-PK column has changed. This prevents unnecessary writes (WAL, triggers, etc.)
+/// even when hash-based filtering has already been applied at the transfer layer.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
-    skip_change_detection: bool,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -1811,19 +1838,8 @@ fn build_staging_merge_sql(
             pg_quote_ident(staging_table),
             pk_list
         )
-    } else if skip_change_detection {
-        // Hash pre-filter was used, no need for column-by-column comparison
-        format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
-            pg_qualify_table(schema, table),
-            col_list,
-            col_list,
-            pg_quote_ident(staging_table),
-            pk_list,
-            update_cols.join(", ")
-        )
     } else {
-        // Build change detection WHERE clause for traditional upsert
+        // Build change detection WHERE clause to prevent unnecessary updates
         let change_detection: Vec<String> = cols
             .iter()
             .filter(|c| !pk_cols.contains(c))
@@ -2048,38 +2064,26 @@ mod tests {
     }
 
     #[test]
-    fn test_build_staging_merge_sql_with_skip_change_detection() {
+    fn test_build_staging_merge_sql_with_change_detection() {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        // Without skip_change_detection (traditional behavior)
-        let sql_with_detection = build_staging_merge_sql(
+        // Should always include change detection WHERE clause
+        let sql = build_staging_merge_sql(
             "public",
             "users",
             "_staging_users",
             &cols,
             &pk_cols,
-            false,
         );
-        assert!(sql_with_detection.contains("WHERE"));
-        assert!(sql_with_detection.contains("IS DISTINCT FROM"));
-
-        // With skip_change_detection (hash pre-filtered)
-        let sql_skip_detection = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            true,
-        );
-        assert!(!sql_skip_detection.contains("WHERE"));
-        assert!(!sql_skip_detection.contains("IS DISTINCT FROM"));
+        assert!(sql.contains("WHERE"));
+        assert!(sql.contains("IS DISTINCT FROM"));
+        assert!(sql.contains("DO UPDATE SET"));
     }
 
     #[test]
     fn test_build_staging_merge_sql_pk_only_table() {
-        // For PK-only tables, should use DO NOTHING regardless of skip_change_detection
+        // For PK-only tables, should use DO NOTHING (no columns to update)
         let cols = vec!["id".to_string()];
         let pk_cols = vec!["id".to_string()];
 
@@ -2089,7 +2093,6 @@ mod tests {
             "_staging_lookup",
             &cols,
             &pk_cols,
-            false,
         );
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));

@@ -755,6 +755,104 @@ impl MssqlPool {
         client.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
+
+    /// Query rows with an additional computed hash column.
+    /// The hash is computed by SQL Server using MD5 of non-PK columns.
+    /// This is more efficient than computing hashes in Rust.
+    pub async fn query_rows_with_hash(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+        let mut client = self.get_client().await?;
+        let t_conn = t0.elapsed();
+
+        let t1 = Instant::now();
+        let stream = client.simple_query(sql).await?;
+        let t_query = t1.elapsed();
+
+        let t2 = Instant::now();
+        let rows = stream.into_first_result().await?;
+        let t_fetch = t2.elapsed();
+
+        let t3 = Instant::now();
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            // col_types includes the hash column at the end (type "row_hash")
+            let mut values = Vec::with_capacity(col_types.len());
+
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = if data_type == "row_hash" {
+                    // Hash column - get as string
+                    row.get::<&str, _>(idx)
+                        .map(|s| SqlValue::String(s.to_string()))
+                        .unwrap_or(SqlValue::Null(SqlNullType::String))
+                } else {
+                    convert_row_value(&row, idx, data_type)
+                };
+                values.push(value);
+            }
+
+            result.push(values);
+        }
+        let t_convert = t3.elapsed();
+
+        if result.len() > 1000 {
+            debug!(
+                "PROFILE read+hash: {} rows - conn={:?}, query={:?}, fetch={:?}, convert={:?}",
+                result.len(),
+                t_conn,
+                t_query,
+                t_fetch,
+                t_convert
+            );
+        }
+
+        Ok(result)
+    }
+}
+
+/// Generate SQL Server HASHBYTES expression for non-PK columns.
+/// Returns a SQL expression that computes MD5 hash as lowercase hex string.
+///
+/// The hash format matches what we store in PostgreSQL:
+/// - NULL values represented as '\N'
+/// - Columns separated by '|'
+/// - Result is 32-character lowercase hex string
+pub fn generate_hash_expression(columns: &[String], pk_columns: &[String]) -> String {
+    // Filter to non-PK columns
+    let non_pk_cols: Vec<&String> = columns
+        .iter()
+        .filter(|c| !pk_columns.contains(c))
+        .collect();
+
+    if non_pk_cols.is_empty() {
+        // No non-PK columns, return empty string hash
+        return "'' AS row_hash".to_string();
+    }
+
+    // Build CONCAT_WS expression with ISNULL for each column
+    // Format: ISNULL(CAST([col] AS NVARCHAR(MAX)), '\N')
+    let col_exprs: Vec<String> = non_pk_cols
+        .iter()
+        .map(|col| {
+            format!(
+                "ISNULL(CAST([{}] AS NVARCHAR(MAX)), '\\N')",
+                col.replace(']', "]]")
+            )
+        })
+        .collect();
+
+    // HASHBYTES returns varbinary, CONVERT with style 2 gives hex without '0x' prefix
+    format!(
+        "LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', CONCAT_WS('|', {})), 2)) AS row_hash",
+        col_exprs.join(", ")
+    )
 }
 
 /// Convert a row value to SqlValue based on the column type.

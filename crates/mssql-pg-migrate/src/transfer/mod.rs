@@ -7,10 +7,11 @@
 
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
-use crate::source::{MssqlPool, Table};
+use crate::source::{generate_hash_expression, MssqlPool, Table};
 use crate::target::{PgPool, SqlValue, TargetPool};
 use futures::future::try_join_all;
-use std::collections::BTreeMap;
+use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +41,12 @@ pub struct TransferJob {
 
     /// Target schema name.
     pub target_schema: String,
+
+    /// Whether to use hash-based change detection for upsert.
+    pub use_hash_detection: bool,
+
+    /// Column name for storing row hashes (when hash detection is enabled).
+    pub row_hash_column: String,
 }
 
 /// Statistics from a transfer job.
@@ -56,6 +63,9 @@ pub struct TransferStats {
 
     /// Total rows transferred.
     pub rows: i64,
+
+    /// Rows skipped due to hash match (unchanged).
+    pub rows_skipped: i64,
 
     /// Last primary key value processed.
     pub last_pk: Option<i64>,
@@ -202,8 +212,12 @@ impl TransferEngine {
     pub async fn execute(&self, job: TransferJob) -> Result<TransferStats> {
         let table_name = job.table.full_name();
         info!(
-            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {})",
-            table_name, job.target_mode, self.config.parallel_readers, self.config.parallel_writers
+            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {}{})",
+            table_name,
+            job.target_mode,
+            self.config.parallel_readers,
+            self.config.parallel_writers,
+            if job.use_hash_detection { ", hash_detection=on" } else { "" }
         );
 
         let start = Instant::now();
@@ -218,6 +232,71 @@ impl TransferEngine {
             .map(|c| c.data_type.clone())
             .collect();
         let pk_cols: Vec<String> = job.table.primary_key.clone();
+
+        // Hash detection setup: check if enabled and applicable
+        let use_hash = job.use_hash_detection
+            && matches!(job.target_mode, TargetMode::Upsert)
+            && job.table.has_single_pk();
+
+        // Fetch existing hashes from target if hash detection is enabled
+        let existing_hashes: HashMap<i64, String> = if use_hash {
+            let pk_col = &pk_cols[0];
+            match self
+                .target
+                .fetch_row_hashes(
+                    &job.target_schema,
+                    &job.table.name,
+                    pk_col,
+                    &job.row_hash_column,
+                    job.min_pk,
+                    job.max_pk,
+                )
+                .await
+            {
+                Ok(hashes) => {
+                    info!(
+                        "{}: fetched {} existing hashes for change detection",
+                        table_name,
+                        hashes.len()
+                    );
+                    hashes
+                }
+                Err(e) => {
+                    warn!(
+                        "{}: failed to fetch existing hashes, continuing without hash filtering: {}",
+                        table_name, e
+                    );
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
+        // Build column lists for reading and writing
+        // When hash detection is enabled, we read with hash column from source
+        // and write with hash column to target
+        let (read_columns, read_col_types, write_columns) = if use_hash {
+            let mut read_cols = columns.clone();
+            read_cols.push(job.row_hash_column.clone());
+            let mut read_types = col_types.clone();
+            read_types.push("row_hash".to_string()); // Special marker for hash column
+            let mut write_cols = columns.clone();
+            write_cols.push(job.row_hash_column.clone());
+            (read_cols, read_types, write_cols)
+        } else {
+            (columns.clone(), col_types.clone(), columns.clone())
+        };
+
+        // Generate hash expression for SQL Server queries
+        let hash_expr = if use_hash {
+            Some(generate_hash_expression(&columns, &pk_cols))
+        } else {
+            None
+        };
+
+        // Find PK column index for hash filtering
+        let pk_idx = columns.iter().position(|c| c == &pk_cols[0]);
 
         // Determine if we can use parallel keyset pagination
         let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
@@ -245,29 +324,32 @@ impl TransferEngine {
         let source = self.source.clone();
         let job_clone = job.clone();
         let chunk_size = self.config.chunk_size;
-        let columns_clone = columns.clone();
-        let col_types_clone = col_types.clone();
+        let read_columns_clone = read_columns.clone();
+        let read_col_types_clone = read_col_types.clone();
+        let hash_expr_clone = hash_expr.clone();
 
         let reader_handle = tokio::spawn(async move {
             if use_keyset && num_readers > 1 {
                 read_table_chunks_parallel(
                     source,
                     job_clone,
-                    columns_clone,
-                    col_types_clone,
+                    read_columns_clone,
+                    read_col_types_clone,
                     chunk_size,
                     num_readers,
                     read_tx,
+                    hash_expr_clone,
                 )
                 .await
             } else {
                 read_table_chunks(
                     source,
                     job_clone,
-                    columns_clone,
-                    col_types_clone,
+                    read_columns_clone,
+                    read_col_types_clone,
                     chunk_size,
                     read_tx,
+                    hash_expr_clone,
                 )
                 .await
             }
@@ -282,7 +364,7 @@ impl TransferEngine {
             let target = self.target.clone();
             let schema = job.target_schema.clone();
             let table_name_clone = job.table.name.clone();
-            let columns_clone = columns.clone();
+            let write_columns_clone = write_columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
 
@@ -297,10 +379,10 @@ impl TransferEngine {
                     let result = match target_mode {
                         TargetMode::Upsert => {
                             target
-                                .upsert_chunk(
+                                .upsert_chunk_with_hash(
                                     &schema,
                                     &table_name_clone,
-                                    &columns_clone,
+                                    &write_columns_clone,
                                     &pk_cols_clone,
                                     write_job.rows,
                                     writer_id,
@@ -312,7 +394,7 @@ impl TransferEngine {
                                 .write_chunk(
                                     &schema,
                                     &table_name_clone,
-                                    &columns_clone,
+                                    &write_columns_clone,
                                     write_job.rows,
                                 )
                                 .await
@@ -351,11 +433,13 @@ impl TransferEngine {
         // 1. Range tracking for safe resume points (RangeTracker)
         // 2. Query timing aggregation
         // 3. Backpressure management between read/write stages
+        // 4. Hash-based filtering (when enabled)
         //
         // Passing write_tx directly to readers would require shared-state range
         // tracking (mutex/atomic), adding complexity for marginal latency gains.
         // The dispatcher overhead is minimal since it just forwards chunks.
         let mut total_query_time = Duration::ZERO;
+        let mut total_rows_skipped = 0i64;
 
         // Use RangeTracker for safe resume points with parallel readers.
         // This prevents data loss when chunks arrive out of order.
@@ -365,17 +449,41 @@ impl TransferEngine {
         // Use a separate receiver for the read channel
         let mut read_rx = read_rx;
 
+        // Hash column is the last column when hash detection is enabled
+        let hash_col_idx = if use_hash {
+            Some(read_columns.len() - 1)
+        } else {
+            None
+        };
+
         while let Some(chunk) = read_rx.recv().await {
             total_query_time += chunk.read_time;
             // Track completed ranges for safe resume point calculation.
             // Only contiguous ranges from start are considered safe.
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
-            let write_job = WriteJob { rows: chunk.rows };
+            // Filter rows by hash if hash detection is enabled
+            let (filtered_rows, skipped) = if use_hash && !existing_hashes.is_empty() {
+                filter_rows_by_hash(
+                    chunk.rows,
+                    pk_idx,
+                    hash_col_idx.unwrap(),
+                    &existing_hashes,
+                )
+            } else {
+                (chunk.rows, 0)
+            };
 
-            if write_tx.send(write_job).await.is_err() {
-                // Writers have all failed
-                break;
+            total_rows_skipped += skipped;
+
+            // Only send if we have rows to write
+            if !filtered_rows.is_empty() {
+                let write_job = WriteJob { rows: filtered_rows };
+
+                if write_tx.send(write_job).await.is_err() {
+                    // Writers have all failed
+                    break;
+                }
             }
         }
 
@@ -431,6 +539,7 @@ impl TransferEngine {
             .fetch_add(total_rows, Ordering::Relaxed);
 
         stats.rows = total_rows;
+        stats.rows_skipped = total_rows_skipped;
         stats.query_time = total_query_time;
         stats.write_time = total_write_time;
         stats.last_pk = last_pk;
@@ -448,13 +557,76 @@ impl TransferEngine {
             0
         };
 
-        info!(
-            "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-            table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
-        );
+        if total_rows_skipped > 0 {
+            info!(
+                "{}: transferred {} rows, skipped {} unchanged in {:?} ({} rows/sec, read: {:?}, write: {:?})",
+                table_name, stats.rows, stats.rows_skipped, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
+            );
+        } else {
+            info!(
+                "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
+                table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
+            );
+        }
 
         Ok(stats)
     }
+}
+
+/// Filter rows by comparing source hash with existing target hashes.
+/// Uses rayon for parallel processing of large chunks.
+///
+/// Returns (filtered_rows, skipped_count) where filtered_rows only contains
+/// rows that are new or have changed (hash mismatch).
+fn filter_rows_by_hash(
+    rows: Vec<Vec<SqlValue>>,
+    pk_idx: Option<usize>,
+    hash_col_idx: usize,
+    existing_hashes: &HashMap<i64, String>,
+) -> (Vec<Vec<SqlValue>>, i64) {
+    let pk_idx = match pk_idx {
+        Some(idx) => idx,
+        None => return (rows, 0), // Can't filter without PK index
+    };
+
+    let total = rows.len();
+
+    // Helper to check if a row should be included (returns true if changed/new)
+    let should_include = |row: &Vec<SqlValue>| -> bool {
+        // Extract PK value
+        let pk = match &row[pk_idx] {
+            SqlValue::I64(v) => *v,
+            SqlValue::I32(v) => *v as i64,
+            SqlValue::I16(v) => *v as i64,
+            _ => return true, // Can't extract PK, include the row
+        };
+
+        // Extract source hash
+        let source_hash = match &row[hash_col_idx] {
+            SqlValue::String(s) => s.as_str(),
+            _ => return true, // No hash, include the row
+        };
+
+        // Check if existing hash matches
+        match existing_hashes.get(&pk) {
+            Some(existing) if existing == source_hash => false, // Hash matches, skip
+            _ => true, // New row or hash changed, include
+        }
+    };
+
+    // Use parallel processing for large chunks (>1000 rows)
+    let filtered: Vec<Vec<SqlValue>> = if rows.len() > 1000 {
+        rows.into_par_iter()
+            .filter(|row| should_include(row))
+            .collect()
+    } else {
+        rows.into_iter()
+            .filter(|row| should_include(row))
+            .collect()
+    };
+
+    let skipped = (total - filtered.len()) as i64;
+    (filtered, skipped)
 }
 
 /// Split a PK range into N sub-ranges for parallel reading.
@@ -496,6 +668,7 @@ async fn read_table_chunks_parallel(
     chunk_size: usize,
     num_readers: usize,
     tx: mpsc::Sender<RowChunk>,
+    hash_expr: Option<String>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -543,6 +716,7 @@ async fn read_table_chunks_parallel(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let hash_expr = hash_expr.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
         // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
@@ -561,7 +735,7 @@ async fn read_table_chunks_parallel(
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, hash_expr,
             )
             .await
         });
@@ -607,6 +781,7 @@ async fn read_chunk_range(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    hash_expr: Option<String>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -628,6 +803,7 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            hash_expr.as_deref(),
         )
         .await?;
 
@@ -696,6 +872,7 @@ async fn read_table_chunks(
     col_types: Vec<String>,
     chunk_size: usize,
     tx: mpsc::Sender<RowChunk>,
+    hash_expr: Option<String>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -718,6 +895,7 @@ async fn read_table_chunks(
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
                 &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
+                hash_expr.as_deref(),
             )
             .await?
         } else {
@@ -795,6 +973,8 @@ async fn read_table_chunks(
 /// This is needed because for the first chunk of a range, `last_pk` represents the starting
 /// boundary that should be included, not a previously-read row to skip.
 /// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
+///
+/// When `hash_expr` is provided, includes the SQL Server-computed hash in the SELECT.
 async fn read_chunk_keyset_fast(
     source: &MssqlPool,
     table: &Table,
@@ -804,18 +984,31 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    hash_expr: Option<&str>,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
-    let col_list = columns
+
+    // Build column list - exclude the hash column from quoted columns since it's a computed expression
+    let data_col_list = columns
         .iter()
+        .filter(|c| !col_types.get(columns.iter().position(|x| x == *c).unwrap_or(0))
+            .map(|t| t == "row_hash")
+            .unwrap_or(false))
         .map(|c| quote_mssql_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Add hash expression if provided
+    let select_list = if let Some(hash) = hash_expr {
+        format!("{}, {}", data_col_list, hash)
+    } else {
+        data_col_list
+    };
+
     let mut query = format!(
         "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
         chunk_size,
-        col_list,
+        select_list,
         qualify_mssql_table(&table.schema, &table.name)
     );
 
@@ -837,8 +1030,12 @@ async fn read_chunk_keyset_fast(
 
     query.push_str(&format!(" ORDER BY {}", quote_mssql_ident(pk_col)));
 
-    // Use fast query with pre-computed column types
-    let rows = source.query_rows_fast(&query, columns, col_types).await?;
+    // Use appropriate query method based on whether hash is included
+    let rows = if hash_expr.is_some() {
+        source.query_rows_with_hash(&query, columns, col_types).await?
+    } else {
+        source.query_rows_fast(&query, columns, col_types).await?
+    };
 
     // Get the last PK value from the result
     let pk_idx = columns.iter().position(|c| c == pk_col);

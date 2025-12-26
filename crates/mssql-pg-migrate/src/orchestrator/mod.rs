@@ -795,6 +795,8 @@ impl Orchestrator {
                                 resume_from_pk: None, // Partitions don't support resume yet
                                 target_mode: self.config.migration.target_mode.clone(),
                                 target_schema: self.config.target.schema.clone(),
+                                use_hash_detection: self.config.migration.use_hash_detection(),
+                                row_hash_column: self.config.migration.get_row_hash_column().to_string(),
                             };
 
                             let engine_clone = engine.clone();
@@ -836,6 +838,8 @@ impl Orchestrator {
                 resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
                 target_mode: self.config.migration.target_mode.clone(),
                 target_schema: self.config.target.schema.clone(),
+                use_hash_detection: self.config.migration.use_hash_detection(),
+                row_hash_column: self.config.migration.get_row_hash_column().to_string(),
             };
 
             let engine_clone = engine.clone();

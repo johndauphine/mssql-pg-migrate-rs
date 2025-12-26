@@ -50,6 +50,7 @@ async-channel = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
+rayon = "1.10"
 
 # Decimal handling
 rust_decimal = { workspace = true }
