@@ -308,4 +308,76 @@ migration:
         assert_eq!(json_config.migration.workers, yaml_config.migration.workers);
         assert_eq!(json_config.migration.chunk_size, yaml_config.migration.chunk_size);
     }
+
+    #[test]
+    fn test_filter_tables_no_filters() {
+        let config = Config::from_yaml(VALID_YAML).unwrap();
+        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, tables);
+    }
+
+    #[test]
+    fn test_filter_tables_include_exact() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["Users".to_string(), "Orders".to_string()];
+        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users", "Orders"]);
+    }
+
+    #[test]
+    fn test_filter_tables_include_wildcard() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["User*".to_string()];
+        let tables = vec!["Users".to_string(), "UserRoles".to_string(), "Orders".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users", "UserRoles"]);
+    }
+
+    #[test]
+    fn test_filter_tables_exclude_exact() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.exclude_tables = vec!["Products".to_string()];
+        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users", "Orders"]);
+    }
+
+    #[test]
+    fn test_filter_tables_exclude_wildcard() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.exclude_tables = vec!["*Log*".to_string()];
+        let tables = vec!["Users".to_string(), "AuditLog".to_string(), "LogEntries".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users"]);
+    }
+
+    #[test]
+    fn test_filter_tables_exclude_takes_precedence() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["User*".to_string()];
+        config.migration.exclude_tables = vec!["UserSecrets".to_string()];
+        let tables = vec!["Users".to_string(), "UserRoles".to_string(), "UserSecrets".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users", "UserRoles"]);
+    }
+
+    #[test]
+    fn test_filter_tables_case_insensitive() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["users".to_string()];
+        let tables = vec!["Users".to_string(), "USERS".to_string(), "Orders".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Users", "USERS"]);
+    }
+
+    #[test]
+    fn test_filter_tables_question_mark_wildcard() {
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["Log?".to_string()];
+        let tables = vec!["Log1".to_string(), "Log2".to_string(), "Logs".to_string(), "LogAB".to_string()];
+        let filtered = config.migration.filter_tables(&tables);
+        assert_eq!(filtered, vec!["Log1", "Log2", "Logs"]);
+    }
 }
