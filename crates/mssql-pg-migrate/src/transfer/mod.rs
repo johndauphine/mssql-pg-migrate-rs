@@ -9,6 +9,7 @@ use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, Table};
 use crate::target::{PgPool, SqlValue, TargetPool};
+use futures::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -343,7 +344,17 @@ impl TransferEngine {
         // Drop our copy of write_rx so channel closes when all writers are done
         drop(write_rx);
 
-        // Dispatcher: read from read_rx, dispatch to write_tx
+        // Dispatcher: read from read_rx, dispatch to write_tx.
+        //
+        // Architecture note: The dispatcher adds a hop between readers and writers,
+        // but this is intentional. It centralizes:
+        // 1. Range tracking for safe resume points (RangeTracker)
+        // 2. Query timing aggregation
+        // 3. Backpressure management between read/write stages
+        //
+        // Passing write_tx directly to readers would require shared-state range
+        // tracking (mutex/atomic), adding complexity for marginal latency gains.
+        // The dispatcher overhead is minimal since it just forwards chunks.
         let mut total_query_time = Duration::ZERO;
 
         // Use RangeTracker for safe resume points with parallel readers.
@@ -386,28 +397,33 @@ impl TransferEngine {
             }
         }
 
-        // Wait for all writers and aggregate stats
-        // Writers run in parallel, so wall-clock write time is approximated
-        // by the maximum per-writer duration, not the sum.
+        // Wait for all writers concurrently and aggregate stats.
+        // Uses try_join_all for fail-fast behavior: if any writer fails,
+        // we get the error immediately rather than waiting for earlier writers.
         let mut total_write_time = Duration::ZERO;
         let mut total_rows = 0i64;
 
-        for handle in writer_handles {
-            match handle.await {
-                Ok(Ok((write_time, rows))) => {
-                    if write_time > total_write_time {
-                        total_write_time = write_time;
-                    }
-                    total_rows += rows;
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(e) => {
-                    return Err(MigrateError::Transfer {
-                        table: table_name.clone(),
+        let writer_futures = writer_handles.into_iter().map(|handle| {
+            let table_name = table_name.clone();
+            async move {
+                match handle.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(MigrateError::Transfer {
+                        table: table_name,
                         message: format!("Writer task panicked: {}", e),
-                    })
+                    }),
                 }
             }
+        });
+
+        let results = try_join_all(writer_futures).await?;
+
+        for (write_time, rows) in results {
+            if write_time > total_write_time {
+                total_write_time = write_time;
+            }
+            total_rows += rows;
         }
 
         // Update global counter
@@ -900,11 +916,26 @@ fn is_pk_sortable(table: &Table) -> bool {
 }
 
 /// Quote a SQL Server identifier, escaping closing brackets.
+///
+/// # SQL Identifier Parameterization
+///
+/// SQL identifiers (table names, column names, schema names) cannot be passed as
+/// parameters in prepared statements - only data values can be parameterized.
+/// This is a fundamental limitation of SQL, not a design choice.
+///
+/// To safely construct dynamic SQL with identifiers, we:
+/// 1. Wrap identifiers in brackets `[name]` (SQL Server's quoting mechanism)
+/// 2. Escape embedded closing brackets by doubling them: `]` → `]]`
+///
+/// This prevents SQL injection through identifier names while allowing dynamic
+/// table/column selection required for a generic migration tool.
 fn quote_mssql_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
 }
 
 /// Qualify a SQL Server table name with schema and proper quoting.
+///
+/// See [`quote_mssql_ident`] for details on identifier escaping.
 fn qualify_mssql_table(schema: &str, table: &str) -> String {
     format!("{}.{}", quote_mssql_ident(schema), quote_mssql_ident(table))
 }

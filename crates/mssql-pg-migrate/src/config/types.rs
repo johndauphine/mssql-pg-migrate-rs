@@ -18,9 +18,12 @@ pub struct SystemResources {
 
 impl SystemResources {
     /// Detect system resources.
+    /// Uses targeted refresh to avoid expensive parsing of all processes, disks, and networks.
     pub fn detect() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        // Only refresh what we need - memory and CPU info
+        sys.refresh_memory();
+        sys.refresh_cpu_all();
 
         let total_memory_bytes = sys.total_memory();
         let total_memory_gb = total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
