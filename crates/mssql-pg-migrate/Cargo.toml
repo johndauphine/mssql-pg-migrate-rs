@@ -50,6 +50,7 @@ async-channel = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
+rayon = "1.10"
 
 # Decimal handling
 rust_decimal = { workspace = true }
@@ -57,8 +58,9 @@ rust_decimal = { workspace = true }
 # Bytes handling
 bytes = { workspace = true }
 
-# Hashing for config validation
+# Hashing for config validation and row change detection
 sha2 = { workspace = true }
+md-5 = "0.10"
 
 # Hex encoding
 hex = { workspace = true }

@@ -8,9 +8,10 @@
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, Table};
-use crate::target::{PgPool, SqlValue, TargetPool};
+use crate::target::{calculate_row_hash, PgPool, SqlValue, TargetPool};
 use futures::future::try_join_all;
-use std::collections::BTreeMap;
+use rayon::prelude::*;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +41,12 @@ pub struct TransferJob {
 
     /// Target schema name.
     pub target_schema: String,
+
+    /// Whether to use hash-based change detection for upsert.
+    pub use_hash_detection: bool,
+
+    /// Column name for storing row hashes (when hash detection is enabled).
+    pub row_hash_column: String,
 }
 
 /// Statistics from a transfer job.
@@ -56,6 +63,9 @@ pub struct TransferStats {
 
     /// Total rows transferred.
     pub rows: i64,
+
+    /// Rows skipped due to hash match (unchanged).
+    pub rows_skipped: i64,
 
     /// Last primary key value processed.
     pub last_pk: Option<i64>,
@@ -202,8 +212,12 @@ impl TransferEngine {
     pub async fn execute(&self, job: TransferJob) -> Result<TransferStats> {
         let table_name = job.table.full_name();
         info!(
-            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {})",
-            table_name, job.target_mode, self.config.parallel_readers, self.config.parallel_writers
+            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {}{})",
+            table_name,
+            job.target_mode,
+            self.config.parallel_readers,
+            self.config.parallel_writers,
+            if job.use_hash_detection { ", hash_detection=on" } else { "" }
         );
 
         let start = Instant::now();
@@ -218,6 +232,73 @@ impl TransferEngine {
             .map(|c| c.data_type.clone())
             .collect();
         let pk_cols: Vec<String> = job.table.primary_key.clone();
+
+        // Hash detection setup: check if enabled and applicable
+        // Now supports both single and composite primary keys
+        let use_hash = job.use_hash_detection
+            && matches!(job.target_mode, TargetMode::Upsert)
+            && !job.table.primary_key.is_empty();
+
+        // Fetch existing hashes from target if hash detection is enabled
+        let existing_hashes: HashMap<String, String> = if use_hash {
+            match self
+                .target
+                .fetch_row_hashes(
+                    &job.target_schema,
+                    &job.table.name,
+                    &pk_cols,
+                    &job.row_hash_column,
+                    job.min_pk,
+                    job.max_pk,
+                )
+                .await
+            {
+                Ok(hashes) => {
+                    info!(
+                        "{}: fetched {} existing hashes for change detection",
+                        table_name,
+                        hashes.len()
+                    );
+                    hashes
+                }
+                Err(e) => {
+                    warn!(
+                        "{}: failed to fetch existing hashes, continuing without hash filtering: {}",
+                        table_name, e
+                    );
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
+        // Build column lists for reading and writing
+        // When hash detection is enabled, we compute hash in Rust after reading
+        // and add hash column to the write columns
+        let write_columns = if use_hash {
+            let mut write_cols = columns.clone();
+            write_cols.push(job.row_hash_column.clone());
+            write_cols
+        } else {
+            columns.clone()
+        };
+
+        // Find PK column indices for hash calculation
+        let pk_indices: Vec<usize> = pk_cols
+            .iter()
+            .filter_map(|pk| columns.iter().position(|c| c == pk))
+            .collect();
+
+        // Warn if some PK columns could not be matched to read columns when hash detection is enabled
+        if use_hash && !pk_cols.is_empty() && pk_indices.len() != pk_cols.len() {
+            warn!(
+                "{}: PK column mismatch for hash calculation: {} PK columns configured, but only {} matched in read columns",
+                table_name,
+                pk_cols.len(),
+                pk_indices.len()
+            );
+        }
 
         // Determine if we can use parallel keyset pagination
         let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
@@ -282,7 +363,7 @@ impl TransferEngine {
             let target = self.target.clone();
             let schema = job.target_schema.clone();
             let table_name_clone = job.table.name.clone();
-            let columns_clone = columns.clone();
+            let write_columns_clone = write_columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
 
@@ -297,10 +378,10 @@ impl TransferEngine {
                     let result = match target_mode {
                         TargetMode::Upsert => {
                             target
-                                .upsert_chunk(
+                                .upsert_chunk_with_hash(
                                     &schema,
                                     &table_name_clone,
-                                    &columns_clone,
+                                    &write_columns_clone,
                                     &pk_cols_clone,
                                     write_job.rows,
                                     writer_id,
@@ -312,7 +393,7 @@ impl TransferEngine {
                                 .write_chunk(
                                     &schema,
                                     &table_name_clone,
-                                    &columns_clone,
+                                    &write_columns_clone,
                                     write_job.rows,
                                 )
                                 .await
@@ -351,11 +432,13 @@ impl TransferEngine {
         // 1. Range tracking for safe resume points (RangeTracker)
         // 2. Query timing aggregation
         // 3. Backpressure management between read/write stages
+        // 4. Hash-based filtering (when enabled)
         //
         // Passing write_tx directly to readers would require shared-state range
         // tracking (mutex/atomic), adding complexity for marginal latency gains.
         // The dispatcher overhead is minimal since it just forwards chunks.
         let mut total_query_time = Duration::ZERO;
+        let mut total_rows_skipped = 0i64;
 
         // Use RangeTracker for safe resume points with parallel readers.
         // This prevents data loss when chunks arrive out of order.
@@ -371,11 +454,27 @@ impl TransferEngine {
             // Only contiguous ranges from start are considered safe.
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
-            let write_job = WriteJob { rows: chunk.rows };
+            // Process rows: compute hash in Rust and filter unchanged rows
+            let (processed_rows, skipped) = if use_hash {
+                process_rows_with_hash(
+                    chunk.rows,
+                    &pk_indices,
+                    &existing_hashes,
+                )
+            } else {
+                (chunk.rows, 0)
+            };
 
-            if write_tx.send(write_job).await.is_err() {
-                // Writers have all failed
-                break;
+            total_rows_skipped += skipped;
+
+            // Only send if we have rows to write
+            if !processed_rows.is_empty() {
+                let write_job = WriteJob { rows: processed_rows };
+
+                if write_tx.send(write_job).await.is_err() {
+                    // Writers have all failed
+                    break;
+                }
             }
         }
 
@@ -431,6 +530,7 @@ impl TransferEngine {
             .fetch_add(total_rows, Ordering::Relaxed);
 
         stats.rows = total_rows;
+        stats.rows_skipped = total_rows_skipped;
         stats.query_time = total_query_time;
         stats.write_time = total_write_time;
         stats.last_pk = last_pk;
@@ -448,13 +548,109 @@ impl TransferEngine {
             0
         };
 
-        info!(
-            "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-            table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
-        );
+        if total_rows_skipped > 0 {
+            info!(
+                "{}: transferred {} rows, skipped {} unchanged in {:?} ({} rows/sec, read: {:?}, write: {:?})",
+                table_name, stats.rows, stats.rows_skipped, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
+            );
+        } else {
+            info!(
+                "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
+                table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
+            );
+        }
 
         Ok(stats)
     }
+}
+
+/// Process rows by computing Rust-side MD5 hash and filtering unchanged rows.
+/// Uses rayon for parallel processing of large chunks.
+///
+/// This function:
+/// 1. Computes MD5 hash of non-PK columns for each row using Rust
+/// 2. Compares with existing hashes from the target database
+/// 3. Filters out rows where the hash matches (unchanged)
+/// 4. Appends the computed hash to each row for storage in target
+///
+/// Returns (processed_rows, skipped_count) where processed_rows only contains
+/// rows that are new or have changed, with hash appended.
+fn process_rows_with_hash(
+    rows: Vec<Vec<SqlValue>>,
+    pk_indices: &[usize],
+    existing_hashes: &HashMap<String, String>,
+) -> (Vec<Vec<SqlValue>>, i64) {
+    if pk_indices.is_empty() {
+        // Can't compute hash without PK indices - just return rows as-is
+        // (hash column won't be added, but this shouldn't happen in practice)
+        return (rows, 0);
+    }
+
+    let total = rows.len();
+
+    // Helper to extract serialized PK key from a row
+    // Handles all types that could reasonably be primary keys
+    let extract_pk_key = |row: &[SqlValue]| -> String {
+        pk_indices
+            .iter()
+            .map(|&idx| match &row[idx] {
+                SqlValue::I64(v) => v.to_string(),
+                SqlValue::I32(v) => v.to_string(),
+                SqlValue::I16(v) => v.to_string(),
+                SqlValue::String(s) => s.clone(),
+                SqlValue::Uuid(u) => u.to_string(),
+                SqlValue::Decimal(d) => d.to_string(),
+                SqlValue::Date(d) => d.to_string(),
+                SqlValue::DateTime(dt) => dt.to_string(),
+                SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
+                SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                SqlValue::Bytes(b) => hex::encode(b),
+                // These types are extremely unlikely as PKs but handle for completeness
+                SqlValue::Time(t) => t.to_string(),
+                SqlValue::F32(f) => f.to_string(),
+                SqlValue::F64(f) => f.to_string(),
+                SqlValue::Null(_) => "NULL".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+
+    // Process a single row: compute hash, check if changed, append hash if so
+    let process_row = |mut row: Vec<SqlValue>| -> Option<Vec<SqlValue>> {
+        // Compute hash using Rust-side calculation
+        let computed_hash = calculate_row_hash(&row, pk_indices);
+
+        // Extract PK key for lookup
+        let pk_key = extract_pk_key(&row);
+
+        // Check if row has changed
+        let is_changed = match existing_hashes.get(&pk_key) {
+            Some(existing) if existing == &computed_hash => false, // Hash matches, skip
+            _ => true, // New row or hash changed, include
+        };
+
+        if is_changed {
+            // Append computed hash to row for storage
+            row.push(SqlValue::String(computed_hash));
+            Some(row)
+        } else {
+            None
+        }
+    };
+
+    // Use parallel processing for large chunks (>1000 rows)
+    let processed: Vec<Vec<SqlValue>> = if rows.len() > 1000 {
+        rows.into_par_iter()
+            .filter_map(process_row)
+            .collect()
+    } else {
+        rows.into_iter()
+            .filter_map(process_row)
+            .collect()
+    };
+
+    let skipped = (total - processed.len()) as i64;
+    (processed, skipped)
 }
 
 /// Split a PK range into N sub-ranges for parallel reading.
@@ -806,6 +1002,8 @@ async fn read_chunk_keyset_fast(
     first_chunk: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
+
+    // Build column list
     let col_list = columns
         .iter()
         .map(|c| quote_mssql_ident(c))
@@ -837,7 +1035,6 @@ async fn read_chunk_keyset_fast(
 
     query.push_str(&format!(" ORDER BY {}", quote_mssql_ident(pk_col)));
 
-    // Use fast query with pre-computed column types
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
 
     // Get the last PK value from the result

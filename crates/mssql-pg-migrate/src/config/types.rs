@@ -318,6 +318,17 @@ pub struct MigrationConfig {
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
     pub memory_budget_percent: u8,
+
+    /// Use hash-based change detection for upsert mode.
+    /// When enabled, rows are pre-filtered by comparing MD5 hashes before staging.
+    /// Only new or changed rows are transferred. If unset, upsert mode enables this by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_hash_detection: Option<bool>,
+
+    /// Column name for storing row hashes in target tables (default: "row_hash").
+    /// Used when use_hash_detection is enabled.
+    #[serde(default = "default_row_hash_column")]
+    pub row_hash_column: String,
 }
 
 fn default_memory_budget_percent() -> u8 {
@@ -594,6 +605,17 @@ impl MigrationConfig {
     pub fn get_upsert_parallel_tasks(&self) -> usize {
         self.upsert_parallel_tasks.unwrap_or(4)
     }
+
+    /// Check if hash-based change detection is enabled.
+    /// Defaults to true for upsert mode, false otherwise.
+    pub fn use_hash_detection(&self) -> bool {
+        self.use_hash_detection.unwrap_or(matches!(self.target_mode, TargetMode::Upsert))
+    }
+
+    /// Get the row hash column name.
+    pub fn get_row_hash_column(&self) -> &str {
+        &self.row_hash_column
+    }
 }
 
 /// Target mode for migration.
@@ -642,4 +664,8 @@ fn default_require() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_row_hash_column() -> String {
+    "row_hash".to_string()
 }
