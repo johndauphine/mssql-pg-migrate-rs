@@ -602,50 +602,82 @@ impl PgPool {
     }
 
     /// Fetch existing row hashes for a PK range.
-    /// Returns HashMap of PK value -> MD5 hash string.
+    /// Returns HashMap of serialized PK -> MD5 hash string.
+    ///
+    /// Supports both single and composite primary keys. For composite PKs,
+    /// the key is serialized as "pk1|pk2|pk3".
     pub async fn fetch_row_hashes(
         &self,
         schema: &str,
         table: &str,
-        pk_col: &str,
+        pk_cols: &[String],
         row_hash_col: &str,
         min_pk: Option<i64>,
         max_pk: Option<i64>,
-    ) -> Result<HashMap<i64, String>> {
+    ) -> Result<HashMap<String, String>> {
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for hash fetch"))?;
 
+        // Build PK column select list
+        let pk_select: Vec<String> = pk_cols.iter().map(|c| Self::quote_ident(c)).collect();
+
         let mut query = format!(
             "SELECT {}, {} FROM {} WHERE {} IS NOT NULL",
-            Self::quote_ident(pk_col),
+            pk_select.join(", "),
             Self::quote_ident(row_hash_col),
             Self::qualify_table(schema, table),
             Self::quote_ident(row_hash_col)
         );
 
-        let mut conditions = Vec::new();
-        if let Some(min) = min_pk {
-            conditions.push(format!("{} >= {}", Self::quote_ident(pk_col), min));
-        }
-        if let Some(max) = max_pk {
-            conditions.push(format!("{} <= {}", Self::quote_ident(pk_col), max));
-        }
-
-        if !conditions.is_empty() {
-            query.push_str(" AND ");
-            query.push_str(&conditions.join(" AND "));
+        // For single integer PK, we can apply range conditions
+        // For composite PKs, we skip range filtering (fetch all hashes)
+        if pk_cols.len() == 1 {
+            let pk_col = &pk_cols[0];
+            let mut conditions = Vec::new();
+            if let Some(min) = min_pk {
+                conditions.push(format!("{} >= {}", Self::quote_ident(pk_col), min));
+            }
+            if let Some(max) = max_pk {
+                conditions.push(format!("{} <= {}", Self::quote_ident(pk_col), max));
+            }
+            if !conditions.is_empty() {
+                query.push_str(" AND ");
+                query.push_str(&conditions.join(" AND "));
+            }
         }
 
         let rows = client.query(&query, &[]).await?;
 
         let mut hashes = HashMap::with_capacity(rows.len());
+        let num_pk_cols = pk_cols.len();
+
         for row in rows {
-            let pk: i64 = row.get(0);
-            let hash: String = row.get(1);
-            hashes.insert(pk, hash);
+            // Build serialized PK key from all PK columns
+            let pk_key: String = (0..num_pk_cols)
+                .map(|i| {
+                    // Try different types for PK columns
+                    if let Ok(v) = row.try_get::<_, i64>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, i32>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, i16>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, String>(i) {
+                        v
+                    } else if let Ok(v) = row.try_get::<_, uuid::Uuid>(i) {
+                        v.to_string()
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+
+            let hash: String = row.get(num_pk_cols);
+            hashes.insert(pk_key, hash);
         }
 
         debug!(
