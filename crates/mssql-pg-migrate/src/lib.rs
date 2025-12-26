@@ -15,12 +15,14 @@
 //!
 //! ```rust,no_run
 //! use mssql_pg_migrate::{Config, Orchestrator};
+//! use tokio_util::sync::CancellationToken;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = Config::load("config.yaml")?;
 //!     let orchestrator = Orchestrator::new(config).await?;
-//!     let result = orchestrator.run(None, false).await?;
+//!     let cancel = CancellationToken::new();
+//!     let result = orchestrator.run(cancel, false).await?;
 //!     println!("Migrated {} rows", result.rows_transferred);
 //!     Ok(())
 //! }
