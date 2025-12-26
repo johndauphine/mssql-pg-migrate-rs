@@ -27,9 +27,14 @@ pub enum MigrateError {
     #[error("Target database error: {0}")]
     Target(#[from] tokio_postgres::Error),
 
-    /// Connection pool error with context
+    /// Connection pool error with context and optional source
     #[error("Pool error: {message}\n  Context: {context}")]
-    Pool { message: String, context: String },
+    Pool {
+        message: String,
+        context: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// Schema extraction failed
     #[error("Schema extraction failed: {0}")]
@@ -73,11 +78,24 @@ pub enum MigrateError {
 }
 
 impl MigrateError {
-    /// Create a Pool error with context about where it occurred
-    pub fn pool(message: impl Into<String>, context: impl Into<String>) -> Self {
+    /// Create a Pool error with context about where it occurred, preserving the source error
+    pub fn pool<E>(error: E, context: impl Into<String>) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        MigrateError::Pool {
+            message: error.to_string(),
+            context: context.into(),
+            source: Some(Box::new(error)),
+        }
+    }
+
+    /// Create a Pool error with just a message (no source error)
+    pub fn pool_msg(message: impl Into<String>, context: impl Into<String>) -> Self {
         MigrateError::Pool {
             message: message.into(),
             context: context.into(),
+            source: None,
         }
     }
 
@@ -166,6 +184,7 @@ mod tests {
         let pool_err = MigrateError::Pool {
             message: "test".into(),
             context: "ctx".into(),
+            source: None,
         };
         assert_eq!(pool_err.exit_code(), EXIT_CONNECTION_ERROR);
     }
@@ -217,6 +236,7 @@ mod tests {
         let err = MigrateError::Pool {
             message: "".into(),
             context: "".into(),
+            source: None,
         };
         assert!(err.is_recoverable());
     }
@@ -266,6 +286,7 @@ mod tests {
         let err = MigrateError::Pool {
             message: "".into(),
             context: "".into(),
+            source: None,
         };
         assert_eq!(err.error_type(), "connection_pool");
     }
@@ -296,11 +317,28 @@ mod tests {
 
     #[test]
     fn test_pool_helper() {
-        let err = MigrateError::pool("message", "context");
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
+        let err = MigrateError::pool(io_err, "context");
+        match &err {
+            MigrateError::Pool { message, context, source } => {
+                assert_eq!(message, "test error");
+                assert_eq!(context, "context");
+                assert!(source.is_some());
+            }
+            _ => panic!("Expected Pool error"),
+        }
+        // Verify error chain is preserved
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn test_pool_msg_helper() {
+        let err = MigrateError::pool_msg("message", "context");
         match err {
-            MigrateError::Pool { message, context } => {
+            MigrateError::Pool { message, context, source } => {
                 assert_eq!(message, "message");
                 assert_eq!(context, "context");
+                assert!(source.is_none());
             }
             _ => panic!("Expected Pool error"),
         }

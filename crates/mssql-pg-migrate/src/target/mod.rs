@@ -237,7 +237,7 @@ impl PgPool {
                 warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
                 let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
                 Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+                    MigrateError::pool(e, "creating PostgreSQL connection pool")
                 })?
             }
             ssl_mode => {
@@ -246,7 +246,7 @@ impl PgPool {
                 let tls_connector = MakeRustlsConnect::new(tls_config);
                 let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
                 let pool = Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+                    MigrateError::pool(e, "creating PostgreSQL connection pool")
                 })?;
                 info!("PostgreSQL TLS enabled (ssl_mode={})", ssl_mode);
                 pool
@@ -257,7 +257,7 @@ impl PgPool {
         let client = pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "testing PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "testing PostgreSQL connection"))?;
 
         client.simple_query("SELECT 1").await?;
 
@@ -417,7 +417,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema));
         client.execute(&sql, &[]).await?;
@@ -431,7 +431,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, false);
         client.execute(&ddl, &[]).await?;
@@ -445,7 +445,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let ddl = self.generate_ddl(table, target_schema, true);
         client.execute(&ddl, &[]).await?;
@@ -459,7 +459,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "DROP TABLE IF EXISTS {} CASCADE",
@@ -476,7 +476,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
         client.execute(&sql, &[]).await?;
@@ -490,7 +490,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let row = client
             .query_one(
@@ -514,7 +514,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let pk_cols: Vec<String> = table
             .primary_key
@@ -539,7 +539,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
 
@@ -581,7 +581,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         // Query to find all non-PK indexes on the table
         let sql = r#"
@@ -623,7 +623,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
         let ref_cols: Vec<String> = fk
@@ -670,7 +670,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let definition = Self::convert_check_definition(&chk.definition);
 
@@ -700,7 +700,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let row = client
             .query_one(
@@ -722,7 +722,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
@@ -745,7 +745,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         // Get max value (cast to bigint for consistent type)
         let sql = format!(
@@ -791,7 +791,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "ALTER TABLE {} SET LOGGED",
@@ -808,7 +808,7 @@ impl TargetPool for PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let sql = format!(
             "ALTER TABLE {} SET UNLOGGED",
@@ -874,7 +874,7 @@ impl TargetPool for PgPool {
         let staging_table = format!("_staging_{}_{}_{}", schema, table, writer_id);
 
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e.to_string(), "getting PostgreSQL connection for upsert")
+            MigrateError::pool(e, "getting PostgreSQL connection for upsert")
         })?;
 
         // 1. Create temp staging table if not exists, then truncate for reuse
@@ -1006,7 +1006,7 @@ impl PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "testing PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "testing PostgreSQL connection"))?;
         client.simple_query("SELECT 1").await?;
         Ok(())
     }
@@ -1041,10 +1041,7 @@ impl PgPool {
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(
-                e.to_string(),
-                format!("getting connection for COPY to {}.{}", schema, table),
-            )
+            MigrateError::pool(e, format!("getting connection for COPY to {}.{}", schema, table))
         })?;
 
         // Build column list
@@ -1121,10 +1118,7 @@ impl PgPool {
         let t0 = Instant::now();
 
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(
-                e.to_string(),
-                format!("getting connection for binary COPY to {}.{}", schema, table),
-            )
+            MigrateError::pool(e, format!("getting connection for binary COPY to {}.{}", schema, table))
         })?;
         let t_conn = t0.elapsed();
 
@@ -1269,7 +1263,7 @@ impl PgPool {
             .pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting PostgreSQL connection"))?;
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         // Build column list
         let col_list: String = cols
