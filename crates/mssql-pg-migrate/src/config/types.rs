@@ -321,7 +321,7 @@ pub struct MigrationConfig {
 
     /// Use hash-based change detection for upsert mode.
     /// When enabled, rows are pre-filtered by comparing MD5 hashes before staging.
-    /// Only new or changed rows are transferred. Default: true for upsert mode.
+    /// Only new or changed rows are transferred. If unset, upsert mode enables this by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_hash_detection: Option<bool>,
 

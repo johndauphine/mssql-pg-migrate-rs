@@ -656,9 +656,10 @@ impl PgPool {
 
         for row in rows {
             // Build serialized PK key from all PK columns
+            // Handles all types that could reasonably be primary keys
             let pk_key: String = (0..num_pk_cols)
                 .map(|i| {
-                    // Try different types for PK columns
+                    // Try different types for PK columns (ordered by likelihood)
                     if let Ok(v) = row.try_get::<_, i64>(i) {
                         v.to_string()
                     } else if let Ok(v) = row.try_get::<_, i32>(i) {
@@ -669,8 +670,18 @@ impl PgPool {
                         v
                     } else if let Ok(v) = row.try_get::<_, uuid::Uuid>(i) {
                         v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, rust_decimal::Decimal>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, chrono::NaiveDate>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, chrono::NaiveDateTime>(i) {
+                        v.to_string()
+                    } else if let Ok(v) = row.try_get::<_, bool>(i) {
+                        if v { "1" } else { "0" }.to_string()
+                    } else if let Ok(v) = row.try_get::<_, Vec<u8>>(i) {
+                        hex::encode(v)
                     } else {
-                        String::new()
+                        "UNKNOWN".to_string()
                     }
                 })
                 .collect::<Vec<_>>()

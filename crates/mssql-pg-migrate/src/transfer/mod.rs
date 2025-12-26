@@ -290,6 +290,16 @@ impl TransferEngine {
             .filter_map(|pk| columns.iter().position(|c| c == pk))
             .collect();
 
+        // Warn if some PK columns could not be matched to read columns when hash detection is enabled
+        if use_hash && !pk_cols.is_empty() && pk_indices.len() != pk_cols.len() {
+            warn!(
+                "{}: PK column mismatch for hash calculation: {} PK columns configured, but only {} matched in read columns",
+                table_name,
+                pk_cols.len(),
+                pk_indices.len()
+            );
+        }
+
         // Determine if we can use parallel keyset pagination
         let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
         let num_readers = if use_keyset {
@@ -579,6 +589,7 @@ fn process_rows_with_hash(
     let total = rows.len();
 
     // Helper to extract serialized PK key from a row
+    // Handles all types that could reasonably be primary keys
     let extract_pk_key = |row: &[SqlValue]| -> String {
         pk_indices
             .iter()
@@ -588,7 +599,17 @@ fn process_rows_with_hash(
                 SqlValue::I16(v) => v.to_string(),
                 SqlValue::String(s) => s.clone(),
                 SqlValue::Uuid(u) => u.to_string(),
-                _ => String::new(),
+                SqlValue::Decimal(d) => d.to_string(),
+                SqlValue::Date(d) => d.to_string(),
+                SqlValue::DateTime(dt) => dt.to_string(),
+                SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
+                SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                SqlValue::Bytes(b) => hex::encode(b),
+                // These types are extremely unlikely as PKs but handle for completeness
+                SqlValue::Time(t) => t.to_string(),
+                SqlValue::F32(f) => f.to_string(),
+                SqlValue::F64(f) => f.to_string(),
+                SqlValue::Null(_) => "NULL".to_string(),
             })
             .collect::<Vec<_>>()
             .join("|")
