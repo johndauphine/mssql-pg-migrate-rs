@@ -9,6 +9,7 @@ use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, Table};
 use crate::target::{PgPool, SqlValue, TargetPool};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,10 +68,78 @@ pub struct TransferStats {
 struct RowChunk {
     /// Row data.
     rows: Vec<Vec<SqlValue>>,
+    /// First PK value in this chunk (for range tracking).
+    first_pk: Option<i64>,
     /// Last PK value in this chunk (for resume).
     last_pk: Option<i64>,
     /// Time taken to read this chunk.
     read_time: Duration,
+}
+
+/// Tracks completed PK ranges to provide safe resume points.
+///
+/// With parallel readers, chunks may complete out of order. This tracker
+/// maintains a set of completed ranges and only reports a safe resume point
+/// when all ranges from the start are contiguous. This prevents data loss
+/// during resume operations.
+#[derive(Debug)]
+struct RangeTracker {
+    /// Completed ranges as (end_pk) indexed by start_pk, sorted by start
+    ranges: BTreeMap<i64, i64>,
+    /// The starting point (min_pk or 0)
+    start_pk: i64,
+}
+
+impl RangeTracker {
+    /// Create a new range tracker.
+    fn new(start_pk: Option<i64>) -> Self {
+        Self {
+            ranges: BTreeMap::new(),
+            start_pk: start_pk.unwrap_or(0),
+        }
+    }
+
+    /// Add a completed chunk range.
+    fn add_range(&mut self, first_pk: Option<i64>, last_pk: Option<i64>) {
+        if let Some(end) = last_pk {
+            // Use first_pk if available, otherwise assume it starts just after start_pk
+            let start = first_pk.unwrap_or(self.start_pk);
+            self.ranges.insert(start, end);
+        }
+    }
+
+    /// Get the safe resume point - the highest PK where all data from start
+    /// has been processed contiguously.
+    ///
+    /// Returns None if no safe point exists (no contiguous range from start).
+    fn safe_resume_point(&self) -> Option<i64> {
+        if self.ranges.is_empty() {
+            return None;
+        }
+
+        // Find the contiguous range starting from start_pk
+        let mut current_end = self.start_pk;
+
+        for (&range_start, &range_end) in &self.ranges {
+            // A range is contiguous if it starts at or before current_end + 1
+            // (allowing for the case where PKs might not be perfectly sequential)
+            if range_start > current_end + 1 {
+                // Gap found - stop here
+                break;
+            }
+            // Extend the contiguous range
+            if range_end > current_end {
+                current_end = range_end;
+            }
+        }
+
+        // Only return a resume point if we've advanced past the start
+        if current_end > self.start_pk {
+            Some(current_end)
+        } else {
+            None
+        }
+    }
 }
 
 /// A write job for the parallel writer pool.
@@ -274,20 +343,20 @@ impl TransferEngine {
 
         // Dispatcher: read from read_rx, dispatch to write_tx
         let mut total_query_time = Duration::ZERO;
-        let mut last_pk = None;
+
+        // Use RangeTracker for safe resume points with parallel readers.
+        // This prevents data loss when chunks arrive out of order.
+        let start_pk = job.resume_from_pk.or(job.min_pk);
+        let mut range_tracker = RangeTracker::new(start_pk);
 
         // Use a separate receiver for the read channel
         let mut read_rx = read_rx;
 
         while let Some(chunk) = read_rx.recv().await {
             total_query_time += chunk.read_time;
-            // With parallel readers, chunks may arrive out of order.
-            // For resume safety, track the minimum PK processed so far.
-            last_pk = match (last_pk, chunk.last_pk) {
-                (None, pk) => pk,
-                (pk, None) => pk,
-                (Some(a), Some(b)) => Some(a.min(b)),
-            };
+            // Track completed ranges for safe resume point calculation.
+            // Only contiguous ranges from start are considered safe.
+            range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
             let write_job = WriteJob { rows: chunk.rows };
 
@@ -296,6 +365,9 @@ impl TransferEngine {
                 break;
             }
         }
+
+        // Get the safe resume point (only contiguous ranges from start)
+        let last_pk = range_tracker.safe_resume_point();
 
         // Close write channel to signal writers to finish
         drop(write_tx);
@@ -540,8 +612,11 @@ async fn read_chunk_range(
             table_name, reader_id, chunk_num, row_count, read_time
         );
 
+        // first_pk is the starting boundary for this chunk (previous last_pk or start)
+        // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
             rows,
+            first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
         };
@@ -632,8 +707,11 @@ async fn read_table_chunks(
             table_name, chunk_num, row_count, read_time
         );
 
+        // first_pk is the starting boundary for this chunk (previous last_pk or start)
+        // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
             rows,
+            first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
         };
@@ -792,4 +870,103 @@ fn quote_mssql_ident(name: &str) -> String {
 /// Qualify a SQL Server table name with schema and proper quoting.
 fn qualify_mssql_table(schema: &str, table: &str) -> String {
     format!("{}.{}", quote_mssql_ident(schema), quote_mssql_ident(table))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_range_tracker_empty() {
+        let tracker = RangeTracker::new(Some(0));
+        assert_eq!(tracker.safe_resume_point(), None);
+    }
+
+    #[test]
+    fn test_range_tracker_single_range() {
+        let mut tracker = RangeTracker::new(Some(0));
+        tracker.add_range(Some(0), Some(100));
+        assert_eq!(tracker.safe_resume_point(), Some(100));
+    }
+
+    #[test]
+    fn test_range_tracker_contiguous_ranges() {
+        let mut tracker = RangeTracker::new(Some(0));
+        tracker.add_range(Some(0), Some(100));
+        tracker.add_range(Some(100), Some(200));
+        tracker.add_range(Some(200), Some(300));
+        assert_eq!(tracker.safe_resume_point(), Some(300));
+    }
+
+    #[test]
+    fn test_range_tracker_gap_in_ranges() {
+        let mut tracker = RangeTracker::new(Some(0));
+        // Add range 0-100 and 200-300, leaving a gap at 100-200
+        tracker.add_range(Some(0), Some(100));
+        tracker.add_range(Some(200), Some(300));
+        // Safe point should only be 100 (before the gap)
+        assert_eq!(tracker.safe_resume_point(), Some(100));
+    }
+
+    #[test]
+    fn test_range_tracker_out_of_order() {
+        let mut tracker = RangeTracker::new(Some(0));
+        // Add ranges out of order (simulating parallel readers)
+        tracker.add_range(Some(200), Some(300)); // Reader B completes first
+        tracker.add_range(Some(0), Some(100)); // Reader A completes second
+        // Still gap at 100-200, so safe point is 100
+        assert_eq!(tracker.safe_resume_point(), Some(100));
+
+        // Now fill the gap
+        tracker.add_range(Some(100), Some(200));
+        // All ranges contiguous, safe point is 300
+        assert_eq!(tracker.safe_resume_point(), Some(300));
+    }
+
+    #[test]
+    fn test_range_tracker_prevents_data_loss() {
+        // Simulate the exact scenario from issue #20:
+        // Reader A: PK 0-2000, Reader B: PK 2000-4000
+        // Reader B completes first, then process crashes
+        let mut tracker = RangeTracker::new(Some(0));
+
+        // Reader B (2000-4000) completes first
+        tracker.add_range(Some(2000), Some(4000));
+
+        // Safe resume point should NOT be 4000 (which would skip 0-2000)
+        // It should be None or 0 since we haven't completed 0-2000
+        assert_eq!(tracker.safe_resume_point(), None);
+
+        // Now Reader A (0-2000) completes
+        tracker.add_range(Some(0), Some(2000));
+
+        // Now safe resume point is 4000 (all data from start is processed)
+        assert_eq!(tracker.safe_resume_point(), Some(4000));
+    }
+
+    #[test]
+    fn test_range_tracker_with_start_pk() {
+        // Test with non-zero start (simulating resume from PK 500)
+        let mut tracker = RangeTracker::new(Some(500));
+        tracker.add_range(Some(500), Some(600));
+        assert_eq!(tracker.safe_resume_point(), Some(600));
+    }
+
+    #[test]
+    fn test_range_tracker_overlapping_ranges() {
+        let mut tracker = RangeTracker::new(Some(0));
+        // Overlapping ranges should still work correctly
+        tracker.add_range(Some(0), Some(150));
+        tracker.add_range(Some(100), Some(250));
+        tracker.add_range(Some(200), Some(300));
+        assert_eq!(tracker.safe_resume_point(), Some(300));
+    }
+
+    #[test]
+    fn test_range_tracker_none_first_pk() {
+        // When first_pk is None, it defaults to start_pk
+        let mut tracker = RangeTracker::new(Some(0));
+        tracker.add_range(None, Some(100));
+        assert_eq!(tracker.safe_resume_point(), Some(100));
+    }
 }
