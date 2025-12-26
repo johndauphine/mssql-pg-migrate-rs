@@ -171,6 +171,8 @@ pub struct TransferConfig {
     pub parallel_readers: usize,
     /// Number of parallel writers per table.
     pub parallel_writers: usize,
+    /// SQL Server query hints (e.g., "OPTION (MAXDOP 4)").
+    pub query_hints: String,
 }
 
 impl Default for TransferConfig {
@@ -180,6 +182,7 @@ impl Default for TransferConfig {
             read_ahead: 16,
             parallel_readers: 4,
             parallel_writers: 4,
+            query_hints: String::new(),
         }
     }
 }
@@ -330,6 +333,7 @@ impl TransferEngine {
         let col_types_clone = col_types.clone();
         let pk_indices_clone = pk_indices.clone();
 
+        let query_hints = self.config.query_hints.clone();
         let reader_handle = tokio::spawn(async move {
             if use_keyset && num_readers > 1 {
                 read_table_chunks_parallel(
@@ -342,6 +346,7 @@ impl TransferEngine {
                     read_tx,
                     use_hash,
                     pk_indices_clone,
+                    query_hints,
                 )
                 .await
             } else {
@@ -354,6 +359,7 @@ impl TransferEngine {
                     read_tx,
                     use_hash,
                     pk_indices_clone,
+                    query_hints,
                 )
                 .await
             }
@@ -694,6 +700,7 @@ async fn read_table_chunks_parallel(
     tx: mpsc::Sender<RowChunk>,
     use_hash: bool,
     pk_indices: Vec<usize>,
+    query_hints: String,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -757,10 +764,11 @@ async fn read_table_chunks_parallel(
             (range_min, true)
         };
 
+        let query_hints = query_hints.clone();
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx, use_hash, pk_indices,
+                is_resume, tx, use_hash, pk_indices, query_hints,
             )
             .await
         });
@@ -811,6 +819,7 @@ async fn read_chunk_range(
     tx: mpsc::Sender<RowChunk>,
     use_hash: bool,
     pk_indices: Vec<usize>,
+    query_hints: String,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -832,6 +841,7 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            &query_hints,
         )
         .await?;
 
@@ -909,6 +919,7 @@ async fn read_table_chunks(
     tx: mpsc::Sender<RowChunk>,
     use_hash: bool,
     pk_indices: Vec<usize>,
+    query_hints: String,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -930,7 +941,7 @@ async fn read_table_chunks(
 
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
-                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
+                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk, &query_hints,
             )
             .await?
         } else {
@@ -941,6 +952,7 @@ async fn read_table_chunks(
                 &col_types,
                 total_rows as usize,
                 chunk_size,
+                &query_hints,
             )
             .await?
         };
@@ -1024,6 +1036,7 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    query_hints: &str,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
 
@@ -1059,6 +1072,9 @@ async fn read_chunk_keyset_fast(
 
     query.push_str(&format!(" ORDER BY {}", quote_mssql_ident(pk_col)));
 
+    // Append query hints (e.g., OPTION (MAXDOP 4, FAST 10000))
+    query.push_str(query_hints);
+
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
 
     // Get the last PK value from the result
@@ -1087,6 +1103,7 @@ async fn read_chunk_offset(
     col_types: &[String],
     offset: usize,
     chunk_size: usize,
+    query_hints: &str,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let col_list = columns
         .iter()
@@ -1113,7 +1130,7 @@ async fn read_chunk_offset(
             .join(", ")
     };
 
-    let query = format!(
+    let mut query = format!(
         "SELECT {} FROM {} WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
         col_list,
         qualify_mssql_table(&table.schema, &table.name),
@@ -1121,6 +1138,9 @@ async fn read_chunk_offset(
         offset,
         chunk_size
     );
+
+    // Append query hints (e.g., OPTION (MAXDOP 4, FAST 10000))
+    query.push_str(query_hints);
 
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
     Ok((rows, None))

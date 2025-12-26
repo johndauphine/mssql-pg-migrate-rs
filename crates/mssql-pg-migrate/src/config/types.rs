@@ -149,6 +149,18 @@ pub struct SourceConfig {
     /// Trust server certificate (default: false).
     #[serde(default)]
     pub trust_server_cert: bool,
+
+    /// MAXDOP query hint for controlling parallel execution (0-64).
+    /// If set, adds OPTION (MAXDOP N) to read queries.
+    /// Use 1 to disable parallelism, higher values for more parallel execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_hint_maxdop: Option<u8>,
+
+    /// FAST query hint for optimizing early row retrieval.
+    /// If set, adds OPTION (FAST N) to read queries.
+    /// Optimizes for quickly returning the first N rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_hint_fast: Option<usize>,
 }
 
 impl fmt::Debug for SourceConfig {
@@ -163,6 +175,8 @@ impl fmt::Debug for SourceConfig {
             .field("schema", &self.schema)
             .field("encrypt", &self.encrypt)
             .field("trust_server_cert", &self.trust_server_cert)
+            .field("query_hint_maxdop", &self.query_hint_maxdop)
+            .field("query_hint_fast", &self.query_hint_fast)
             .finish()
     }
 }
