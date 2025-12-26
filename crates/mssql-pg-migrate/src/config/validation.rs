@@ -202,4 +202,67 @@ mod tests {
         config.migration.max_mssql_connections = Some(10);
         assert!(validate(&config).is_ok());
     }
+
+    #[test]
+    fn test_zero_max_partitions_rejected() {
+        let mut config = valid_config();
+        config.migration.max_partitions = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_partitions"));
+    }
+
+    #[test]
+    fn test_zero_read_ahead_buffers_rejected() {
+        let mut config = valid_config();
+        config.migration.read_ahead_buffers = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("read_ahead_buffers"));
+    }
+
+    #[test]
+    fn test_zero_max_pg_connections_rejected() {
+        let mut config = valid_config();
+        config.migration.max_pg_connections = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_pg_connections"));
+    }
+
+    #[test]
+    fn test_zero_finalizer_concurrency_rejected() {
+        let mut config = valid_config();
+        config.migration.finalizer_concurrency = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("finalizer_concurrency"));
+    }
+
+    #[test]
+    fn test_zero_copy_buffer_rows_rejected() {
+        let mut config = valid_config();
+        config.migration.copy_buffer_rows = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("copy_buffer_rows"));
+    }
+
+    #[test]
+    fn test_zero_upsert_batch_size_rejected() {
+        let mut config = valid_config();
+        config.migration.upsert_batch_size = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("upsert_batch_size"));
+    }
+
+    #[test]
+    fn test_zero_upsert_parallel_tasks_rejected() {
+        let mut config = valid_config();
+        config.migration.upsert_parallel_tasks = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("upsert_parallel_tasks"));
+    }
 }

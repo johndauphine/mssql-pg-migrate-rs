@@ -840,8 +840,14 @@ impl Orchestrator {
             let (job_name, task_result) = match join_result {
                 Ok(result) => result,
                 Err(e) => {
-                    // Task panicked - we can't recover the job name from JoinError
-                    error!("Task panicked: {}", e);
+                    // Distinguish between cancelled and panicked tasks
+                    if e.is_cancelled() {
+                        // Task was cancelled (e.g., by abort_all) - this is expected during shutdown
+                        debug!("Task was cancelled");
+                    } else {
+                        // Task panicked - we can't recover the job name from JoinError
+                        error!("Task panicked: {}", e);
+                    }
                     continue;
                 }
             };
@@ -850,48 +856,11 @@ impl Orchestrator {
             let base_table = job_name.split(":p").next().unwrap_or(&job_name).to_string();
             let is_partitioned = job_name.contains(":p");
 
-            match task_result {
+            // Process the result (success or failure)
+            match &task_result {
                 Ok(stats) => {
                     info!("{}: completed ({} rows)", job_name, stats.rows);
                     *table_rows.entry(base_table.clone()).or_insert(0) += stats.rows;
-
-                    // Track partition completion
-                    if is_partitioned {
-                        *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
-                        let completed = partition_completed[&base_table];
-                        let expected = expected_partitions.get(&base_table).copied().unwrap_or(1);
-
-                        // When all partitions of a table are done, update state and checkpoint
-                        if completed == expected {
-                            let total_rows = table_rows[&base_table];
-                            if let Some(ts) = state.tables.get_mut(&base_table) {
-                                if !table_errors.contains_key(&base_table) {
-                                    ts.status = TaskStatus::Completed;
-                                    ts.rows_transferred = total_rows;
-                                    ts.completed_at = Some(Utc::now());
-                                } else {
-                                    ts.status = TaskStatus::Failed;
-                                    ts.error = table_errors.get(&base_table).cloned();
-                                    ts.rows_transferred = total_rows;
-                                }
-                            }
-                            self.save_state(state)?;
-                            progress.complete_table(total_rows);
-                            progress.emit("transferring", Some(base_table.clone()));
-                        }
-                    } else {
-                        // For non-partitioned tables, update state directly
-                        if let Some(ts) = state.tables.get_mut(&base_table) {
-                            ts.status = TaskStatus::Completed;
-                            ts.rows_transferred = stats.rows;
-                            ts.last_pk = stats.last_pk;
-                            ts.completed_at = Some(Utc::now());
-                        }
-                        // Checkpoint state after each table completion
-                        self.save_state(state)?;
-                        progress.complete_table(stats.rows);
-                        progress.emit("transferring", Some(base_table.clone()));
-                    }
                 }
                 Err(e) => {
                     error!("{}: failed - {}", job_name, e);
@@ -899,35 +868,64 @@ impl Orchestrator {
                     table_errors
                         .entry(base_table.clone())
                         .or_insert_with(|| e.to_string());
+                }
+            }
 
-                    // Track partition completion even on failure
-                    if is_partitioned {
-                        *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
-                        let completed = partition_completed[&base_table];
-                        let expected = expected_partitions.get(&base_table).copied().unwrap_or(1);
+            // Track partition/table completion
+            if is_partitioned {
+                *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
+                let completed = partition_completed[&base_table];
+                let expected = expected_partitions.get(&base_table).copied().unwrap_or(1);
 
-                        // When all partitions are done (even with failures), update state
-                        if completed == expected {
-                            if let Some(ts) = state.tables.get_mut(&base_table) {
-                                ts.status = TaskStatus::Failed;
-                                ts.error = table_errors.get(&base_table).cloned();
-                                ts.rows_transferred = *table_rows.get(&base_table).unwrap_or(&0);
-                            }
-                            self.save_state(state)?;
-                            progress.increment_table_count();
-                            progress.emit("transferring", Some(base_table.clone()));
+                // When all partitions of a table are done, determine final status
+                if completed == expected {
+                    let total_rows = table_rows.get(&base_table).copied().unwrap_or(0);
+                    if let Some(ts) = state.tables.get_mut(&base_table) {
+                        // Check for any errors across all partitions
+                        if table_errors.contains_key(&base_table) {
+                            ts.status = TaskStatus::Failed;
+                            ts.error = table_errors.get(&base_table).cloned();
+                        } else {
+                            ts.status = TaskStatus::Completed;
+                            ts.completed_at = Some(Utc::now());
                         }
+                        ts.rows_transferred = total_rows;
+                    }
+                    self.save_state(state)?;
+                    // Progress tracking
+                    if table_errors.contains_key(&base_table) {
+                        progress.increment_table_count();
                     } else {
-                        // Non-partitioned table failed - update state and checkpoint
-                        if let Some(ts) = state.tables.get_mut(&base_table) {
+                        progress.complete_table(total_rows);
+                    }
+                    progress.emit("transferring", Some(base_table.clone()));
+                }
+            } else {
+                // Non-partitioned table - update state directly based on result
+                let is_success = task_result.is_ok();
+                let rows = task_result.as_ref().map(|s| s.rows).unwrap_or(0);
+
+                if let Some(ts) = state.tables.get_mut(&base_table) {
+                    match task_result {
+                        Ok(stats) => {
+                            ts.status = TaskStatus::Completed;
+                            ts.rows_transferred = stats.rows;
+                            ts.last_pk = stats.last_pk;
+                            ts.completed_at = Some(Utc::now());
+                        }
+                        Err(e) => {
                             ts.status = TaskStatus::Failed;
                             ts.error = Some(e.to_string());
                         }
-                        self.save_state(state)?;
-                        progress.increment_table_count();
-                        progress.emit("transferring", Some(base_table.clone()));
                     }
                 }
+                self.save_state(state)?;
+                if is_success {
+                    progress.complete_table(rows);
+                } else {
+                    progress.increment_table_count();
+                }
+                progress.emit("transferring", Some(base_table.clone()));
             }
         }
 
