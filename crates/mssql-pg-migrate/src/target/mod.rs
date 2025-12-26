@@ -362,12 +362,25 @@ impl PgPool {
         ddl
     }
 
-    /// Quote a PostgreSQL identifier.
+    /// Quote a PostgreSQL identifier, escaping embedded double quotes.
+    ///
+    /// SQL identifiers (table names, column names, schema names) cannot be passed as
+    /// parameters in prepared statements - only data values can be parameterized.
+    /// This is a fundamental limitation of SQL, not a design choice.
+    ///
+    /// To safely construct dynamic SQL with identifiers, we:
+    /// 1. Wrap identifiers in double quotes `"name"` (PostgreSQL's quoting mechanism)
+    /// 2. Escape embedded quotes by doubling them: `"` → `""`
+    ///
+    /// This prevents SQL injection through identifier names while allowing dynamic
+    /// table/column selection required for a generic migration tool.
     fn quote_ident(name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
     }
 
-    /// Fully qualify a table name.
+    /// Fully qualify a table name with schema.
+    ///
+    /// See [`Self::quote_ident`] for details on identifier escaping.
     fn qualify_table(schema: &str, table: &str) -> String {
         format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
     }
@@ -384,7 +397,13 @@ impl PgPool {
     }
 
     /// Convert SQL Server CHECK definition to PostgreSQL.
+    ///
+    /// This does simple bracket-to-quote conversion for column identifiers.
+    /// Complex cases (nested brackets, brackets in strings) may not convert correctly.
     fn convert_check_definition(def: &str) -> String {
+        // Detect complex cases that may not parse correctly
+        Self::warn_if_complex_constraint(def);
+
         let mut result = def.to_string();
 
         // Replace [column] with "column"
@@ -407,6 +426,54 @@ impl PgPool {
         result = result.replace("GETDATE()", "CURRENT_TIMESTAMP");
 
         result
+    }
+
+    /// Check for complex constraint patterns that may not convert correctly.
+    fn warn_if_complex_constraint(def: &str) {
+        // Check for nested brackets like [[column]]
+        if def.contains("[[") || def.contains("]]") {
+            warn!(
+                "CHECK constraint contains nested brackets which may not convert correctly: {}",
+                Self::truncate_for_log(def)
+            );
+            return;
+        }
+
+        // Check for brackets inside string literals (approximate detection)
+        // Look for patterns like '[something]' inside quotes
+        let mut in_string = false;
+        let mut has_bracket_in_string = false;
+        let chars: Vec<char> = def.chars().collect();
+
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '\'' {
+                // Handle escaped quotes ''
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    continue;
+                }
+                in_string = !in_string;
+            } else if in_string && (c == '[' || c == ']') {
+                has_bracket_in_string = true;
+                break;
+            }
+        }
+
+        if has_bracket_in_string {
+            warn!(
+                "CHECK constraint contains brackets inside string literals which may not convert correctly: {}",
+                Self::truncate_for_log(def)
+            );
+        }
+    }
+
+    /// Truncate a constraint definition for logging (avoid huge log entries).
+    fn truncate_for_log(s: &str) -> String {
+        const MAX_LEN: usize = 100;
+        if s.len() > MAX_LEN {
+            format!("{}...", &s[..MAX_LEN])
+        } else {
+            s.to_string()
+        }
     }
 }
 
