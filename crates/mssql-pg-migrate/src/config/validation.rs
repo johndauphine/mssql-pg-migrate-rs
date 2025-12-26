@@ -49,18 +49,32 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
 
-    // Migration config validation - only check if explicitly set
-    if let Some(0) = config.migration.workers {
-        return Err(MigrateError::Config(
-            "migration.workers must be at least 1".into(),
-        ));
-    }
-    if let Some(0) = config.migration.chunk_size {
-        return Err(MigrateError::Config(
-            "migration.chunk_size must be at least 1".into(),
-        ));
-    }
+    // Migration config validation - validate all Option<usize> fields when Some(0)
+    // These fields must be at least 1 if explicitly set
+    validate_nonzero_option(config.migration.workers, "migration.workers")?;
+    validate_nonzero_option(config.migration.chunk_size, "migration.chunk_size")?;
+    validate_nonzero_option(config.migration.max_partitions, "migration.max_partitions")?;
+    validate_nonzero_option(config.migration.read_ahead_buffers, "migration.read_ahead_buffers")?;
+    validate_nonzero_option(config.migration.write_ahead_writers, "migration.write_ahead_writers")?;
+    validate_nonzero_option(config.migration.parallel_readers, "migration.parallel_readers")?;
+    validate_nonzero_option(config.migration.max_mssql_connections, "migration.max_mssql_connections")?;
+    validate_nonzero_option(config.migration.max_pg_connections, "migration.max_pg_connections")?;
+    validate_nonzero_option(config.migration.finalizer_concurrency, "migration.finalizer_concurrency")?;
+    validate_nonzero_option(config.migration.copy_buffer_rows, "migration.copy_buffer_rows")?;
+    validate_nonzero_option(config.migration.upsert_batch_size, "migration.upsert_batch_size")?;
+    validate_nonzero_option(config.migration.upsert_parallel_tasks, "migration.upsert_parallel_tasks")?;
 
+    Ok(())
+}
+
+/// Validate that an optional usize field is not zero when set
+fn validate_nonzero_option(value: Option<usize>, field_name: &str) -> Result<()> {
+    if let Some(0) = value {
+        return Err(MigrateError::Config(format!(
+            "{} must be at least 1",
+            field_name
+        )));
+    }
     Ok(())
 }
 
@@ -151,5 +165,41 @@ mod tests {
             !debug_output.contains("super_secret_password_456"),
             "Debug output should not contain actual password value"
         );
+    }
+
+    #[test]
+    fn test_zero_parallel_readers_rejected() {
+        let mut config = valid_config();
+        config.migration.parallel_readers = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("parallel_readers"));
+    }
+
+    #[test]
+    fn test_zero_parallel_writers_rejected() {
+        let mut config = valid_config();
+        config.migration.write_ahead_writers = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("write_ahead_writers"));
+    }
+
+    #[test]
+    fn test_zero_max_connections_rejected() {
+        let mut config = valid_config();
+        config.migration.max_mssql_connections = Some(0);
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_mssql_connections"));
+    }
+
+    #[test]
+    fn test_valid_nonzero_options_accepted() {
+        let mut config = valid_config();
+        config.migration.parallel_readers = Some(4);
+        config.migration.write_ahead_writers = Some(2);
+        config.migration.max_mssql_connections = Some(10);
+        assert!(validate(&config).is_ok());
     }
 }
