@@ -356,8 +356,12 @@ impl MigrationConfig {
             );
         }
         let memory_budget_pct = clamped_percent as f64 / 100.0;
-        let memory_budget_bytes =
-            (resources.total_memory_bytes as f64 * memory_budget_pct) as usize;
+        // Keep calculation in u64 to avoid 32-bit overflow on systems with >4GB RAM
+        let memory_budget_bytes_u64 =
+            (resources.total_memory_bytes as f64 * memory_budget_pct) as u64;
+        // Saturate to usize::MAX on 32-bit systems to prevent panic
+        let memory_budget_bytes = usize::try_from(memory_budget_bytes_u64)
+            .unwrap_or(usize::MAX);
         let memory_budget_mb = memory_budget_bytes / (1024 * 1024);
 
         info!(
