@@ -528,15 +528,21 @@ async fn read_table_chunks_parallel(
         let tx = tx.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
-        let start_pk = if reader_id == 0 {
-            job.resume_from_pk.or(job.min_pk)
+        // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
+        let (start_pk, is_resume) = if reader_id == 0 {
+            if job.resume_from_pk.is_some() {
+                (job.resume_from_pk, true) // Resuming: use > to skip already-read row
+            } else {
+                (job.min_pk, false) // Fresh start: use >= to include boundary
+            }
         } else {
-            range_min
+            (range_min, false) // Other readers: fresh range, use >=
         };
 
         let handle = tokio::spawn(async move {
             read_chunk_range(
-                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id, tx,
+                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
+                is_resume, tx,
             )
             .await
         });
@@ -567,6 +573,10 @@ async fn read_table_chunks_parallel(
 }
 
 /// Read chunks for a specific PK range.
+///
+/// `is_resume` indicates whether `start_pk` came from a resume checkpoint (true) or
+/// is a fresh range boundary (false). When resuming, the first query uses `>` to skip
+/// the already-processed row. For fresh starts, the first query uses `>=` to include it.
 async fn read_chunk_range(
     source: Arc<MssqlPool>,
     table: Table,
@@ -576,6 +586,7 @@ async fn read_chunk_range(
     end_pk: i64,
     chunk_size: usize,
     reader_id: usize,
+    is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
 ) -> Result<i64> {
     let table_name = table.full_name();
@@ -583,6 +594,8 @@ async fn read_chunk_range(
     let mut last_pk = start_pk;
     let mut total_rows = 0i64;
     let mut chunk_num = 0;
+    // First chunk uses >= for fresh ranges, > for resume
+    let mut is_first_chunk = !is_resume;
 
     loop {
         let read_start = Instant::now();
@@ -595,8 +608,12 @@ async fn read_chunk_range(
             last_pk,
             Some(end_pk),
             chunk_size,
+            is_first_chunk,
         )
         .await?;
+
+        // After first chunk, always use > for subsequent chunks
+        is_first_chunk = false;
 
         let read_time = read_start.elapsed();
         let row_count = rows.len();
@@ -666,18 +683,22 @@ async fn read_table_chunks(
 
     let use_keyset = table.has_single_pk() && is_pk_sortable(table);
 
+    // Determine start point and whether we're resuming
+    let is_resume = job.resume_from_pk.is_some();
     let mut last_pk: Option<i64> = job.resume_from_pk.or(job.min_pk);
     let max_pk = job.max_pk;
 
     let mut total_rows = 0i64;
     let mut chunk_num = 0;
+    // First chunk uses >= for fresh ranges, > for resume
+    let mut is_first_chunk = !is_resume;
 
     loop {
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
-                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size,
+                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
             )
             .await?
         } else {
@@ -691,6 +712,9 @@ async fn read_table_chunks(
             )
             .await?
         };
+
+        // After first chunk, always use > for subsequent chunks
+        is_first_chunk = false;
 
         let read_time = read_start.elapsed();
         let row_count = rows.len();
@@ -747,6 +771,11 @@ async fn read_table_chunks(
 }
 
 /// Read a chunk using keyset pagination with pre-computed column types (O(1) lookup).
+///
+/// When `first_chunk` is true and `last_pk` is set, uses `>=` (inclusive) for the lower bound.
+/// This is needed because for the first chunk of a range, `last_pk` represents the starting
+/// boundary that should be included, not a previously-read row to skip.
+/// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
 async fn read_chunk_keyset_fast(
     source: &MssqlPool,
     table: &Table,
@@ -755,6 +784,7 @@ async fn read_chunk_keyset_fast(
     last_pk: Option<i64>,
     max_pk: Option<i64>,
     chunk_size: usize,
+    first_chunk: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let col_list = columns
@@ -772,7 +802,10 @@ async fn read_chunk_keyset_fast(
 
     let mut conditions = Vec::new();
     if let Some(pk) = last_pk {
-        conditions.push(format!("{} > {}", quote_mssql_ident(pk_col), pk));
+        // For first chunk of a range, use >= to include the starting boundary
+        // For subsequent chunks (or resume), use > to skip the last-read row
+        let op = if first_chunk { ">=" } else { ">" };
+        conditions.push(format!("{} {} {}", quote_mssql_ident(pk_col), op, pk));
     }
     if let Some(pk) = max_pk {
         conditions.push(format!("{} <= {}", quote_mssql_ident(pk_col), pk));

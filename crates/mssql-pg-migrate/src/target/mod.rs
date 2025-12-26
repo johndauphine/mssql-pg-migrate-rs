@@ -865,16 +865,18 @@ impl TargetPool for PgPool {
 
         let row_count = rows.len() as u64;
 
-        // Generate unique staging table name
-        let staging_table = format!("_staging_{}_{}", table, uuid::Uuid::new_v4().simple());
+        // Use deterministic staging table name based on target table
+        // This allows reuse across batches, reducing catalog churn
+        let staging_table = format!("_staging_{}_{}", schema, table);
 
         let client = self.pool.get().await.map_err(|e| {
             MigrateError::pool(e.to_string(), "getting PostgreSQL connection for upsert")
         })?;
 
-        // 1. Create temp staging table (session-local, dropped on disconnect)
+        // 1. Create temp staging table if not exists, then truncate for reuse
+        // This reduces system catalog churn by reusing the same table across batches
         let create_staging_sql = format!(
-            "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS)",
+            "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
             pg_quote_ident(&staging_table),
             pg_qualify_table(schema, table)
         );
@@ -882,6 +884,15 @@ impl TargetPool for PgPool {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
                 format!("creating staging table: {}", e),
+            )
+        })?;
+
+        // Truncate to clear any previous batch data (faster than DROP/CREATE)
+        let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
+        client.execute(&truncate_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                format!("truncating staging table: {}", e),
             )
         })?;
 
@@ -967,9 +978,9 @@ impl TargetPool for PgPool {
             )
         })?;
 
-        // 4. Drop staging table (also dropped automatically ON COMMIT DROP)
-        let drop_sql = format!("DROP TABLE IF EXISTS {}", pg_quote_ident(&staging_table));
-        let _ = client.execute(&drop_sql, &[]).await; // Ignore errors, it's cleanup
+        // Note: Staging table is NOT dropped here - it's reused across batches
+        // to reduce system catalog churn. It will be automatically dropped when
+        // the connection is returned to the pool or the session ends.
 
         Ok(row_count)
     }
