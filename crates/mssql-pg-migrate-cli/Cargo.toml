@@ -19,6 +19,7 @@ clap = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

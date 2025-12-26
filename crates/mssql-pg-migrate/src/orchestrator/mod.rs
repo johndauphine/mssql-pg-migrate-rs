@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Migration orchestrator.
@@ -325,7 +327,7 @@ impl Orchestrator {
     /// If dry_run is true, only validates and shows what would happen without transferring data.
     pub async fn run(
         mut self,
-        cancel: Option<watch::Receiver<bool>>,
+        cancel: CancellationToken,
         dry_run: bool,
     ) -> Result<MigrationResult> {
         let started_at = Utc::now();
@@ -334,11 +336,6 @@ impl Orchestrator {
             .as_ref()
             .map(|s| s.run_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        let cancel = cancel.unwrap_or_else(|| {
-            let (_, rx) = watch::channel(false);
-            rx
-        });
 
         info!("Starting migration run: {}", run_id);
 
@@ -414,8 +411,7 @@ impl Orchestrator {
         let transfer_result = if !dry_run {
             info!("Phase 3: Transferring data");
             self.emit_progress("transferring", tables.len());
-            self.transfer_data(&tables, &mut state, cancel.clone())
-                .await
+            self.transfer_data(&tables, &mut state, &cancel).await
         } else {
             info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
             Ok(())
@@ -477,7 +473,7 @@ impl Orchestrator {
         } else if tables_failed > 0 {
             state.status = RunStatus::Failed;
             "failed"
-        } else if *cancel.borrow() {
+        } else if cancel.is_cancelled() {
             state.status = RunStatus::Cancelled;
             "cancelled"
         } else {
@@ -673,7 +669,7 @@ impl Orchestrator {
         &self,
         tables: &[Table],
         state: &mut MigrationState,
-        cancel: watch::Receiver<bool>,
+        cancel: &CancellationToken,
     ) -> Result<()> {
         let workers = self.config.migration.get_workers();
         let semaphore = Arc::new(Semaphore::new(workers));
@@ -713,11 +709,17 @@ impl Orchestrator {
             workers
         );
 
-        let mut handles = Vec::new();
+        // Use JoinSet to process task completions as they occur (not sequentially).
+        // This prevents fast tables from waiting on slow tables.
+        let mut join_set: JoinSet<(String, crate::error::Result<crate::transfer::TransferStats>)> =
+            JoinSet::new();
+
+        // Track expected partition counts per table (populated during spawning)
+        let mut expected_partitions: HashMap<String, usize> = HashMap::new();
 
         for table in pending_tables {
             // Check for cancellation
-            if *cancel.borrow() {
+            if cancel.is_cancelled() {
                 info!("Cancellation requested, stopping new transfers");
                 break;
             }
@@ -740,6 +742,9 @@ impl Orchestrator {
                             partitions.len(),
                             table.row_count
                         );
+
+                        // Track expected partition count for this table
+                        expected_partitions.insert(table_name.clone(), partitions.len());
 
                         // Update state
                         if let Some(ts) = state.tables.get_mut(&table_name) {
@@ -767,13 +772,11 @@ impl Orchestrator {
                             let partition_name =
                                 format!("{}:p{}", table_name, partition.partition_id);
 
-                            let handle = tokio::spawn(async move {
+                            join_set.spawn(async move {
                                 let result = engine_clone.execute(job).await;
                                 drop(permit);
-                                result
+                                (partition_name, result)
                             });
-
-                            handles.push((partition_name, handle));
                         }
                         continue;
                     }
@@ -807,145 +810,122 @@ impl Orchestrator {
             };
 
             let engine_clone = engine.clone();
+            let job_name = table_name.clone();
 
-            let handle = tokio::spawn(async move {
+            join_set.spawn(async move {
                 let result = engine_clone.execute(job).await;
                 drop(permit);
-                result
+                (job_name, result)
             });
-
-            handles.push((table_name, handle));
         }
 
-        // Collect results, tracking partition aggregation
+        // Collect results using JoinSet.join_next() for completion-order processing.
+        // This prevents fast tables from waiting on slow tables.
         let mut table_rows: HashMap<String, i64> = HashMap::new();
         let mut table_errors: HashMap<String, String> = HashMap::new();
-        let mut partition_counts: HashMap<String, usize> = HashMap::new();
         let mut partition_completed: HashMap<String, usize> = HashMap::new();
 
-        // Count partitions per table for tracking when a partitioned table is complete
-        for (job_name, _) in &handles {
-            let base_table = job_name.split(":p").next().unwrap_or(job_name).to_string();
-            *partition_counts.entry(base_table).or_insert(0) += 1;
-        }
+        // Process results as they complete (not in spawn order)
+        while let Some(join_result) = join_set.join_next().await {
+            // Check for cancellation - abort remaining tasks
+            if cancel.is_cancelled() {
+                info!("Cancellation detected, aborting remaining {} tasks", join_set.len());
+                join_set.abort_all();
+                // Save current state before breaking
+                self.save_state(state)?;
+                break;
+            }
 
-        for (job_name, handle) in handles {
+            // Extract job result from JoinSet
+            let (job_name, task_result) = match join_result {
+                Ok(result) => result,
+                Err(e) => {
+                    // Distinguish between cancelled and panicked tasks
+                    if e.is_cancelled() {
+                        // Task was cancelled (e.g., by abort_all) - this is expected during shutdown
+                        debug!("Task was cancelled");
+                    } else {
+                        // Task panicked - we can't recover the job name from JoinError
+                        error!("Task panicked: {}", e);
+                    }
+                    continue;
+                }
+            };
+
             // Extract base table name (handles both "schema.table" and "schema.table:p1")
             let base_table = job_name.split(":p").next().unwrap_or(&job_name).to_string();
             let is_partitioned = job_name.contains(":p");
 
-            match handle.await {
-                Ok(Ok(stats)) => {
+            // Process the result (success or failure)
+            match &task_result {
+                Ok(stats) => {
                     info!("{}: completed ({} rows)", job_name, stats.rows);
                     *table_rows.entry(base_table.clone()).or_insert(0) += stats.rows;
-
-                    // Track partition completion
-                    if is_partitioned {
-                        *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
-                        let completed = partition_completed[&base_table];
-                        let total = partition_counts[&base_table];
-
-                        // When all partitions of a table are done, update state and checkpoint
-                        if completed == total {
-                            let total_rows = table_rows[&base_table];
-                            // Update state for completed partitioned table
-                            if let Some(ts) = state.tables.get_mut(&base_table) {
-                                ts.status = TaskStatus::Completed;
-                                ts.rows_transferred = total_rows;
-                                ts.completed_at = Some(Utc::now());
-                            }
-                            // Checkpoint state
-                            self.save_state(state)?;
-                            progress.complete_table(total_rows);
-                            progress.emit("transferring", Some(base_table.clone()));
-                        }
-                    } else {
-                        // For non-partitioned tables, update state directly
-                        if let Some(ts) = state.tables.get_mut(&base_table) {
-                            ts.status = TaskStatus::Completed;
-                            ts.rows_transferred = stats.rows;
-                            ts.last_pk = stats.last_pk;
-                            ts.completed_at = Some(Utc::now());
-                        }
-                        // Checkpoint state after each table completion
-                        self.save_state(state)?;
-                        progress.complete_table(stats.rows);
-                        progress.emit("transferring", Some(base_table.clone()));
-                    }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!("{}: failed - {}", job_name, e);
                     // Preserve first error for this table (don't overwrite if partition already failed)
                     table_errors
                         .entry(base_table.clone())
                         .or_insert_with(|| e.to_string());
+                }
+            }
 
-                    // Track partition completion even on failure
-                    if is_partitioned {
-                        *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
-                        let completed = partition_completed[&base_table];
-                        let total = partition_counts[&base_table];
+            // Track partition/table completion
+            if is_partitioned {
+                *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
+                let completed = partition_completed[&base_table];
+                let expected = expected_partitions.get(&base_table).copied().unwrap_or(1);
 
-                        // When all partitions are done (even with failures), update state and checkpoint
-                        if completed == total {
-                            if let Some(ts) = state.tables.get_mut(&base_table) {
-                                ts.status = TaskStatus::Failed;
-                                ts.error = table_errors.get(&base_table).cloned();
-                                // Track rows from successfully completed partitions
-                                ts.rows_transferred = *table_rows.get(&base_table).unwrap_or(&0);
-                            }
-                            self.save_state(state)?;
-                            progress.increment_table_count();
-                            progress.emit("transferring", Some(base_table.clone()));
+                // When all partitions of a table are done, determine final status
+                if completed == expected {
+                    let total_rows = table_rows.get(&base_table).copied().unwrap_or(0);
+                    if let Some(ts) = state.tables.get_mut(&base_table) {
+                        // Check for any errors across all partitions
+                        if table_errors.contains_key(&base_table) {
+                            ts.status = TaskStatus::Failed;
+                            ts.error = table_errors.get(&base_table).cloned();
+                        } else {
+                            ts.status = TaskStatus::Completed;
+                            ts.completed_at = Some(Utc::now());
                         }
+                        ts.rows_transferred = total_rows;
+                    }
+                    self.save_state(state)?;
+                    // Progress tracking
+                    if table_errors.contains_key(&base_table) {
+                        progress.increment_table_count();
                     } else {
-                        // Non-partitioned table failed - update state and checkpoint
-                        if let Some(ts) = state.tables.get_mut(&base_table) {
+                        progress.complete_table(total_rows);
+                    }
+                    progress.emit("transferring", Some(base_table.clone()));
+                }
+            } else {
+                // Non-partitioned table - update state directly based on result
+                let is_success = task_result.is_ok();
+                let rows = task_result.as_ref().map(|s| s.rows).unwrap_or(0);
+
+                if let Some(ts) = state.tables.get_mut(&base_table) {
+                    match task_result {
+                        Ok(stats) => {
+                            ts.status = TaskStatus::Completed;
+                            ts.rows_transferred = stats.rows;
+                            ts.last_pk = stats.last_pk;
+                            ts.completed_at = Some(Utc::now());
+                        }
+                        Err(e) => {
                             ts.status = TaskStatus::Failed;
                             ts.error = Some(e.to_string());
                         }
-                        self.save_state(state)?;
-                        progress.increment_table_count();
-                        progress.emit("transferring", Some(base_table.clone()));
                     }
                 }
-                Err(e) => {
-                    error!("{}: task panicked - {}", job_name, e);
-                    let panic_msg = format!("Task panicked: {}", e);
-                    // Preserve first error for this table (don't overwrite if partition already failed)
-                    table_errors
-                        .entry(base_table.clone())
-                        .or_insert_with(|| panic_msg.clone());
-
-                    // Track partition completion even on panic
-                    if is_partitioned {
-                        *partition_completed.entry(base_table.clone()).or_insert(0) += 1;
-                        let completed = partition_completed[&base_table];
-                        let total = partition_counts[&base_table];
-
-                        // When all partitions are done (even with panics), update state and checkpoint
-                        if completed == total {
-                            if let Some(ts) = state.tables.get_mut(&base_table) {
-                                ts.status = TaskStatus::Failed;
-                                ts.error = table_errors.get(&base_table).cloned();
-                                // Track rows from successfully completed partitions
-                                ts.rows_transferred = *table_rows.get(&base_table).unwrap_or(&0);
-                            }
-                            self.save_state(state)?;
-                            progress.increment_table_count();
-                            progress.emit("transferring", Some(base_table.clone()));
-                        }
-                    } else {
-                        // Non-partitioned table panicked - update state and checkpoint
-                        if let Some(ts) = state.tables.get_mut(&base_table) {
-                            ts.status = TaskStatus::Failed;
-                            ts.error = Some(panic_msg);
-                        }
-                        self.save_state(state)?;
-                        progress.increment_table_count();
-                        progress.emit("transferring", Some(base_table.clone()));
-                    }
+                self.save_state(state)?;
+                if is_success {
+                    progress.complete_table(rows);
+                } else {
+                    progress.increment_table_count();
                 }
+                progress.emit("transferring", Some(base_table.clone()));
             }
         }
 

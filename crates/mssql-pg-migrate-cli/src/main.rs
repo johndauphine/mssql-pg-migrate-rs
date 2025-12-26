@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use mssql_pg_migrate::{Config, MigrateError, Orchestrator};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -115,7 +115,7 @@ async fn run() -> Result<(), MigrateError> {
     info!("Loaded configuration from {:?}", cli.config);
 
     // Setup signal handling for graceful shutdown (SIGINT and SIGTERM)
-    let cancel_rx = setup_signal_handler(cli.shutdown_timeout).await?;
+    let cancel_token = setup_signal_handler(cli.shutdown_timeout).await?;
 
     match cli.command {
         Commands::Run {
@@ -149,7 +149,7 @@ async fn run() -> Result<(), MigrateError> {
             }
 
             // Run fresh migration (or dry-run)
-            let result = orchestrator.run(Some(cancel_rx), dry_run).await?;
+            let result = orchestrator.run(cancel_token, dry_run).await?;
 
             if cli.output_json {
                 println!("{}", result.to_json()?);
@@ -213,7 +213,7 @@ async fn run() -> Result<(), MigrateError> {
             info!("Resuming from previous state");
 
             // Run migration (not dry-run for resume)
-            let result = orchestrator.run(Some(cancel_rx), false).await?;
+            let result = orchestrator.run(cancel_token, false).await?;
 
             if cli.output_json {
                 println!("{}", result.to_json()?);
@@ -303,21 +303,21 @@ fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
 
 /// Setup signal handlers for graceful shutdown.
 /// Handles both SIGINT (Ctrl-C) and SIGTERM (Kubernetes/Airflow shutdown).
-/// Returns a watch channel receiver that will be set to true when a signal is received.
+/// Returns a CancellationToken that will be cancelled when a signal is received.
 #[cfg(unix)]
-async fn setup_signal_handler(shutdown_timeout: u64) -> Result<watch::Receiver<bool>, MigrateError> {
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+async fn setup_signal_handler(shutdown_timeout: u64) -> Result<CancellationToken, MigrateError> {
+    let cancel_token = CancellationToken::new();
 
-    // Clone sender for each signal handler
-    let tx_int = cancel_tx.clone();
-    let tx_term = cancel_tx;
+    // Clone token for each signal handler
+    let token_int = cancel_token.clone();
+    let token_term = cancel_token.clone();
 
     // SIGINT handler (Ctrl-C)
     tokio::spawn(async move {
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
         sigint.recv().await;
         eprintln!("\nReceived SIGINT. Shutting down gracefully (timeout: {}s)...", shutdown_timeout);
-        let _ = tx_int.send(true);
+        token_int.cancel();
     });
 
     // SIGTERM handler (Kubernetes/Airflow)
@@ -325,24 +325,25 @@ async fn setup_signal_handler(shutdown_timeout: u64) -> Result<watch::Receiver<b
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
         sigterm.recv().await;
         eprintln!("\nReceived SIGTERM. Shutting down gracefully (timeout: {}s)...", shutdown_timeout);
-        let _ = tx_term.send(true);
+        token_term.cancel();
     });
 
-    Ok(cancel_rx)
+    Ok(cancel_token)
 }
 
 /// Setup signal handler for Windows (only SIGINT/Ctrl-C)
 #[cfg(not(unix))]
-async fn setup_signal_handler(_shutdown_timeout: u64) -> Result<watch::Receiver<bool>, MigrateError> {
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+async fn setup_signal_handler(_shutdown_timeout: u64) -> Result<CancellationToken, MigrateError> {
+    let cancel_token = CancellationToken::new();
+    let token = cancel_token.clone();
 
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to setup Ctrl-C handler");
         eprintln!("\nReceived Ctrl-C. Shutting down gracefully...");
-        let _ = cancel_tx.send(true);
+        token.cancel();
     });
 
-    Ok(cancel_rx)
+    Ok(cancel_token)
 }
