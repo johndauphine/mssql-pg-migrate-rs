@@ -894,6 +894,8 @@ impl Orchestrator {
                             if let Some(ts) = state.tables.get_mut(&base_table) {
                                 ts.status = TaskStatus::Failed;
                                 ts.error = table_errors.get(&base_table).cloned();
+                                // Track rows from successfully completed partitions
+                                ts.rows_transferred = *table_rows.get(&base_table).unwrap_or(&0);
                             }
                             self.save_state(state)?;
                             progress.increment_table_count();
@@ -929,6 +931,8 @@ impl Orchestrator {
                             if let Some(ts) = state.tables.get_mut(&base_table) {
                                 ts.status = TaskStatus::Failed;
                                 ts.error = table_errors.get(&base_table).cloned();
+                                // Track rows from successfully completed partitions
+                                ts.rows_transferred = *table_rows.get(&base_table).unwrap_or(&0);
                             }
                             self.save_state(state)?;
                             progress.increment_table_count();
@@ -954,6 +958,8 @@ impl Orchestrator {
                 if table_errors.contains_key(table_name) {
                     ts.status = TaskStatus::Failed;
                     ts.error = table_errors.get(table_name).cloned();
+                    // Track rows from successfully completed partitions even on failure
+                    ts.rows_transferred = *rows;
                 } else if ts.status != TaskStatus::Completed {
                     // Partitioned table - aggregate rows
                     ts.status = TaskStatus::Completed;

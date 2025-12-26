@@ -65,7 +65,6 @@ hex = { workspace = true }
 
 # Connection pooling
 bb8 = { workspace = true }
-deadpool = { workspace = true }
 
 # System info detection
 sysinfo = { workspace = true }

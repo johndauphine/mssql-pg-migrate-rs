@@ -289,8 +289,22 @@ impl PgPool {
                     .with_custom_certificate_verifier(Arc::new(NoVerifier))
                     .with_no_client_auth()
             }
-            "verify-ca" | "verify-full" => {
-                // Full certificate verification using system root CAs
+            "verify-ca" => {
+                // NOTE: In this implementation, 'verify-ca' behaves like 'verify-full':
+                // the server certificate is validated against trusted CAs and the
+                // server hostname is also verified against the certificate.
+                // This is stricter than PostgreSQL's 'verify-ca' semantics but safer.
+                info!(
+                    "ssl_mode=verify-ca: certificate and hostname verification enabled \
+                     (same behavior as verify-full in this implementation)"
+                );
+                ClientConfig::builder()
+                    .with_root_certificates(root_store.clone())
+                    .with_no_client_auth()
+            }
+            "verify-full" => {
+                // Full certificate and hostname verification using system root CAs
+                info!("ssl_mode=verify-full: full certificate and hostname verification enabled");
                 ClientConfig::builder()
                     .with_root_certificates(root_store)
                     .with_no_client_auth()

@@ -121,9 +121,10 @@ impl RangeTracker {
         let mut current_end = self.start_pk;
 
         for (&range_start, &range_end) in &self.ranges {
-            // A range is contiguous if it starts at or before current_end + 1
-            // (allowing for the case where PKs might not be perfectly sequential)
-            if range_start > current_end + 1 {
+            // A range is contiguous only if it does not start after current_end.
+            // Any range_start > current_end indicates a gap and breaks contiguity.
+            // Using strict checking to catch boundary tracking bugs early.
+            if range_start > current_end {
                 // Gap found - stop here
                 break;
             }

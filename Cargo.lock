@@ -956,7 +956,6 @@ dependencies = [
  "bb8",
  "bytes",
  "chrono",
- "deadpool",
  "deadpool-postgres",
  "futures",
  "hex",
