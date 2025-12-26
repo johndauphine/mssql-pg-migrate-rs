@@ -751,15 +751,12 @@ impl Orchestrator {
                         for partition in partitions {
                             let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-                            // Subtract 1 from min_pk so that `WHERE pk > (min_pk - 1)` includes the first row.
-                            // For the first partition (min_pk = 1), this becomes `WHERE pk > 0`.
-                            // Use saturating_sub to handle edge case of i64::MIN.
-                            let adjusted_min = partition.min_pk.map(|pk| pk.saturating_sub(1));
-
+                            // No adjustment needed: the transfer engine now uses >= for first chunk,
+                            // which correctly includes the partition's min_pk boundary.
                             let job = TransferJob {
                                 table: table.clone(),
                                 partition_id: Some(partition.partition_id),
-                                min_pk: adjusted_min,
+                                min_pk: partition.min_pk,
                                 max_pk: partition.max_pk,
                                 resume_from_pk: None, // Partitions don't support resume yet
                                 target_mode: self.config.migration.target_mode.clone(),

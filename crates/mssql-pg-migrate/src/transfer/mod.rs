@@ -536,7 +536,9 @@ async fn read_table_chunks_parallel(
                 (job.min_pk, false) // Fresh start: use >= to include boundary
             }
         } else {
-            (range_min, false) // Other readers: fresh range, use >=
+            // Non-first readers: the boundary pk was already read by the previous reader,
+            // so use > (exclusive) to avoid reading the same row twice
+            (range_min, true)
         };
 
         let handle = tokio::spawn(async move {
