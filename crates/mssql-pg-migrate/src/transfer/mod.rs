@@ -328,6 +328,7 @@ impl TransferEngine {
         let chunk_size = self.config.chunk_size;
         let columns_clone = columns.clone();
         let col_types_clone = col_types.clone();
+        let pk_indices_clone = pk_indices.clone();
 
         let reader_handle = tokio::spawn(async move {
             if use_keyset && num_readers > 1 {
@@ -339,6 +340,8 @@ impl TransferEngine {
                     chunk_size,
                     num_readers,
                     read_tx,
+                    use_hash,
+                    pk_indices_clone,
                 )
                 .await
             } else {
@@ -349,6 +352,8 @@ impl TransferEngine {
                     col_types_clone,
                     chunk_size,
                     read_tx,
+                    use_hash,
+                    pk_indices_clone,
                 )
                 .await
             }
@@ -454,13 +459,9 @@ impl TransferEngine {
             // Only contiguous ranges from start are considered safe.
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
-            // Process rows: compute hash in Rust and filter unchanged rows
-            let (processed_rows, skipped) = if use_hash {
-                process_rows_with_hash(
-                    chunk.rows,
-                    &pk_indices,
-                    &existing_hashes,
-                )
+            // Filter rows: hashes are already computed by readers, just filter unchanged
+            let (filtered_rows, skipped) = if use_hash {
+                filter_unchanged_rows(chunk.rows, &pk_indices, &existing_hashes)
             } else {
                 (chunk.rows, 0)
             };
@@ -468,8 +469,8 @@ impl TransferEngine {
             total_rows_skipped += skipped;
 
             // Only send if we have rows to write
-            if !processed_rows.is_empty() {
-                let write_job = WriteJob { rows: processed_rows };
+            if !filtered_rows.is_empty() {
+                let write_job = WriteJob { rows: filtered_rows };
 
                 if write_tx.send(write_job).await.is_err() {
                     // Writers have all failed
@@ -564,32 +565,48 @@ impl TransferEngine {
     }
 }
 
-/// Process rows by computing Rust-side MD5 hash and filtering unchanged rows.
-/// Uses rayon for parallel processing of large chunks.
+/// Compute MD5 hashes for rows and append hash as last column.
+/// Uses rayon for parallel processing of large chunks (>1000 rows).
 ///
-/// This function:
-/// 1. Computes MD5 hash of non-PK columns for each row using Rust
-/// 2. Compares with existing hashes from the target database
-/// 3. Filters out rows where the hash matches (unchanged)
-/// 4. Appends the computed hash to each row for storage in target
+/// This is called by readers to pre-compute hashes before sending to dispatcher.
+fn compute_row_hashes(rows: Vec<Vec<SqlValue>>, pk_indices: &[usize]) -> Vec<Vec<SqlValue>> {
+    if pk_indices.is_empty() {
+        return rows;
+    }
+
+    // Process a single row: compute hash and append
+    let add_hash = |mut row: Vec<SqlValue>| -> Vec<SqlValue> {
+        let hash = calculate_row_hash(&row, pk_indices);
+        row.push(SqlValue::String(hash));
+        row
+    };
+
+    // Use parallel processing for large chunks (>1000 rows)
+    if rows.len() > 1000 {
+        rows.into_par_iter().map(add_hash).collect()
+    } else {
+        rows.into_iter().map(add_hash).collect()
+    }
+}
+
+/// Filter out unchanged rows by comparing pre-computed hashes with existing hashes.
+/// Hash must already be appended as the last column of each row.
 ///
-/// Returns (processed_rows, skipped_count) where processed_rows only contains
-/// rows that are new or have changed, with hash appended.
-fn process_rows_with_hash(
+/// Returns (filtered_rows, skipped_count) where filtered_rows only contains
+/// rows that are new or have changed.
+fn filter_unchanged_rows(
     rows: Vec<Vec<SqlValue>>,
     pk_indices: &[usize],
     existing_hashes: &HashMap<String, String>,
 ) -> (Vec<Vec<SqlValue>>, i64) {
-    if pk_indices.is_empty() {
-        // Can't compute hash without PK indices - just return rows as-is
-        // (hash column won't be added, but this shouldn't happen in practice)
+    if pk_indices.is_empty() || existing_hashes.is_empty() {
+        // No filtering possible - return all rows
         return (rows, 0);
     }
 
     let total = rows.len();
 
     // Helper to extract serialized PK key from a row
-    // Handles all types that could reasonably be primary keys
     let extract_pk_key = |row: &[SqlValue]| -> String {
         pk_indices
             .iter()
@@ -605,7 +622,6 @@ fn process_rows_with_hash(
                 SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
                 SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
                 SqlValue::Bytes(b) => hex::encode(b),
-                // These types are extremely unlikely as PKs but handle for completeness
                 SqlValue::Time(t) => t.to_string(),
                 SqlValue::F32(f) => f.to_string(),
                 SqlValue::F64(f) => f.to_string(),
@@ -615,42 +631,26 @@ fn process_rows_with_hash(
             .join("|")
     };
 
-    // Process a single row: compute hash, check if changed, append hash if so
-    let process_row = |mut row: Vec<SqlValue>| -> Option<Vec<SqlValue>> {
-        // Compute hash using Rust-side calculation
-        let computed_hash = calculate_row_hash(&row, pk_indices);
-
-        // Extract PK key for lookup
-        let pk_key = extract_pk_key(&row);
-
-        // Check if row has changed
-        let is_changed = match existing_hashes.get(&pk_key) {
-            Some(existing) if existing == &computed_hash => false, // Hash matches, skip
-            _ => true, // New row or hash changed, include
+    // Check if a row has changed (hash is last column)
+    let is_changed = |row: &Vec<SqlValue>| -> bool {
+        // Hash is the last column
+        let hash = match row.last() {
+            Some(SqlValue::String(h)) => h.as_str(),
+            _ => return true, // No hash, include row
         };
 
-        if is_changed {
-            // Append computed hash to row for storage
-            row.push(SqlValue::String(computed_hash));
-            Some(row)
-        } else {
-            None
+        let pk_key = extract_pk_key(row);
+
+        match existing_hashes.get(&pk_key) {
+            Some(existing) if existing == hash => false, // Hash matches, skip
+            _ => true, // New row or hash changed, include
         }
     };
 
-    // Use parallel processing for large chunks (>1000 rows)
-    let processed: Vec<Vec<SqlValue>> = if rows.len() > 1000 {
-        rows.into_par_iter()
-            .filter_map(process_row)
-            .collect()
-    } else {
-        rows.into_iter()
-            .filter_map(process_row)
-            .collect()
-    };
+    let filtered: Vec<Vec<SqlValue>> = rows.into_iter().filter(is_changed).collect();
 
-    let skipped = (total - processed.len()) as i64;
-    (processed, skipped)
+    let skipped = (total - filtered.len()) as i64;
+    (filtered, skipped)
 }
 
 /// Split a PK range into N sub-ranges for parallel reading.
@@ -692,6 +692,8 @@ async fn read_table_chunks_parallel(
     chunk_size: usize,
     num_readers: usize,
     tx: mpsc::Sender<RowChunk>,
+    use_hash: bool,
+    pk_indices: Vec<usize>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -739,6 +741,7 @@ async fn read_table_chunks_parallel(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let pk_indices = pk_indices.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
         // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
@@ -757,7 +760,7 @@ async fn read_table_chunks_parallel(
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, use_hash, pk_indices,
             )
             .await
         });
@@ -792,6 +795,9 @@ async fn read_table_chunks_parallel(
 /// `is_resume` indicates whether `start_pk` came from a resume checkpoint (true) or
 /// is a fresh range boundary (false). When resuming, the first query uses `>` to skip
 /// the already-processed row. For fresh starts, the first query uses `>=` to include it.
+///
+/// When `use_hash` is true, computes MD5 hashes for each row using rayon parallelism
+/// and appends the hash to each row before sending to the channel.
 async fn read_chunk_range(
     source: Arc<MssqlPool>,
     table: Table,
@@ -803,6 +809,8 @@ async fn read_chunk_range(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    use_hash: bool,
+    pk_indices: Vec<usize>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -840,6 +848,13 @@ async fn read_chunk_range(
         total_rows += row_count as i64;
         chunk_num += 1;
 
+        // Compute hashes in parallel if hash detection is enabled
+        let rows_with_hash = if use_hash {
+            compute_row_hashes(rows, &pk_indices)
+        } else {
+            rows
+        };
+
         debug!(
             "{} reader {}: read chunk {} with {} rows in {:?}",
             table_name, reader_id, chunk_num, row_count, read_time
@@ -848,7 +863,7 @@ async fn read_chunk_range(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows,
+            rows: rows_with_hash,
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
@@ -892,6 +907,8 @@ async fn read_table_chunks(
     col_types: Vec<String>,
     chunk_size: usize,
     tx: mpsc::Sender<RowChunk>,
+    use_hash: bool,
+    pk_indices: Vec<usize>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -942,6 +959,13 @@ async fn read_table_chunks(
         total_rows += row_count as i64;
         chunk_num += 1;
 
+        // Compute hashes in parallel if hash detection is enabled
+        let rows_with_hash = if use_hash {
+            compute_row_hashes(rows, &pk_indices)
+        } else {
+            rows
+        };
+
         debug!(
             "{}: read chunk {} with {} rows in {:?}",
             table_name, chunk_num, row_count, read_time
@@ -950,7 +974,7 @@ async fn read_table_chunks(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows,
+            rows: rows_with_hash,
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
