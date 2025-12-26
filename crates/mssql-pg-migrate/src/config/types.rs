@@ -534,7 +534,9 @@ impl MigrationConfig {
     }
 
     pub fn get_chunk_size(&self) -> usize {
-        self.chunk_size.unwrap_or(100_000) // Optimal: 100K-120K
+        // Conservative default to prevent unbounded memory growth.
+        // Auto-tuning will increase this based on available memory.
+        self.chunk_size.unwrap_or(10_000)
     }
 
     pub fn get_max_partitions(&self) -> usize {
@@ -550,7 +552,9 @@ impl MigrationConfig {
     }
 
     pub fn get_read_ahead_buffers(&self) -> usize {
-        self.read_ahead_buffers.unwrap_or(8)
+        // Conservative default to prevent unbounded memory growth.
+        // Auto-tuning will increase this based on available memory.
+        self.read_ahead_buffers.unwrap_or(4)
     }
 
     pub fn get_write_ahead_writers(&self) -> usize {
@@ -563,7 +567,9 @@ impl MigrationConfig {
     }
 
     pub fn get_parallel_readers(&self) -> usize {
-        self.parallel_readers.unwrap_or(12) // Optimal: 12-14
+        // Conservative default to prevent unbounded memory growth.
+        // Auto-tuning will increase this based on available memory.
+        self.parallel_readers.unwrap_or(4)
     }
 
     pub fn get_max_mssql_connections(&self) -> usize {

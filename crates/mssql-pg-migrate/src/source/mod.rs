@@ -131,14 +131,14 @@ impl MssqlPool {
             .min_idle(Some(1))
             .build(manager)
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "creating MSSQL connection pool"))?;
+            .map_err(|e| MigrateError::pool(e, "creating MSSQL connection pool"))?;
 
         // Test connection
         {
             let mut conn = pool
                 .get()
                 .await
-                .map_err(|e| MigrateError::pool(e.to_string(), "testing MSSQL connection"))?;
+                .map_err(|e| MigrateError::pool(e, "testing MSSQL connection"))?;
 
             conn.simple_query("SELECT 1").await?.into_row().await?;
         }
@@ -156,7 +156,7 @@ impl MssqlPool {
         self.pool
             .get()
             .await
-            .map_err(|e| MigrateError::pool(e.to_string(), "getting MSSQL connection from pool"))
+            .map_err(|e| MigrateError::pool(e, "getting MSSQL connection from pool"))
     }
 
     /// Load columns for a table.
