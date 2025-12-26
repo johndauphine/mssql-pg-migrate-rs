@@ -94,6 +94,7 @@ pub trait TargetPool: Send + Sync {
     ) -> Result<u64>;
 
     /// Upsert a chunk of rows.
+    /// `writer_id` is used to create a unique staging table per writer to avoid conflicts.
     async fn upsert_chunk(
         &self,
         schema: &str,
@@ -101,6 +102,7 @@ pub trait TargetPool: Send + Sync {
         cols: &[String],
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
+        writer_id: usize,
     ) -> Result<u64>;
 
     /// Get the database type.
@@ -854,6 +856,7 @@ impl TargetPool for PgPool {
         cols: &[String],
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
+        writer_id: usize,
     ) -> Result<u64> {
         if rows.is_empty() {
             return Ok(0);
@@ -865,9 +868,10 @@ impl TargetPool for PgPool {
 
         let row_count = rows.len() as u64;
 
-        // Use deterministic staging table name based on target table
-        // This allows reuse across batches, reducing catalog churn
-        let staging_table = format!("_staging_{}_{}", schema, table);
+        // Use per-writer staging table to avoid conflicts between parallel writers.
+        // Each writer gets its own staging table that persists for the session,
+        // reducing catalog churn while avoiding race conditions.
+        let staging_table = format!("_staging_{}_{}_{}", schema, table, writer_id);
 
         let client = self.pool.get().await.map_err(|e| {
             MigrateError::pool(e.to_string(), "getting PostgreSQL connection for upsert")
@@ -980,7 +984,8 @@ impl TargetPool for PgPool {
 
         // Note: Staging table is NOT dropped here - it's reused across batches
         // to reduce system catalog churn. It will be automatically dropped when
-        // the connection is returned to the pool or the session ends.
+        // the underlying PostgreSQL session/connection is closed (not merely when
+        // the connection is returned to the pool).
 
         Ok(row_count)
     }

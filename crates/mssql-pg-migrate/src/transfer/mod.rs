@@ -302,6 +302,7 @@ impl TransferEngine {
                                     &columns_clone,
                                     &pk_cols_clone,
                                     write_job.rows,
+                                    writer_id,
                                 )
                                 .await
                         }
