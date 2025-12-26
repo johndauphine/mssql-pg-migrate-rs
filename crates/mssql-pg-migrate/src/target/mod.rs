@@ -8,7 +8,10 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
+use md5::Md5;
+use md5::Digest;
 use rustls::ClientConfig;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_postgres::Config as PgConfig;
@@ -149,6 +152,54 @@ pub enum SqlNullType {
     DateTimeOffset,
     Date,
     Time,
+}
+
+/// Calculate MD5 hash of non-PK column values for change detection.
+///
+/// The hash is calculated using pipe-separated values with consistent formatting:
+/// - NULL values are represented as `\N`
+/// - Floats use fixed precision to ensure hash stability
+/// - All types are converted to their string representation
+///
+/// Returns a 32-character lowercase hex string.
+pub fn calculate_row_hash(row: &[SqlValue], pk_indices: &[usize]) -> String {
+    let mut hasher = Md5::new();
+    let mut first = true;
+
+    for (idx, value) in row.iter().enumerate() {
+        // Skip primary key columns - they identify the row, not the content
+        if pk_indices.contains(&idx) {
+            continue;
+        }
+
+        // Use pipe as separator between values
+        if !first {
+            hasher.update(b"|");
+        }
+        first = false;
+
+        match value {
+            SqlValue::Null(_) => hasher.update(b"\\N"),
+            SqlValue::Bool(b) => hasher.update(if *b { b"t" } else { b"f" }),
+            SqlValue::I16(n) => hasher.update(n.to_string().as_bytes()),
+            SqlValue::I32(n) => hasher.update(n.to_string().as_bytes()),
+            SqlValue::I64(n) => hasher.update(n.to_string().as_bytes()),
+            SqlValue::F32(n) => hasher.update(format!("{:.6}", n).as_bytes()),
+            SqlValue::F64(n) => hasher.update(format!("{:.15}", n).as_bytes()),
+            SqlValue::String(s) => hasher.update(s.as_bytes()),
+            SqlValue::Bytes(b) => hasher.update(b),
+            SqlValue::Uuid(u) => hasher.update(u.to_string().as_bytes()),
+            SqlValue::Decimal(d) => hasher.update(d.to_string().as_bytes()),
+            SqlValue::DateTime(dt) => {
+                hasher.update(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string().as_bytes())
+            }
+            SqlValue::DateTimeOffset(dt) => hasher.update(dt.to_rfc3339().as_bytes()),
+            SqlValue::Date(d) => hasher.update(d.to_string().as_bytes()),
+            SqlValue::Time(t) => hasher.update(t.to_string().as_bytes()),
+        }
+    }
+
+    format!("{:x}", hasher.finalize())
 }
 
 /// Certificate verifier that accepts any certificate.
@@ -324,6 +375,17 @@ impl PgPool {
 
     /// Generate DDL for table creation.
     fn generate_ddl(&self, table: &Table, target_schema: &str, unlogged: bool) -> String {
+        self.generate_ddl_with_options(table, target_schema, unlogged, None)
+    }
+
+    /// Generate DDL for table creation with optional row_hash column.
+    fn generate_ddl_with_options(
+        &self,
+        table: &Table,
+        target_schema: &str,
+        unlogged: bool,
+        row_hash_column: Option<&str>,
+    ) -> String {
         let unlogged_str = if unlogged { "UNLOGGED " } else { "" };
 
         let schema = Self::quote_ident(target_schema);
@@ -351,11 +413,17 @@ impl PgPool {
                 identity
             ));
 
-            if i < table.columns.len() - 1 {
+            // Add comma if more columns follow or if we're adding row_hash
+            if i < table.columns.len() - 1 || row_hash_column.is_some() {
                 ddl.push_str(",\n");
             } else {
                 ddl.push('\n');
             }
+        }
+
+        // Add row_hash column if requested (for upsert mode with hash detection)
+        if let Some(hash_col) = row_hash_column {
+            ddl.push_str(&format!("    {} VARCHAR(32)\n", Self::quote_ident(hash_col)));
         }
 
         ddl.push_str(")");
@@ -474,6 +542,133 @@ impl PgPool {
         } else {
             s.to_string()
         }
+    }
+
+    /// Ensure the row_hash column exists on a table.
+    /// Returns true if the column was added, false if it already existed.
+    pub async fn ensure_row_hash_column(
+        &self,
+        schema: &str,
+        table: &str,
+        row_hash_column: &str,
+    ) -> Result<bool> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
+
+        // Check if column exists
+        let check_sql = r#"
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+            )
+        "#;
+
+        let row = client
+            .query_one(check_sql, &[&schema, &table, &row_hash_column])
+            .await?;
+        let exists: bool = row.get(0);
+
+        if !exists {
+            let alter_sql = format!(
+                "ALTER TABLE {} ADD COLUMN {} VARCHAR(32)",
+                Self::qualify_table(schema, table),
+                Self::quote_ident(row_hash_column)
+            );
+            client.execute(&alter_sql, &[]).await?;
+            info!(
+                "Added {} column to {}.{}",
+                row_hash_column, schema, table
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Fetch existing row hashes for a PK range.
+    /// Returns HashMap of PK value -> MD5 hash string.
+    pub async fn fetch_row_hashes(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_col: &str,
+        row_hash_col: &str,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+    ) -> Result<HashMap<i64, String>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for hash fetch"))?;
+
+        let mut query = format!(
+            "SELECT {}, {} FROM {} WHERE {} IS NOT NULL",
+            Self::quote_ident(pk_col),
+            Self::quote_ident(row_hash_col),
+            Self::qualify_table(schema, table),
+            Self::quote_ident(row_hash_col)
+        );
+
+        let mut conditions = Vec::new();
+        if let Some(min) = min_pk {
+            conditions.push(format!("{} >= {}", Self::quote_ident(pk_col), min));
+        }
+        if let Some(max) = max_pk {
+            conditions.push(format!("{} <= {}", Self::quote_ident(pk_col), max));
+        }
+
+        if !conditions.is_empty() {
+            query.push_str(" AND ");
+            query.push_str(&conditions.join(" AND "));
+        }
+
+        let rows = client.query(&query, &[]).await?;
+
+        let mut hashes = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let pk: i64 = row.get(0);
+            let hash: String = row.get(1);
+            hashes.insert(pk, hash);
+        }
+
+        debug!(
+            "Fetched {} existing hashes from {}.{} (pk range {:?} to {:?})",
+            hashes.len(),
+            schema,
+            table,
+            min_pk,
+            max_pk
+        );
+
+        Ok(hashes)
+    }
+
+    /// Create a table with the row_hash column included.
+    /// Used for upsert mode with hash-based change detection.
+    pub async fn create_table_with_hash(
+        &self,
+        table: &Table,
+        target_schema: &str,
+        row_hash_column: &str,
+    ) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
+
+        let ddl = self.generate_ddl_with_options(table, target_schema, false, Some(row_hash_column));
+        client.execute(&ddl, &[]).await?;
+
+        debug!(
+            "Created table {}.{} with {} column",
+            target_schema, table.name, row_hash_column
+        );
+        Ok(())
     }
 }
 
@@ -1041,7 +1236,7 @@ impl TargetPool for PgPool {
         })?;
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
+        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, false);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1575,12 +1770,17 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
 
 /// Build SQL to merge from staging table into target table.
 /// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE.
+///
+/// When `skip_change_detection` is true, the WHERE clause is omitted because
+/// rows have already been pre-filtered using hash comparison. This is more
+/// efficient as we don't need to compare all columns again.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
+    skip_change_detection: bool,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -1601,20 +1801,6 @@ fn build_staging_merge_sql(
         .map(|c| format!("{} = EXCLUDED.{}", pg_quote_ident(c), pg_quote_ident(c)))
         .collect();
 
-    // Build change detection WHERE clause
-    let change_detection: Vec<String> = cols
-        .iter()
-        .filter(|c| !pk_cols.contains(c))
-        .map(|c| {
-            format!(
-                "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                pg_quote_ident(table),
-                pg_quote_ident(c),
-                pg_quote_ident(c)
-            )
-        })
-        .collect();
-
     if update_cols.is_empty() {
         // PK-only table, just INSERT ... ON CONFLICT DO NOTHING
         format!(
@@ -1625,7 +1811,32 @@ fn build_staging_merge_sql(
             pg_quote_ident(staging_table),
             pk_list
         )
+    } else if skip_change_detection {
+        // Hash pre-filter was used, no need for column-by-column comparison
+        format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+            pg_qualify_table(schema, table),
+            col_list,
+            col_list,
+            pg_quote_ident(staging_table),
+            pk_list,
+            update_cols.join(", ")
+        )
     } else {
+        // Build change detection WHERE clause for traditional upsert
+        let change_detection: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| {
+                format!(
+                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                    pg_quote_ident(table),
+                    pg_quote_ident(c),
+                    pg_quote_ident(c)
+                )
+            })
+            .collect();
+
         format!(
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
             pg_qualify_table(schema, table),
@@ -1636,5 +1847,251 @@ fn build_staging_merge_sql(
             update_cols.join(", "),
             change_detection.join(" OR ")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_row_hash_basic() {
+        // Test with simple string values, PK at index 0
+        let row = vec![
+            SqlValue::I64(1),                         // PK - should be excluded
+            SqlValue::String("hello".to_string()),
+            SqlValue::I32(42),
+        ];
+        let pk_indices = vec![0];
+
+        let hash = calculate_row_hash(&row, &pk_indices);
+
+        // Hash should be 32 hex characters
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_calculate_row_hash_excludes_pk() {
+        // Two rows with same non-PK data but different PKs should have same hash
+        let row1 = vec![
+            SqlValue::I64(1),                         // PK
+            SqlValue::String("data".to_string()),
+        ];
+        let row2 = vec![
+            SqlValue::I64(999),                       // Different PK
+            SqlValue::String("data".to_string()),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_detects_changes() {
+        // Two rows with same PK but different data should have different hashes
+        let row1 = vec![
+            SqlValue::I64(1),
+            SqlValue::String("value1".to_string()),
+        ];
+        let row2 = vec![
+            SqlValue::I64(1),
+            SqlValue::String("value2".to_string()),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_null_handling() {
+        // NULL values should be handled consistently
+        let row1 = vec![
+            SqlValue::I64(1),
+            SqlValue::Null(SqlNullType::String),
+        ];
+        let row2 = vec![
+            SqlValue::I64(2),
+            SqlValue::Null(SqlNullType::String),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        // Same data (NULL) should produce same hash
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_null_vs_empty_string() {
+        // NULL and empty string should have different hashes
+        let row1 = vec![
+            SqlValue::I64(1),
+            SqlValue::Null(SqlNullType::String),
+        ];
+        let row2 = vec![
+            SqlValue::I64(1),
+            SqlValue::String("".to_string()),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_composite_pk() {
+        // Test with composite primary key
+        let row = vec![
+            SqlValue::I64(1),                         // PK part 1
+            SqlValue::I64(2),                         // PK part 2
+            SqlValue::String("data".to_string()),
+        ];
+        let pk_indices = vec![0, 1];
+
+        let hash = calculate_row_hash(&row, &pk_indices);
+
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_all_types() {
+        // Test with all supported types
+        let row = vec![
+            SqlValue::I64(1),                                                          // PK
+            SqlValue::Bool(true),
+            SqlValue::I16(16),
+            SqlValue::I32(32),
+            SqlValue::I64(64),
+            SqlValue::F32(1.5),
+            SqlValue::F64(2.5),
+            SqlValue::String("text".to_string()),
+            SqlValue::Bytes(vec![1, 2, 3]),
+            SqlValue::Uuid(uuid::Uuid::nil()),
+            SqlValue::Decimal(rust_decimal::Decimal::new(12345, 2)),
+            SqlValue::Date(chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()),
+            SqlValue::Time(chrono::NaiveTime::from_hms_opt(12, 30, 45).unwrap()),
+        ];
+        let pk_indices = vec![0];
+
+        let hash = calculate_row_hash(&row, &pk_indices);
+
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_float_precision() {
+        // Floats should use fixed precision for hash stability
+        let row1 = vec![
+            SqlValue::I64(1),
+            SqlValue::F64(1.0 / 3.0),  // 0.333333...
+        ];
+        let row2 = vec![
+            SqlValue::I64(1),
+            SqlValue::F64(1.0 / 3.0),  // Same calculation
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        // Same float value should produce same hash
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_order_matters() {
+        // Column order should affect hash
+        let row1 = vec![
+            SqlValue::I64(1),
+            SqlValue::String("a".to_string()),
+            SqlValue::String("b".to_string()),
+        ];
+        let row2 = vec![
+            SqlValue::I64(1),
+            SqlValue::String("b".to_string()),
+            SqlValue::String("a".to_string()),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row1, &pk_indices);
+        let hash2 = calculate_row_hash(&row2, &pk_indices);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_calculate_row_hash_deterministic() {
+        // Same input should always produce same hash
+        let row = vec![
+            SqlValue::I64(42),
+            SqlValue::String("test".to_string()),
+            SqlValue::I32(123),
+        ];
+        let pk_indices = vec![0];
+
+        let hash1 = calculate_row_hash(&row, &pk_indices);
+        let hash2 = calculate_row_hash(&row, &pk_indices);
+        let hash3 = calculate_row_hash(&row, &pk_indices);
+
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash2, hash3);
+    }
+
+    #[test]
+    fn test_build_staging_merge_sql_with_skip_change_detection() {
+        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
+        let pk_cols = vec!["id".to_string()];
+
+        // Without skip_change_detection (traditional behavior)
+        let sql_with_detection = build_staging_merge_sql(
+            "public",
+            "users",
+            "_staging_users",
+            &cols,
+            &pk_cols,
+            false,
+        );
+        assert!(sql_with_detection.contains("WHERE"));
+        assert!(sql_with_detection.contains("IS DISTINCT FROM"));
+
+        // With skip_change_detection (hash pre-filtered)
+        let sql_skip_detection = build_staging_merge_sql(
+            "public",
+            "users",
+            "_staging_users",
+            &cols,
+            &pk_cols,
+            true,
+        );
+        assert!(!sql_skip_detection.contains("WHERE"));
+        assert!(!sql_skip_detection.contains("IS DISTINCT FROM"));
+    }
+
+    #[test]
+    fn test_build_staging_merge_sql_pk_only_table() {
+        // For PK-only tables, should use DO NOTHING regardless of skip_change_detection
+        let cols = vec!["id".to_string()];
+        let pk_cols = vec!["id".to_string()];
+
+        let sql = build_staging_merge_sql(
+            "public",
+            "lookup",
+            "_staging_lookup",
+            &cols,
+            &pk_cols,
+            false,
+        );
+        assert!(sql.contains("DO NOTHING"));
+        assert!(!sql.contains("DO UPDATE"));
     }
 }

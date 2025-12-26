@@ -582,6 +582,16 @@ impl Orchestrator {
             }
             TargetMode::Upsert => {
                 // For upsert, ensure tables exist and drop non-PK indexes for performance
+                let use_hash_detection = self.config.migration.use_hash_detection();
+                let row_hash_column = self.config.migration.get_row_hash_column();
+
+                if use_hash_detection {
+                    info!(
+                        "Hash-based change detection enabled (column: {})",
+                        row_hash_column
+                    );
+                }
+
                 for table in tables {
                     let table_name = table.full_name();
 
@@ -592,7 +602,12 @@ impl Orchestrator {
 
                     if !self.target.table_exists(target_schema, &table.name).await? {
                         debug!("Creating table for upsert: {}", table_name);
-                        if self.config.migration.use_unlogged_tables {
+                        if use_hash_detection {
+                            // Create table with row_hash column for change detection
+                            self.target
+                                .create_table_with_hash(table, target_schema, row_hash_column)
+                                .await?;
+                        } else if self.config.migration.use_unlogged_tables {
                             self.target
                                 .create_table_unlogged(table, target_schema)
                                 .await?;
@@ -601,6 +616,20 @@ impl Orchestrator {
                         }
                         self.target.create_primary_key(table, target_schema).await?;
                     } else {
+                        // Table exists - ensure hash column exists if using hash detection
+                        if use_hash_detection {
+                            let added = self
+                                .target
+                                .ensure_row_hash_column(target_schema, &table.name, row_hash_column)
+                                .await?;
+                            if added {
+                                debug!(
+                                    "Added {} column to existing table {}",
+                                    row_hash_column, table_name
+                                );
+                            }
+                        }
+
                         // Drop non-PK indexes for faster upserts (only recreated if create_indexes is enabled)
                         let dropped = self
                             .target

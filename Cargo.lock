@@ -959,6 +959,7 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "hex",
+ "md-5",
  "parking_lot",
  "postgres-types",
  "rust_decimal",
