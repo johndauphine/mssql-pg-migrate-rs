@@ -21,6 +21,9 @@ tokio-util = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
 postgres-types = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
@@ -62,6 +65,7 @@ hex = { workspace = true }
 
 # Connection pooling
 bb8 = { workspace = true }
+deadpool = { workspace = true }
 
 # System info detection
 sysinfo = { workspace = true }
