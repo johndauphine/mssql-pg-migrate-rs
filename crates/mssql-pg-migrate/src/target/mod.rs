@@ -8,8 +8,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
+use rustls::ClientConfig;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_postgres::{Config as PgConfig, NoTls};
+use tokio_postgres::Config as PgConfig;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, info, warn};
 
 /// Target buffer size for COPY operations (~64KB like Go pgx).
@@ -146,6 +149,57 @@ pub enum SqlNullType {
     Time,
 }
 
+/// Certificate verifier that accepts any certificate.
+/// Used for ssl_mode=require which needs TLS but doesn't verify certificates.
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 /// PostgreSQL target pool implementation.
 pub struct PgPool {
     pool: Pool,
@@ -175,13 +229,27 @@ impl PgPool {
             recycling_method: RecyclingMethod::Fast,
         };
 
-        let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
-        let pool = Pool::builder(mgr)
-            .max_size(max_conns)
-            .build()
-            .map_err(|e| {
-                MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
-            })?;
+        // Create pool based on ssl_mode
+        let pool = match config.ssl_mode.to_lowercase().as_str() {
+            "disable" => {
+                warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
+                let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
+                Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
+                    MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+                })?
+            }
+            ssl_mode => {
+                // Build TLS config based on ssl_mode
+                let tls_config = Self::build_tls_config(ssl_mode)?;
+                let tls_connector = MakeRustlsConnect::new(tls_config);
+                let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
+                let pool = Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
+                    MigrateError::pool(e.to_string(), "creating PostgreSQL connection pool")
+                })?;
+                info!("PostgreSQL TLS enabled (ssl_mode={})", ssl_mode);
+                pool
+            }
+        };
 
         // Test connection
         let client = pool
@@ -201,6 +269,55 @@ impl PgPool {
             copy_buffer_rows,
             use_binary_copy,
         })
+    }
+
+    /// Build TLS configuration based on ssl_mode.
+    fn build_tls_config(ssl_mode: &str) -> Result<ClientConfig> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = match ssl_mode {
+            "require" => {
+                // TLS required but no certificate verification
+                // This is less secure but matches PostgreSQL "require" semantics
+                warn!(
+                    "ssl_mode=require: TLS enabled but server certificate is not verified. \
+                     Consider using 'verify-full' for production."
+                );
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth()
+            }
+            "verify-ca" => {
+                // NOTE: In this implementation, 'verify-ca' behaves like 'verify-full':
+                // the server certificate is validated against trusted CAs and the
+                // server hostname is also verified against the certificate.
+                // This is stricter than PostgreSQL's 'verify-ca' semantics but safer.
+                info!(
+                    "ssl_mode=verify-ca: certificate and hostname verification enabled \
+                     (same behavior as verify-full in this implementation)"
+                );
+                ClientConfig::builder()
+                    .with_root_certificates(root_store.clone())
+                    .with_no_client_auth()
+            }
+            "verify-full" => {
+                // Full certificate and hostname verification using system root CAs
+                info!("ssl_mode=verify-full: full certificate and hostname verification enabled");
+                ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth()
+            }
+            other => {
+                return Err(MigrateError::Config(format!(
+                    "Invalid ssl_mode '{}'. Valid options: disable, require, verify-ca, verify-full",
+                    other
+                )));
+            }
+        };
+
+        Ok(config)
     }
 
     /// Generate DDL for table creation.

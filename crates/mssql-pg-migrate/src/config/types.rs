@@ -1,6 +1,7 @@
 //! Configuration type definitions with auto-tuning based on system resources.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use sysinfo::System;
 use tracing::info;
 
@@ -112,7 +113,7 @@ impl Config {
 }
 
 /// Source database (MSSQL) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     /// Database type (always "mssql" for now).
     #[serde(default = "default_mssql")]
@@ -147,8 +148,24 @@ pub struct SourceConfig {
     pub trust_server_cert: bool,
 }
 
+impl fmt::Debug for SourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceConfig")
+            .field("type", &self.r#type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("schema", &self.schema)
+            .field("encrypt", &self.encrypt)
+            .field("trust_server_cert", &self.trust_server_cert)
+            .finish()
+    }
+}
+
 /// Target database (PostgreSQL) configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TargetConfig {
     /// Database type (always "postgres" for now).
     #[serde(default = "default_postgres")]
@@ -177,6 +194,21 @@ pub struct TargetConfig {
     /// SSL mode (default: "require").
     #[serde(default = "default_require")]
     pub ssl_mode: String,
+}
+
+impl fmt::Debug for TargetConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TargetConfig")
+            .field("type", &self.r#type)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("schema", &self.schema)
+            .field("ssl_mode", &self.ssl_mode)
+            .finish()
+    }
 }
 
 /// Migration behavior configuration.
