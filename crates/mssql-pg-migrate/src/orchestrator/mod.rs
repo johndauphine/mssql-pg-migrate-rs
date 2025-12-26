@@ -706,17 +706,11 @@ impl Orchestrator {
         // Create progress tracker
         let progress = Arc::new(ProgressTracker::new(tables.len(), self.progress_enabled));
 
-        let query_hints = self.config.source.build_query_hints();
-        if !query_hints.is_empty() {
-            info!("Using SQL Server query hints:{}", query_hints);
-        }
-
         let transfer_config = TransferConfig {
             chunk_size: self.config.migration.get_chunk_size(),
             read_ahead: self.config.migration.get_read_ahead_buffers(),
             parallel_readers: self.config.migration.get_parallel_readers(),
             parallel_writers: self.config.migration.get_write_ahead_writers(),
-            query_hints,
         };
 
         let engine = Arc::new(TransferEngine::new(

@@ -95,8 +95,6 @@ mod tests {
                 schema: "dbo".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
-                query_hint_maxdop: None,
-                query_hint_fast: None,
             },
             target: TargetConfig {
                 r#type: "postgres".to_string(),
