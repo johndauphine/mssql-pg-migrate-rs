@@ -641,6 +641,7 @@ impl App {
                     } else if wizard.input.is_empty() {
                         // On text steps with empty input, go back to previous step
                         wizard.step = wizard.step.prev();
+                        wizard.input.clear();
                         wizard.error = None;
                         wizard.selected_option = 0;
                         wizard.init_selection_for_step();
