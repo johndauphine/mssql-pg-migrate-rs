@@ -347,6 +347,39 @@ impl Orchestrator {
             .extract_schema(&self.config.source.schema)
             .await?;
 
+        // Apply table filters (include_tables / exclude_tables)
+        let original_count = tables.len();
+        if !self.config.migration.include_tables.is_empty()
+            || !self.config.migration.exclude_tables.is_empty()
+        {
+            let table_names: Vec<String> = tables.iter().map(|t| t.full_name()).collect();
+            let filtered_names = self.config.migration.filter_tables(&table_names);
+            // Use HashSet for O(1) lookup instead of Vec::contains()
+            let filtered_set: std::collections::HashSet<String> =
+                filtered_names.into_iter().collect();
+            tables.retain(|t| filtered_set.contains(&t.full_name()));
+
+            if tables.len() < original_count {
+                info!(
+                    "Filtered tables: {} -> {} (include: {:?}, exclude: {:?})",
+                    original_count,
+                    tables.len(),
+                    self.config.migration.include_tables,
+                    self.config.migration.exclude_tables
+                );
+            }
+
+            if tables.is_empty() {
+                warn!(
+                    "All {} tables were filtered out by include/exclude patterns. \
+                     Check your include_tables ({:?}) and exclude_tables ({:?}) configuration.",
+                    original_count,
+                    self.config.migration.include_tables,
+                    self.config.migration.exclude_tables
+                );
+            }
+        }
+
         // Load additional metadata
         for table in &mut tables {
             if self.config.migration.create_indexes {

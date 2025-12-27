@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use sysinfo::System;
-use tracing::info;
+use tracing::{info, warn};
 
 /// System resource information for auto-tuning.
 #[derive(Debug, Clone)]
@@ -615,6 +615,79 @@ impl MigrationConfig {
     /// Get the row hash column name.
     pub fn get_row_hash_column(&self) -> &str {
         &self.row_hash_column
+    }
+
+    /// Check if a table name matches any of the given patterns.
+    ///
+    /// Patterns support glob wildcards:
+    /// - `*` matches any sequence of characters
+    /// - `?` matches any single character
+    ///
+    /// Pattern matching is case-insensitive.
+    fn matches_any_pattern(table_name: &str, patterns: &[String]) -> bool {
+        use glob::Pattern;
+
+        let table_lower = table_name.to_lowercase();
+        for pattern_str in patterns {
+            // glob::Pattern matching is case-sensitive by default,
+            // so we lowercase both for case-insensitive matching
+            let pattern_lower = pattern_str.to_lowercase();
+            match Pattern::new(&pattern_lower) {
+                Ok(pattern) => {
+                    if pattern.matches(&table_lower) {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Invalid glob pattern '{}': {}. Pattern will be skipped.",
+                        pattern_str, e
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract just the table name from a schema-qualified name.
+    /// "schema.table" -> "table", "table" -> "table"
+    fn extract_table_name(full_name: &str) -> &str {
+        full_name.rsplit('.').next().unwrap_or(full_name)
+    }
+
+    /// Filter tables based on include_tables and exclude_tables patterns.
+    ///
+    /// Rules:
+    /// - Patterns match against table name only (not schema)
+    /// - If include_tables is empty, all tables are included by default
+    /// - If include_tables is non-empty, only matching tables are included
+    /// - exclude_tables always takes precedence over include_tables
+    ///
+    /// Returns the filtered list of table names (full schema.table names).
+    pub fn filter_tables(&self, table_names: &[String]) -> Vec<String> {
+        table_names
+            .iter()
+            .filter(|full_name| {
+                // Extract just the table name for pattern matching
+                let table_name = Self::extract_table_name(full_name);
+
+                // If exclude patterns match, exclude the table
+                if !self.exclude_tables.is_empty()
+                    && Self::matches_any_pattern(table_name, &self.exclude_tables)
+                {
+                    return false;
+                }
+
+                // If include patterns are specified, table must match one
+                if !self.include_tables.is_empty() {
+                    return Self::matches_any_pattern(table_name, &self.include_tables);
+                }
+
+                // No include patterns means include all (that weren't excluded)
+                true
+            })
+            .cloned()
+            .collect()
     }
 }
 

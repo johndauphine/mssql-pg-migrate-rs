@@ -71,6 +71,9 @@ bb8 = { workspace = true }
 # System info detection
 sysinfo = { workspace = true }
 
+# Glob pattern matching for table filters
+glob = "0.3"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

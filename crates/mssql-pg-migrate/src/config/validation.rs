@@ -64,6 +64,14 @@ pub fn validate(config: &Config) -> Result<()> {
     validate_nonzero_option(config.migration.upsert_batch_size, "migration.upsert_batch_size")?;
     validate_nonzero_option(config.migration.upsert_parallel_tasks, "migration.upsert_parallel_tasks")?;
 
+    // Validate table filter patterns for SQL injection prevention
+    for pattern in &config.migration.include_tables {
+        validate_table_pattern(pattern, "include_tables")?;
+    }
+    for pattern in &config.migration.exclude_tables {
+        validate_table_pattern(pattern, "exclude_tables")?;
+    }
+
     Ok(())
 }
 
@@ -75,6 +83,36 @@ fn validate_nonzero_option(value: Option<usize>, field_name: &str) -> Result<()>
             field_name
         )));
     }
+    Ok(())
+}
+
+/// Validate a table name pattern for SQL injection prevention.
+///
+/// Allowed characters:
+/// - Alphanumeric (a-z, A-Z, 0-9)
+/// - Underscore (_)
+/// - Dot (.) for schema.table patterns
+/// - Glob wildcards (* and ?)
+///
+/// This prevents SQL injection through table filter patterns.
+fn validate_table_pattern(pattern: &str, field_name: &str) -> Result<()> {
+    if pattern.is_empty() {
+        return Err(MigrateError::Config(format!(
+            "{} contains empty pattern",
+            field_name
+        )));
+    }
+
+    for ch in pattern.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' && ch != '*' && ch != '?' {
+            return Err(MigrateError::Config(format!(
+                "{} pattern '{}' contains invalid character '{}'. \
+                 Only alphanumeric, underscore, dot, and glob wildcards (* ?) are allowed.",
+                field_name, pattern, ch
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -264,5 +302,60 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("upsert_parallel_tasks"));
+    }
+
+    #[test]
+    fn test_valid_table_patterns_accepted() {
+        let mut config = valid_config();
+        config.migration.include_tables = vec![
+            "Users".to_string(),
+            "dbo.Orders".to_string(),
+            "User*".to_string(),
+            "???_Table".to_string(),
+            "Schema.Table_Name123".to_string(),
+        ];
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_sql_injection_in_include_tables_rejected() {
+        let mut config = valid_config();
+        config.migration.include_tables = vec!["Users; DROP TABLE Users--".to_string()];
+        let result = validate(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("include_tables"));
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn test_sql_injection_in_exclude_tables_rejected() {
+        let mut config = valid_config();
+        config.migration.exclude_tables = vec!["Users' OR '1'='1".to_string()];
+        let result = validate(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exclude_tables"));
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn test_empty_pattern_rejected() {
+        let mut config = valid_config();
+        config.migration.include_tables = vec!["".to_string()];
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty pattern"));
+    }
+
+    #[test]
+    fn test_special_chars_in_pattern_rejected() {
+        let mut config = valid_config();
+        // Test various SQL injection characters
+        for pattern in &["Table;", "Table--", "Table/*", "Table'", "Table\"", "Table\\", "Table()", "Table[]"] {
+            config.migration.include_tables = vec![pattern.to_string()];
+            let result = validate(&config);
+            assert!(result.is_err(), "Pattern '{}' should be rejected", pattern);
+        }
     }
 }
