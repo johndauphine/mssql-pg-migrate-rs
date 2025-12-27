@@ -380,4 +380,22 @@ migration:
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Log1", "Log2", "Logs"]);
     }
+
+    #[test]
+    fn test_filter_tables_schema_qualified_names() {
+        // Patterns should match table name only, not schema
+        let mut config = Config::from_yaml(VALID_YAML).unwrap();
+        config.migration.include_tables = vec!["Users".to_string(), "Post*".to_string()];
+        config.migration.exclude_tables = vec!["PostLinks".to_string()];
+        let tables = vec![
+            "dbo.Users".to_string(),
+            "dbo.Posts".to_string(),
+            "dbo.PostTypes".to_string(),
+            "dbo.PostLinks".to_string(),
+            "dbo.Comments".to_string(),
+        ];
+        let filtered = config.migration.filter_tables(&tables);
+        // Should include Users, Posts, PostTypes but exclude PostLinks and Comments
+        assert_eq!(filtered, vec!["dbo.Users", "dbo.Posts", "dbo.PostTypes"]);
+    }
 }

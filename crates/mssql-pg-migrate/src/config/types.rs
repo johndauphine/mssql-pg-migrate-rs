@@ -641,28 +641,38 @@ impl MigrationConfig {
         false
     }
 
+    /// Extract just the table name from a schema-qualified name.
+    /// "schema.table" -> "table", "table" -> "table"
+    fn extract_table_name(full_name: &str) -> &str {
+        full_name.rsplit('.').next().unwrap_or(full_name)
+    }
+
     /// Filter tables based on include_tables and exclude_tables patterns.
     ///
     /// Rules:
+    /// - Patterns match against table name only (not schema)
     /// - If include_tables is empty, all tables are included by default
     /// - If include_tables is non-empty, only matching tables are included
     /// - exclude_tables always takes precedence over include_tables
     ///
-    /// Returns the filtered list of table names.
+    /// Returns the filtered list of table names (full schema.table names).
     pub fn filter_tables(&self, table_names: &[String]) -> Vec<String> {
         table_names
             .iter()
-            .filter(|name| {
+            .filter(|full_name| {
+                // Extract just the table name for pattern matching
+                let table_name = Self::extract_table_name(full_name);
+
                 // If exclude patterns match, exclude the table
                 if !self.exclude_tables.is_empty()
-                    && Self::matches_any_pattern(name, &self.exclude_tables)
+                    && Self::matches_any_pattern(table_name, &self.exclude_tables)
                 {
                     return false;
                 }
 
                 // If include patterns are specified, table must match one
                 if !self.include_tables.is_empty() {
-                    return Self::matches_any_pattern(name, &self.include_tables);
+                    return Self::matches_any_pattern(table_name, &self.include_tables);
                 }
 
                 // No include patterns means include all (that weren't excluded)
