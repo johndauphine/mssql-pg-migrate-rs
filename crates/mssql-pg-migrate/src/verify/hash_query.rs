@@ -39,13 +39,13 @@ pub fn mssql_batch_hash_query(
 
     let columns_sql = column_exprs.join(mssql_column_separator());
 
-    // Build the query with parameterized PK range
+    // Build the query with parameterized PK range (tiberius uses @P1, @P2 for parameters)
     format!(
         r#"SELECT
     ISNULL(CHECKSUM_AGG(BINARY_CHECKSUM({columns_sql})), 0) AS batch_hash,
     COUNT(*) AS row_count
 FROM [{schema}].[{table_name}] WITH (NOLOCK)
-WHERE [{pk_column}] >= @min_pk AND [{pk_column}] < @max_pk"#,
+WHERE [{pk_column}] >= @P1 AND [{pk_column}] < @P2"#,
         columns_sql = columns_sql,
         schema = schema,
         table_name = table.name,
@@ -82,6 +82,7 @@ pub fn postgres_batch_hash_query(
     // Take first 8 hex chars (32 bits) and sum them as BIGINT to avoid overflow
     // This won't produce identical results to MSSQL CHECKSUM_AGG but will be
     // deterministic for comparison purposes
+    // Cast PK column to BIGINT for comparison to work with any integer type
     format!(
         r#"SELECT
     COALESCE(SUM(
@@ -89,7 +90,7 @@ pub fn postgres_batch_hash_query(
     ), 0)::BIGINT AS batch_hash,
     COUNT(*)::BIGINT AS row_count
 FROM "{schema}"."{table_name}"
-WHERE "{pk_column}" >= $1 AND "{pk_column}" < $2"#,
+WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2"#,
         columns_sql = columns_sql,
         schema = schema,
         table_name = table.name,
@@ -115,13 +116,13 @@ pub fn mssql_row_hashes_query(
 
     let columns_sql = column_exprs.join(" + N'|' + ");
 
-    // Use HASHBYTES with MD5 for row-level hashes
+    // Use HASHBYTES with MD5 for row-level hashes (tiberius uses @P1, @P2 for parameters)
     format!(
         r#"SELECT
     [{pk_column}] AS pk,
     LOWER(CONVERT(NVARCHAR(32), HASHBYTES('MD5', {columns_sql}), 2)) AS row_hash
 FROM [{schema}].[{table_name}] WITH (NOLOCK)
-WHERE [{pk_column}] >= @min_pk AND [{pk_column}] < @max_pk
+WHERE [{pk_column}] >= @P1 AND [{pk_column}] < @P2
 ORDER BY [{pk_column}]"#,
         pk_column = pk_column,
         columns_sql = columns_sql,
@@ -143,12 +144,13 @@ pub fn postgres_row_hashes_query(
     match row_hash_column {
         Some(hash_col) => {
             // Use existing row_hash column
+            // Cast PK column to BIGINT for comparison to work with any integer type
             format!(
                 r#"SELECT
     "{pk_column}"::BIGINT AS pk,
     "{hash_col}" AS row_hash
 FROM "{schema}"."{table_name}"
-WHERE "{pk_column}" >= $1 AND "{pk_column}" < $2
+WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2
 ORDER BY "{pk_column}""#,
                 pk_column = pk_column,
                 hash_col = hash_col,
@@ -159,12 +161,13 @@ ORDER BY "{pk_column}""#,
         None => {
             // Compute hash on the fly (slower but works without row_hash column)
             // Note: This would need the full column list - for now, require row_hash column
+            // Cast PK column to BIGINT for comparison to work with any integer type
             format!(
                 r#"SELECT
     "{pk_column}"::BIGINT AS pk,
     NULL::TEXT AS row_hash
 FROM "{schema}"."{table_name}"
-WHERE "{pk_column}" >= $1 AND "{pk_column}" < $2
+WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2
 ORDER BY "{pk_column}""#,
                 pk_column = pk_column,
                 schema = schema,
@@ -184,9 +187,9 @@ pub fn mssql_pk_bounds_query(
 ) -> String {
     format!(
         r#"SELECT
-    MIN([{pk_column}]) AS min_pk,
-    MAX([{pk_column}]) AS max_pk,
-    COUNT(*) AS row_count
+    CAST(MIN([{pk_column}]) AS BIGINT) AS min_pk,
+    CAST(MAX([{pk_column}]) AS BIGINT) AS max_pk,
+    CAST(COUNT(*) AS BIGINT) AS row_count
 FROM [{schema}].[{table_name}] WITH (NOLOCK)"#,
         pk_column = pk_column,
         schema = schema,
@@ -274,8 +277,8 @@ mod tests {
         assert!(query.contains("BINARY_CHECKSUM"));
         assert!(query.contains("batch_hash"));
         assert!(query.contains("row_count"));
-        assert!(query.contains("@min_pk"));
-        assert!(query.contains("@max_pk"));
+        assert!(query.contains("@P1"));
+        assert!(query.contains("@P2"));
         assert!(!query.contains("[id],")); // PK should be excluded from hash
     }
 

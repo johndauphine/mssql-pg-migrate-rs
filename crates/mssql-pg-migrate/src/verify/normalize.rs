@@ -21,33 +21,18 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
     let data_type = column.data_type.to_lowercase();
 
     match data_type.as_str() {
-        // DateTime types: round to 3ms precision (MSSQL DATETIME granularity)
-        // Format as ISO 8601: YYYY-MM-DDTHH:MM:SS.mmm
-        "datetime" => {
-            // DATETIME has 3.33ms precision - round to nearest 3ms
-            // Use style 126 for ISO 8601 format
+        // DateTime types: use FORMAT for consistent ISO 8601 output
+        // We truncate to seconds for simplicity (avoids overflow issues with DATEDIFF on milliseconds)
+        "datetime" | "datetime2" | "smalldatetime" => {
+            // FORMAT with 'yyyy-MM-ddTHH:mm:ss.fff' for ISO 8601
             format!(
-                "ISNULL(CONVERT(NVARCHAR(23), \
-                 DATEADD(ms, (DATEDIFF(ms, '19000101', [{name}]) / 3) * 3, '19000101'), 126), \
-                 N'NULL')"
-            )
-        }
-        "datetime2" | "smalldatetime" => {
-            // DATETIME2 has higher precision but we normalize to 3ms for compatibility
-            format!(
-                "ISNULL(CONVERT(NVARCHAR(23), \
-                 DATEADD(ms, (DATEDIFF_BIG(ms, '19000101', [{name}]) / 3) * 3, '19000101'), 126), \
-                 N'NULL')"
+                "ISNULL(FORMAT([{name}], 'yyyy-MM-ddTHH:mm:ss.fff'), N'NULL')"
             )
         }
         "datetimeoffset" => {
-            // Apply 3ms rounding (like other datetime types) while preserving timezone offset
+            // Format with timezone offset
             format!(
-                "ISNULL(CONVERT(NVARCHAR(34), \
-                 TODATETIMEOFFSET( \
-                     DATEADD(ms, (DATEDIFF_BIG(ms, '19000101', CAST([{name}] AS datetime2)) / 3) * 3, '19000101'), \
-                     DATEPART(TZOFFSET, [{name}]) \
-                 ), 127), N'NULL')"
+                "ISNULL(FORMAT([{name}], 'yyyy-MM-ddTHH:mm:ss.fffzzz'), N'NULL')"
             )
         }
         "date" => {

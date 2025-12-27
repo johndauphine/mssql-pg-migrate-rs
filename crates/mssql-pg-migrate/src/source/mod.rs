@@ -802,10 +802,13 @@ impl MssqlPool {
 
         let mut hashes = std::collections::HashMap::new();
         for row in rows {
-            if let (Some(pk), Some(hash)) = (
-                row.get::<i64, _>(0).or_else(|| row.get::<i32, _>(0).map(|v| v as i64)),
-                row.get::<&str, _>(1),
-            ) {
+            // Try i32 first (common case), then i64 for BIGINT columns
+            let pk: Option<i64> = row.get::<i32, _>(0)
+                .map(|v| v as i64)
+                .or_else(|| row.get::<i64, _>(0));
+            let hash: Option<&str> = row.get(1);
+
+            if let (Some(pk), Some(hash)) = (pk, hash) {
                 hashes.insert(pk, hash.to_string());
             }
         }
@@ -826,15 +829,13 @@ impl MssqlPool {
             .map_err(MigrateError::Source)?;
 
         if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            // Try i64 first (query uses CAST AS BIGINT), fallback to i32 for compatibility
             let min_pk: i64 = row.get::<i64, _>(0)
-                .or_else(|| row.get::<i32, _>(0).map(|v| v as i64))
-                .unwrap_or(0);
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
             let max_pk: i64 = row.get::<i64, _>(1)
-                .or_else(|| row.get::<i32, _>(1).map(|v| v as i64))
-                .unwrap_or(0);
+                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
             let row_count: i64 = row.get::<i64, _>(2)
-                .or_else(|| row.get::<i32, _>(2).map(|v| v as i64))
-                .unwrap_or(0);
+                .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
             Ok((min_pk, max_pk, row_count))
         } else {
             Ok((0, 0, 0))
