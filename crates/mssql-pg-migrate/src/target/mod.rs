@@ -1176,6 +1176,8 @@ impl TargetPool for PgPool {
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
     ) -> Result<u64> {
+        use std::time::Instant;
+
         if rows.is_empty() {
             return Ok(0);
         }
@@ -1185,6 +1187,7 @@ impl TargetPool for PgPool {
         }
 
         let row_count = rows.len() as u64;
+        let chunk_start = Instant::now();
 
         // Use per-writer staging table to avoid conflicts between parallel writers.
         // Each writer gets its own staging table that persists for the session,
@@ -1217,6 +1220,9 @@ impl TargetPool for PgPool {
                 format!("truncating staging table: {}", e),
             )
         })?;
+
+        let staging_time = chunk_start.elapsed();
+        let copy_start = Instant::now();
 
         // 2. COPY rows into staging table using binary format
         let col_list: String = cols
@@ -1291,6 +1297,9 @@ impl TargetPool for PgPool {
             )
         })?;
 
+        let copy_time = copy_start.elapsed();
+        let merge_start = Instant::now();
+
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
         let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
@@ -1299,6 +1308,22 @@ impl TargetPool for PgPool {
                 format!("merging staging to target: {}", e),
             )
         })?;
+
+        let merge_time = merge_start.elapsed();
+        let total_time = chunk_start.elapsed();
+
+        // Log detailed timing for profiling (only for larger chunks to avoid spam)
+        if row_count >= 10000 {
+            tracing::debug!(
+                "dbo.{}: upsert chunk {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
+                table,
+                row_count,
+                staging_time,
+                copy_time,
+                merge_time,
+                total_time
+            );
+        }
 
         // Note: Staging table is NOT dropped here - it's reused across batches
         // to reduce system catalog churn. It will be automatically dropped when
@@ -1842,9 +1867,8 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
 /// Build SQL to merge from staging table into target table.
 /// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
 ///
-/// The WHERE clause uses IS DISTINCT FROM to only update rows where at least
-/// one non-PK column has changed. This prevents unnecessary writes (WAL, triggers, etc.)
-/// even when hash-based filtering has already been applied at the transfer layer.
+/// If row_hash column is present, uses it for efficient change detection (single column compare).
+/// Otherwise falls back to comparing all non-PK columns with IS DISTINCT FROM.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
@@ -1882,19 +1906,30 @@ fn build_staging_merge_sql(
             pk_list
         )
     } else {
-        // Build change detection WHERE clause to prevent unnecessary updates
-        let change_detection: Vec<String> = cols
-            .iter()
-            .filter(|c| !pk_cols.contains(c))
-            .map(|c| {
-                format!(
-                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                    pg_quote_ident(table),
-                    pg_quote_ident(c),
-                    pg_quote_ident(c)
-                )
-            })
-            .collect();
+        // Use row_hash for change detection if available (much faster than comparing all columns)
+        let has_row_hash = cols.iter().any(|c| c == "row_hash");
+
+        let change_detection = if has_row_hash {
+            // Single column comparison using pre-computed hash
+            format!(
+                "{}.\"row_hash\" IS DISTINCT FROM EXCLUDED.\"row_hash\"",
+                pg_quote_ident(table)
+            )
+        } else {
+            // Fallback: compare all non-PK columns
+            cols.iter()
+                .filter(|c| !pk_cols.contains(c))
+                .map(|c| {
+                    format!(
+                        "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                        pg_quote_ident(table),
+                        pg_quote_ident(c),
+                        pg_quote_ident(c)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
 
         format!(
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
@@ -1904,7 +1939,7 @@ fn build_staging_merge_sql(
             pg_quote_ident(staging_table),
             pk_list,
             update_cols.join(", "),
-            change_detection.join(" OR ")
+            change_detection
         )
     }
 }
