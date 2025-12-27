@@ -362,9 +362,14 @@ fn prompt_migration_config(
         config.chunk_size = prompt_optional_usize("  Chunk size", existing.and_then(|c| c.chunk_size))?;
 
         let memory_budget: u8 = Input::new()
-            .with_prompt("  Memory budget percent")
+            .with_prompt("  Memory budget percent (1-100)")
             .default(existing.map(|c| c.memory_budget_percent).unwrap_or(70))
             .interact_text()?;
+        if memory_budget == 0 || memory_budget > 100 {
+            return Err(WizardError::Validation(
+                "Memory budget percent must be between 1 and 100.".to_string(),
+            ));
+        }
         config.memory_budget_percent = memory_budget;
 
         config.use_binary_copy = Confirm::new()
