@@ -273,6 +273,9 @@ pub struct WizardState {
 
     /// Selected option index for enum selection steps.
     pub selected_option: usize,
+
+    /// Whether the configuration was successfully saved.
+    pub was_saved: bool,
 }
 
 impl WizardState {
@@ -286,6 +289,7 @@ impl WizardState {
             input: String::new(),
             error: None,
             selected_option: 0,
+            was_saved: false,
         }
     }
 
@@ -299,6 +303,7 @@ impl WizardState {
             input: String::new(),
             error: None,
             selected_option: 0,
+            was_saved: false,
         }
     }
 
@@ -536,8 +541,10 @@ impl WizardState {
                     if let Err(e) = self.save() {
                         return Err(format!("Failed to save: {}", e));
                     }
+                    self.was_saved = true;
                     self.transcript.push(format!("Configuration saved to {}", self.output_path.display()));
                 } else {
+                    self.was_saved = false;
                     self.transcript.push("Configuration cancelled.".to_string());
                 }
                 self.step = WizardStep::Done;
