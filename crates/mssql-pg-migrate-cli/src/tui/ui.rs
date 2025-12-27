@@ -291,11 +291,17 @@ fn render_side_panel(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
+    // Get config filename for title
+    let config_filename = app.config_summary.config_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+
     let config_para = Paragraph::new(config_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Config "),
+                .title(format!(" {} ", config_filename)),
         );
 
     frame.render_widget(config_para, side_chunks[0]);
@@ -632,6 +638,14 @@ fn render_wizard(frame: &mut Frame, app: &App) {
     let area = centered_rect(70, 70, frame.area());
     frame.render_widget(Clear, area);
 
+    // Determine if editing existing file or creating new
+    let file_action = if wizard.output_path.exists() {
+        "Editing"
+    } else {
+        "Creating"
+    };
+    let file_path = wizard.output_path.display();
+
     // Build wizard content
     let mut lines: Vec<Line> = vec![
         Line::from(""),
@@ -639,6 +653,10 @@ fn render_wizard(frame: &mut Frame, app: &App) {
             " Configuration Wizard ",
             Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
         )),
+        Line::from(vec![
+            Span::styled(format!(" {} ", file_action), Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", file_path), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
         Line::from(format!(
             " Step {} of {} ",
             wizard.step.step_number(),
@@ -661,21 +679,45 @@ fn render_wizard(frame: &mut Frame, app: &App) {
 
     // Current prompt
     let prompt = wizard.get_prompt();
-    let input_display = if wizard.step.is_password() {
-        "*".repeat(wizard.input.len())
-    } else {
-        wizard.input.clone()
-    };
 
     lines.push(Line::from(vec![
         Span::styled(&prompt, Style::default().fg(Color::Yellow)),
     ]));
 
-    lines.push(Line::from(vec![
-        Span::styled(" > ", Style::default().fg(Color::Cyan)),
-        Span::raw(&input_display),
-        Span::styled("█", Style::default().fg(Color::Gray)),
-    ]));
+    // Check if this is an enum selection step
+    if wizard.step.is_enum_selection() {
+        // Render options as a selection list
+        let options = wizard.step.get_options();
+        lines.push(Line::from(""));
+        for (i, option) in options.iter().enumerate() {
+            let is_selected = i == wizard.selected_option;
+            let marker = if is_selected { "▸ " } else { "  " };
+            let style = if is_selected {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", marker), style),
+                Span::styled(option.label, style),
+                Span::styled(format!("  {}", option.description), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    } else {
+        // Regular text input
+        let input_display = if wizard.step.is_password() {
+            "*".repeat(wizard.input.len())
+        } else {
+            wizard.input.clone()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(" > ".to_string(), Style::default().fg(Color::Cyan)),
+            Span::raw(input_display),
+            Span::styled("█".to_string(), Style::default().fg(Color::Gray)),
+        ]));
+    }
 
     // Error message if any
     if let Some(ref error) = wizard.error {
@@ -686,16 +728,27 @@ fn render_wizard(frame: &mut Frame, app: &App) {
         ]));
     }
 
-    // Footer hints
+    // Footer hints - different for enum selection vs text input
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Submit "),
-        Span::styled(" ↑ ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Back "),
-        Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Cancel "),
-    ]));
+    if wizard.step.is_enum_selection() {
+        lines.push(Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Select "),
+            Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Confirm "),
+            Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Cancel "),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Submit "),
+            Span::styled(" ↑ ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Back "),
+            Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Cancel "),
+        ]));
+    }
 
     let wizard_widget = Paragraph::new(lines)
         .block(

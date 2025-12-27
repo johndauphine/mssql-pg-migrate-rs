@@ -75,14 +75,14 @@ fn install_panic_hook() {
 
 /// Run the TUI application.
 pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
+    // Load config BEFORE setting up terminal so errors display properly
+    let config = Config::load(config_path.as_ref())?;
+
     // Install panic hook to restore terminal on panic
     install_panic_hook();
 
     // Setup terminal
     let mut terminal = setup_terminal()?;
-
-    // Load config for display (don't connect yet)
-    let config = Config::load(config_path.as_ref())?;
 
     // Create event channels
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
