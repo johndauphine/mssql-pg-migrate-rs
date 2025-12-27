@@ -555,29 +555,16 @@ impl UniversalVerifyEngine {
             }
         }
 
-        // Handle deletes
+        // Note: We intentionally do NOT delete rows that exist in target but not in source.
+        // This is a safety measure - the target may have legitimate additional data,
+        // and deletes are destructive operations that cannot be easily undone.
+        // The verify output still reports rows_to_delete for informational purposes.
         if !diff.missing_in_source.is_empty() {
             info!(
-                "Deleting {} rows from {}.{}",
+                "Skipping {} rows in {}.{} that exist in target but not source (deletes disabled for safety)",
                 diff.missing_in_source.len(),
                 target_schema,
                 table.name
-            );
-
-            let deleted = self
-                .target
-                .delete_rows_by_composite_pks(
-                    target_schema,
-                    &table.name,
-                    pk_columns,
-                    &diff.missing_in_source,
-                )
-                .await?;
-
-            stats.rows_deleted = deleted;
-            info!(
-                "Deleted {} rows from {}.{}",
-                deleted, target_schema, table.name
             );
         }
 
