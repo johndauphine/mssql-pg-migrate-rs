@@ -11,6 +11,10 @@ description = "High-performance MSSQL to PostgreSQL migration CLI"
 name = "mssql-pg-migrate"
 path = "src/main.rs"
 
+[features]
+default = []
+tui = ["ratatui", "crossterm", "fuzzy-matcher"]
+
 [dependencies]
 mssql-pg-migrate = { path = "../mssql-pg-migrate" }
 
@@ -34,6 +38,14 @@ serde_yaml = { workspace = true }
 
 # Interactive prompts
 dialoguer = "0.11"
+
+# Date/time (for TUI log formatting)
+chrono = { workspace = true }
+
+# TUI (optional, enabled with --features tui)
+ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", optional = true }
+fuzzy-matcher = { version = "0.3", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.0"

@@ -2,6 +2,9 @@
 
 mod wizard;
 
+#[cfg(feature = "tui")]
+mod tui;
+
 use clap::{Parser, Subcommand};
 use mssql_pg_migrate::{Config, MigrateError, Orchestrator};
 use std::path::PathBuf;
@@ -106,6 +109,10 @@ enum Commands {
         #[arg(long, short)]
         force: bool,
     },
+
+    /// Launch interactive TUI mode
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 #[tokio::main]
@@ -132,6 +139,12 @@ async fn run() -> Result<(), MigrateError> {
         return Ok(());
     }
 
+    // Handle TUI command separately (manages its own terminal)
+    #[cfg(feature = "tui")]
+    if let Commands::Tui = cli.command {
+        return tui::run(&cli.config).await;
+    }
+
     // Setup logging
     setup_logging(&cli.verbosity, &cli.log_format)
         .map_err(|e| MigrateError::Config(e.to_string()))?;
@@ -146,6 +159,8 @@ async fn run() -> Result<(), MigrateError> {
 
     match cli.command {
         Commands::Init { .. } => unreachable!(), // Handled above
+        #[cfg(feature = "tui")]
+        Commands::Tui => unreachable!(), // Handled above
         Commands::Run {
             source_schema,
             target_schema,

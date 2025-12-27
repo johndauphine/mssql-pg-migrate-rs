@@ -50,6 +50,10 @@ pub struct TableState {
     /// Rows transferred so far.
     pub rows_transferred: i64,
 
+    /// Rows skipped (unchanged in upsert mode with hash detection).
+    #[serde(default)]
+    pub rows_skipped: i64,
+
     /// Last processed primary key value (for resume).
     pub last_pk: Option<i64>,
 
@@ -136,6 +140,7 @@ impl MigrationState {
                 status: TaskStatus::Pending,
                 rows_total,
                 rows_transferred: 0,
+                rows_skipped: 0,
                 last_pk: None,
                 partitions: None,
                 completed_at: None,
@@ -171,6 +176,7 @@ impl TableState {
             status: TaskStatus::Pending,
             rows_total,
             rows_transferred: 0,
+            rows_skipped: 0,
             last_pk: None,
             partitions: None,
             completed_at: None,
