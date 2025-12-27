@@ -96,10 +96,16 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,mssql_pg_migrate=debug"));
 
-    tracing_subscriber::registry()
+    if let Err(e) = tracing_subscriber::registry()
         .with(filter)
         .with(tui_layer)
-        .init();
+        .try_init()
+    {
+        eprintln!("Warning: Failed to set up TUI logging: {}", e);
+    }
+
+    // Test log to verify tracing is working
+    tracing::info!("TUI logging initialized");
 
     // Create application state
     let mut app = App::new(

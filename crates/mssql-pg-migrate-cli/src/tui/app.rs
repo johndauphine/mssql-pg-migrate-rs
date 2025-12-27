@@ -555,6 +555,16 @@ impl App {
 
     /// Handle a progress update from the orchestrator.
     fn handle_progress(&mut self, update: ProgressUpdate) {
+        // Log progress for debugging
+        tracing::debug!(
+            "Progress: phase={}, tables={}/{}, rows={}, rps={}",
+            update.phase,
+            update.tables_completed,
+            update.tables_total,
+            update.rows_transferred,
+            update.rows_per_second
+        );
+
         // Don't update phase if already in terminal state (handles race condition
         // where progress events arrive after MigrationComplete)
         if matches!(
