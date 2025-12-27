@@ -1,11 +1,12 @@
 //! Migration orchestrator - main workflow coordinator.
 
-use crate::config::{Config, TableStats, TargetMode};
+use crate::config::{BatchVerifyConfig, Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, SourcePool, Table};
 use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
 use crate::target::{PgPool, TargetPool};
 use crate::transfer::{TransferConfig, TransferEngine, TransferJob};
+use crate::verify::UniversalVerifyEngine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -547,6 +548,18 @@ impl Orchestrator {
             info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
             Ok(())
         };
+
+        // Phase 3.5: Batch sync for upsert mode (only on success, skip in dry-run)
+        if transfer_result.is_ok()
+            && !dry_run
+            && matches!(self.config.migration.target_mode, TargetMode::Upsert)
+        {
+            info!("Phase 3.5: Batch sync verification");
+            self.emit_progress("batch_sync", tables.len(), total_rows);
+            if let Err(e) = self.batch_sync(&tables, &cancel).await {
+                warn!("Batch sync failed (non-fatal): {}", e);
+            }
+        }
 
         // Phase 4: Finalize (only on success, skip in dry-run)
         if transfer_result.is_ok() && !dry_run {
@@ -1314,6 +1327,78 @@ impl Orchestrator {
         }
 
         Ok(results)
+    }
+
+    /// Batch sync for upsert mode - verifies and syncs any remaining differences.
+    ///
+    /// This is called after the main transfer phase to catch any rows that may have
+    /// changed during transfer or were missed due to timing issues.
+    async fn batch_sync(&self, tables: &[Table], cancel: &CancellationToken) -> Result<()> {
+        let source_schema = &self.config.source.schema;
+        let target_schema = &self.config.target.schema;
+
+        // Create verify engine with default batch sizes
+        let verify_config = BatchVerifyConfig {
+            tier1_batch_size: 1_000_000,
+            tier2_batch_size: 10_000,
+            parallel_verify_ranges: 4,
+        };
+
+        let engine = UniversalVerifyEngine::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.target),
+            verify_config,
+            self.config.migration.get_row_hash_column().to_string(),
+        );
+
+        let mut total_synced = 0i64;
+
+        for table in tables {
+            if cancel.is_cancelled() {
+                info!("Batch sync cancelled");
+                break;
+            }
+
+            // Skip tables without primary key
+            if table.primary_key.is_empty() {
+                debug!("Skipping batch sync for {} (no primary key)", table.name);
+                continue;
+            }
+
+            // Verify and sync the table
+            match engine
+                .verify_and_sync_table(table, source_schema, target_schema)
+                .await
+            {
+                Ok((result, stats)) => {
+                    let synced = stats.rows_inserted + stats.rows_updated;
+                    if synced > 0 {
+                        info!(
+                            "Batch sync {}: {} inserts, {} updates",
+                            table.name, stats.rows_inserted, stats.rows_updated
+                        );
+                        total_synced += synced;
+                    } else if !result.is_in_sync() {
+                        debug!(
+                            "Batch sync {}: {} deletes skipped (safety)",
+                            table.name, result.rows_to_delete
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Batch sync failed for {}: {}", table.name, e);
+                    // Continue with other tables - batch sync is best-effort
+                }
+            }
+        }
+
+        if total_synced > 0 {
+            info!("Batch sync complete: {} rows synced", total_synced);
+        } else {
+            info!("Batch sync complete: all tables in sync");
+        }
+
+        Ok(())
     }
 }
 

@@ -92,12 +92,8 @@ enum Commands {
     /// Validate row counts between source and target
     Validate,
 
-    /// Verify data consistency using multi-tier batch hashing
+    /// Verify data consistency using multi-tier batch hashing (read-only)
     Verify {
-        /// Automatically sync mismatched rows
-        #[arg(long)]
-        sync: bool,
-
         /// Tier 1 (coarse) batch size in rows (default: 1000000)
         #[arg(long, default_value = "1000000")]
         tier1_size: i64,
@@ -298,7 +294,6 @@ async fn run() -> Result<(), MigrateError> {
         }
 
         Commands::Verify {
-            sync,
             tier1_size,
             tier2_size,
         } => {
@@ -322,10 +317,7 @@ async fn run() -> Result<(), MigrateError> {
             let source = orchestrator.source_pool();
             let target = orchestrator.target_pool();
 
-            println!(
-                "Starting multi-tier verification{}...\n",
-                if sync { " with auto-sync" } else { "" }
-            );
+            println!("Starting multi-tier verification (read-only)...\n");
 
             let mut total_result = mssql_pg_migrate::VerifyResult::new();
             let start = std::time::Instant::now();
@@ -339,7 +331,7 @@ async fn run() -> Result<(), MigrateError> {
 
             for table in &tables {
                 match engine
-                    .verify_table(table, source_schema, target_schema, sync)
+                    .verify_table(table, source_schema, target_schema)
                     .await
                 {
                     Ok(result) => {
