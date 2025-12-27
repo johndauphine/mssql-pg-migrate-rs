@@ -263,8 +263,6 @@ pub struct TableVerifyResult {
     pub rows_to_update: i64,
     /// Rows that need to be deleted.
     pub rows_to_delete: i64,
-    /// Whether sync was performed.
-    pub sync_performed: bool,
     /// Whether the table was skipped.
     pub skipped: bool,
     /// Reason for skipping (if skipped).
@@ -299,8 +297,6 @@ pub struct VerifyResult {
     pub total_rows_to_update: i64,
     /// Total rows that need to be deleted across all tables.
     pub total_rows_to_delete: i64,
-    /// Whether sync was performed.
-    pub sync_performed: bool,
     /// Total duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -317,7 +313,6 @@ impl VerifyResult {
             total_rows_to_insert: 0,
             total_rows_to_update: 0,
             total_rows_to_delete: 0,
-            sync_performed: false,
             duration_ms: 0,
         }
     }
@@ -336,9 +331,6 @@ impl VerifyResult {
             self.total_rows_to_insert += result.rows_to_insert;
             self.total_rows_to_update += result.rows_to_update;
             self.total_rows_to_delete += result.rows_to_delete;
-            if result.sync_performed {
-                self.sync_performed = true;
-            }
         }
         self.tables.push(result);
     }

@@ -1,11 +1,12 @@
 //! Migration orchestrator - main workflow coordinator.
 
-use crate::config::{Config, TableStats, TargetMode};
+use crate::config::{BatchVerifyConfig, Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, SourcePool, Table};
 use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
 use crate::target::{PgPool, TargetPool};
 use crate::transfer::{TransferConfig, TransferEngine, TransferJob};
+use crate::verify::UniversalVerifyEngine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -539,12 +540,26 @@ impl Orchestrator {
         }
 
         // Phase 3: Transfer data (skip in dry-run)
+        // For upsert mode: use batch hashing to detect changes, only sync differences
+        // For other modes: full transfer of all rows
         let transfer_result = if !dry_run {
-            info!("Phase 3: Transferring data");
-            self.emit_progress("transferring", tables.len(), total_rows);
-            self.transfer_data(&tables, &mut state, &cancel).await
+            if matches!(self.config.migration.target_mode, TargetMode::Upsert) {
+                // Upsert mode: Use batch hashing to detect and sync only changed rows
+                info!("Phase 3: Batch sync (detecting changes with batch hashing)");
+                self.emit_progress("batch_sync", tables.len(), total_rows);
+                self.batch_sync(&tables, &mut state, &cancel).await
+            } else {
+                // Drop/recreate or truncate: Full transfer of all rows
+                info!("Phase 3: Transferring data");
+                self.emit_progress("transferring", tables.len(), total_rows);
+                self.transfer_data(&tables, &mut state, &cancel).await
+            }
         } else {
-            info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
+            if matches!(self.config.migration.target_mode, TargetMode::Upsert) {
+                info!("Phase 3: [DRY RUN] Would detect and sync changes with batch hashing");
+            } else {
+                info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
+            }
             Ok(())
         };
 
@@ -1314,6 +1329,126 @@ impl Orchestrator {
         }
 
         Ok(results)
+    }
+
+    /// Batch sync for upsert mode - uses multi-tier batch hashing to detect and sync differences.
+    ///
+    /// This is the primary sync mechanism for upsert mode:
+    /// 1. Uses batch hashing to identify rows that differ between source and target
+    /// 2. Only fetches and syncs the rows that have changed
+    /// 3. Performs inserts and updates only (no deletes for safety)
+    async fn batch_sync(
+        &self,
+        tables: &[Table],
+        state: &mut MigrationState,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let source_schema = &self.config.source.schema;
+        let target_schema = &self.config.target.schema;
+
+        // Create verify engine with default batch sizes
+        let verify_config = BatchVerifyConfig {
+            tier1_batch_size: 1_000_000,
+            tier2_batch_size: 10_000,
+            parallel_verify_ranges: 4,
+        };
+
+        let engine = UniversalVerifyEngine::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.target),
+            verify_config,
+            self.config.migration.get_row_hash_column().to_string(),
+        );
+
+        let mut total_synced = 0i64;
+        let mut tables_success = 0usize;
+        let mut tables_failed = 0usize;
+
+        for table in tables {
+            if cancel.is_cancelled() {
+                info!("Batch sync cancelled");
+                break;
+            }
+
+            let table_name = table.full_name();
+
+            // Skip tables without primary key
+            if table.primary_key.is_empty() {
+                debug!("Skipping batch sync for {} (no primary key)", table.name);
+                if let Some(ts) = state.tables.get_mut(&table_name) {
+                    ts.status = TaskStatus::Completed;
+                    ts.completed_at = Some(Utc::now());
+                }
+                tables_success += 1;
+                continue;
+            }
+
+            // Mark as in progress
+            if let Some(ts) = state.tables.get_mut(&table_name) {
+                ts.status = TaskStatus::InProgress;
+            }
+
+            // Verify and sync the table
+            match engine
+                .verify_and_sync_table(table, source_schema, target_schema)
+                .await
+            {
+                Ok((result, stats)) => {
+                    let synced = stats.rows_inserted + stats.rows_updated;
+                    if synced > 0 {
+                        info!(
+                            "Batch sync {}: {} inserts, {} updates",
+                            table.name, stats.rows_inserted, stats.rows_updated
+                        );
+                        total_synced += synced;
+                    } else if !result.is_in_sync() {
+                        debug!(
+                            "Batch sync {}: {} deletes skipped (safety)",
+                            table.name, result.rows_to_delete
+                        );
+                    } else {
+                        debug!("Batch sync {}: already in sync", table.name);
+                    }
+
+                    // Update state
+                    if let Some(ts) = state.tables.get_mut(&table_name) {
+                        ts.status = TaskStatus::Completed;
+                        ts.rows_transferred = synced;
+                        ts.completed_at = Some(Utc::now());
+                    }
+                    tables_success += 1;
+                }
+                Err(e) => {
+                    warn!("Batch sync failed for {}: {}", table.name, e);
+                    if let Some(ts) = state.tables.get_mut(&table_name) {
+                        ts.status = TaskStatus::Failed;
+                        ts.error = Some(e.to_string());
+                    }
+                    tables_failed += 1;
+                }
+            }
+
+            // Save state after each table
+            self.save_state(state)?;
+        }
+
+        if total_synced > 0 {
+            info!(
+                "Batch sync complete: {} rows synced across {} tables",
+                total_synced, tables_success
+            );
+        } else {
+            info!("Batch sync complete: all {} tables in sync", tables_success);
+        }
+
+        if tables_failed > 0 {
+            return Err(MigrateError::Transfer {
+                table: format!("{} tables", tables_failed),
+                message: "One or more tables failed during batch sync".into(),
+            });
+        }
+
+        Ok(())
     }
 }
 
