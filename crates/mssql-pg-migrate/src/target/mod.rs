@@ -1918,13 +1918,7 @@ fn build_staging_merge_sql(
         )
     } else {
         // Use row_hash for change detection if available (much faster than comparing all columns)
-        let hash_col_in_cols = row_hash_column.and_then(|h| {
-            if cols.iter().any(|c| c == h) {
-                Some(h)
-            } else {
-                None
-            }
-        });
+        let hash_col_in_cols = row_hash_column.filter(|h| cols.iter().any(|c| c == *h));
 
         let change_detection = if let Some(hash_col) = hash_col_in_cols {
             // Single column comparison using pre-computed hash
