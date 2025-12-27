@@ -31,3 +31,7 @@ test-config.yaml
 
 # Logs
 *.log
+migration-logs-*.txt
+
+# Screenshots
+Screenshot*.png
