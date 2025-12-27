@@ -124,10 +124,7 @@ async fn run() -> Result<(), MigrateError> {
 
     // Handle init command separately (doesn't need existing config)
     if let Commands::Init { output, advanced, force } = cli.command {
-        // Setup minimal logging for init
-        setup_logging("info", "text")
-            .map_err(|e| MigrateError::Config(e.to_string()))?;
-
+        // No logging setup for wizard - keeps terminal clean for interactive prompts
         let output_path = output.unwrap_or_else(|| PathBuf::from("config.yaml"));
         wizard::run_wizard(&output_path, advanced, force)
             .await
