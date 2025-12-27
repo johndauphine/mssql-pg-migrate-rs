@@ -631,38 +631,51 @@ impl App {
 
             AppEvent::WizardBackspace => {
                 if let Some(ref mut wizard) = self.wizard {
-                    // Ignore backspace for enum selection steps
-                    if !wizard.step.is_enum_selection() {
+                    if wizard.step.is_enum_selection() {
+                        // On enum steps, backspace goes back to previous step
+                        wizard.step = wizard.step.prev();
+                        wizard.input.clear();
+                        wizard.error = None;
+                        wizard.selected_option = 0;
+                        wizard.init_selection_for_step();
+                    } else if wizard.input.is_empty() {
+                        // On text steps with empty input, go back to previous step
+                        wizard.step = wizard.step.prev();
+                        wizard.input.clear();
+                        wizard.error = None;
+                        wizard.selected_option = 0;
+                        wizard.init_selection_for_step();
+                    } else {
+                        // Otherwise delete character
                         wizard.input.pop();
                     }
                 }
             }
 
             AppEvent::WizardSubmit => {
-                let (done, message) = if let Some(ref mut wizard) = self.wizard {
+                let (done, was_saved, output_path) = if let Some(ref mut wizard) = self.wizard {
                     match wizard.process_input() {
                         Ok(done) => {
-                            let msg = if done && wizard.is_done() {
-                                Some(format!("Configuration saved to {}", wizard.output_path.display()))
-                            } else {
-                                None
-                            };
-                            (done, msg)
+                            (done, wizard.was_saved, wizard.output_path.display().to_string())
                         }
                         Err(e) => {
                             wizard.error = Some(e);
-                            (false, None)
+                            (false, false, String::new())
                         }
                     }
                 } else {
-                    (false, None)
+                    (false, false, String::new())
                 };
 
                 if done {
                     self.input_mode = InputMode::Normal;
                     self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
-                    if let Some(msg) = message {
-                        self.add_transcript(TranscriptEntry::success(msg));
+                    if was_saved {
+                        self.add_transcript(TranscriptEntry::success(format!(
+                            "Configuration saved to {}", output_path
+                        )));
+                    } else {
+                        self.add_transcript(TranscriptEntry::info("Wizard cancelled".to_string()));
                     }
                     self.wizard = None;
                 }
@@ -1048,6 +1061,29 @@ impl App {
         )
     }
 
+    /// Try to load a config file if a path is provided.
+    /// Returns true if successful or if no path was provided.
+    /// Returns false if loading failed (error is added to transcript).
+    fn try_load_config(&mut self, file_path: Option<&str>) -> bool {
+        if let Some(path) = file_path.filter(|p| !p.is_empty()) {
+            match Config::load(path) {
+                Ok(new_config) => {
+                    self.config_path = PathBuf::from(path);
+                    self.config_summary = ConfigSummary::from_config(&new_config, &self.config_path);
+                    self.config = new_config;
+                    self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
+                    true
+                }
+                Err(e) => {
+                    self.add_transcript(TranscriptEntry::error(format!("Failed to load config: {}", e)));
+                    false
+                }
+            }
+        } else {
+            true // No path provided, use existing config
+        }
+    }
+
     /// Get elapsed time as Duration.
     pub fn elapsed(&self) -> Duration {
         match (self.started_at, self.completed_at) {
@@ -1222,30 +1258,14 @@ impl App {
             args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..])
         });
 
-        // For commands that use config files (not /wizard which uses it as output path),
-        // reload config if a file path is provided
-        let commands_that_load_config = ["/run", "/resume", "/dry-run", "/health", "/validate"];
-        if commands_that_load_config.contains(&cmd) {
-            if let Some(path) = file_path.filter(|p| !p.is_empty()) {
-                match Config::load(path) {
-                    Ok(new_config) => {
-                        self.config_path = PathBuf::from(path);
-                        self.config_summary = ConfigSummary::from_config(&new_config, &self.config_path);
-                        self.config = new_config;
-                        self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
-                    }
-                    Err(e) => {
-                        self.add_transcript(TranscriptEntry::error(format!("Failed to load config: {}", e)));
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
         match cmd {
             "/run" => {
                 if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                // Load config after validation passes
+                if !self.try_load_config(file_path) {
                     return Ok(());
                 }
                 self.add_transcript(TranscriptEntry::info("Starting migration..."));
@@ -1256,6 +1276,10 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Load config after validation passes
+                if !self.try_load_config(file_path) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Resuming migration..."));
                 self.spawn_migration(false, true).await;
             }
@@ -1264,13 +1288,25 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Load config after validation passes
+                if !self.try_load_config(file_path) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting dry run..."));
                 self.spawn_migration(true, false).await;
             }
             "/validate" => {
+                // Load config if provided (validation doesn't require can_start_migration check)
+                if !self.try_load_config(file_path) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Validation not yet implemented"));
             }
             "/health" => {
+                // Load config if provided (health check doesn't require can_start_migration check)
+                if !self.try_load_config(file_path) {
+                    return Ok(());
+                }
                 self.spawn_health_check().await;
             }
             "/wizard" => {
