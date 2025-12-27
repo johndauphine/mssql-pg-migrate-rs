@@ -380,6 +380,7 @@ impl TransferEngine {
             let write_columns_clone = write_columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
+            let row_hash_column = job.row_hash_column.clone();
 
             let handle = tokio::spawn(async move {
                 let mut local_write_time = Duration::ZERO;
@@ -399,6 +400,7 @@ impl TransferEngine {
                                     &pk_cols_clone,
                                     write_job.rows,
                                     writer_id,
+                                    Some(&row_hash_column),
                                 )
                                 .await
                         }
