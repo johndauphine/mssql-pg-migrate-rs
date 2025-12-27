@@ -1,5 +1,7 @@
 //! mssql-pg-migrate CLI - High-performance MSSQL to PostgreSQL migration.
 
+mod wizard;
+
 use clap::{Parser, Subcommand};
 use mssql_pg_migrate::{Config, MigrateError, Orchestrator};
 use std::path::PathBuf;
@@ -89,6 +91,21 @@ enum Commands {
 
     /// Test database connections
     HealthCheck,
+
+    /// Create or edit a configuration file interactively
+    Init {
+        /// Output path for configuration file [default: config.yaml]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Show advanced performance tuning options
+        #[arg(long)]
+        advanced: bool,
+
+        /// Force overwrite existing file without confirmation
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -105,6 +122,16 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), MigrateError> {
     let cli = Cli::parse();
 
+    // Handle init command separately (doesn't need existing config)
+    if let Commands::Init { output, advanced, force } = cli.command {
+        // No logging setup for wizard - keeps terminal clean for interactive prompts
+        let output_path = output.unwrap_or_else(|| PathBuf::from("config.yaml"));
+        wizard::run_wizard(&output_path, advanced, force)
+            .await
+            .map_err(|e| MigrateError::Config(e.to_string()))?;
+        return Ok(());
+    }
+
     // Setup logging
     setup_logging(&cli.verbosity, &cli.log_format)
         .map_err(|e| MigrateError::Config(e.to_string()))?;
@@ -118,6 +145,7 @@ async fn run() -> Result<(), MigrateError> {
     let cancel_token = setup_signal_handler(cli.shutdown_timeout).await?;
 
     match cli.command {
+        Commands::Init { .. } => unreachable!(), // Handled above
         Commands::Run {
             source_schema,
             target_schema,
