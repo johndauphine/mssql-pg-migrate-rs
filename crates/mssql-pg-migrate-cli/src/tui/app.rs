@@ -363,6 +363,9 @@ impl App {
 
             AppEvent::Error(msg) => {
                 self.add_error(msg);
+                // Reset phase so user can try again
+                self.phase = MigrationPhase::Idle;
+                self.cancel_token = None;
             }
 
             AppEvent::Cancel => {
@@ -380,7 +383,7 @@ impl App {
     async fn execute_action(&mut self, action: Action) -> Result<(), MigrateError> {
         match action {
             Action::RunMigration => {
-                if self.phase != MigrationPhase::Idle {
+                if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
@@ -388,7 +391,7 @@ impl App {
                 self.spawn_migration(false, false).await;
             }
             Action::DryRun => {
-                if self.phase != MigrationPhase::Idle {
+                if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
@@ -396,7 +399,7 @@ impl App {
                 self.spawn_migration(true, false).await;
             }
             Action::Resume => {
-                if self.phase != MigrationPhase::Idle {
+                if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
@@ -630,6 +633,17 @@ impl App {
     /// Add an error to transcript.
     pub fn add_error(&mut self, message: String) {
         self.add_transcript(TranscriptEntry::error(message));
+    }
+
+    /// Check if a new migration can be started.
+    fn can_start_migration(&self) -> bool {
+        matches!(
+            self.phase,
+            MigrationPhase::Idle
+                | MigrationPhase::Completed
+                | MigrationPhase::Failed
+                | MigrationPhase::Cancelled
+        )
     }
 
     /// Get elapsed time as Duration.
