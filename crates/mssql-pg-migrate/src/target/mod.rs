@@ -1767,6 +1767,13 @@ impl PgPool {
     /// Delete rows by composite primary key values.
     ///
     /// Used for sync operations to remove rows that exist in target but not source.
+    ///
+    /// # Query Size
+    ///
+    /// Deletes are batched in chunks of 500 rows to avoid exceeding database
+    /// query size limits. For composite PKs with many columns, the OR-based
+    /// WHERE clause can still become large. Consider reducing chunk size
+    /// for very wide composite PKs.
     pub async fn delete_rows_by_composite_pks(
         &self,
         schema: &str,
@@ -1855,8 +1862,15 @@ fn extract_pk_value_from_pg(row: &tokio_postgres::Row, idx: usize) -> PkValue {
     if let Ok(v) = row.try_get::<_, String>(idx) {
         return PkValue::String(v);
     }
-    // Default to empty string if nothing matched
-    PkValue::String(String::new())
+    // Panic instead of silently returning empty string - this indicates a data type
+    // issue that should be investigated rather than masked
+    let col = &row.columns()[idx];
+    panic!(
+        "Failed to extract primary key value from PostgreSQL row for column '{}' (type: {:?}) at index {}",
+        col.name(),
+        col.type_(),
+        idx,
+    );
 }
 
 impl PgPool {

@@ -153,7 +153,9 @@ pub fn postgres_pk_select(pk_columns: &[String]) -> String {
 /// Generate MSSQL query to partition table using NTILE for Tier 1.
 ///
 /// Returns partition_id and row_count for each partition.
-/// This is a one-time query to divide the table into N equal partitions.
+/// This is a one-time query to divide the table into N approximately equal partitions
+/// (some partitions may contain at most one more row than others when row count
+/// doesn't divide evenly).
 pub fn mssql_ntile_partition_query(
     schema: &str,
     table_name: &str,
@@ -180,6 +182,9 @@ ORDER BY partition_id"#,
 }
 
 /// Generate PostgreSQL query to partition table using NTILE for Tier 1.
+///
+/// Returns partition_id and row_count for each partition. NTILE divides into
+/// approximately equal partitions (some may have one more row than others).
 pub fn postgres_ntile_partition_query(
     schema: &str,
     table_name: &str,

@@ -6,6 +6,14 @@
 //! - UUID/GUID PKs
 //! - String PKs (VARCHAR, NVARCHAR)
 //! - Composite PKs (multiple columns)
+//!
+//! # Performance Notes
+//!
+//! ROW_NUMBER queries require sorting the entire table for each query, which can
+//! be expensive for very large tables. Ensure appropriate indexes exist on PK
+//! columns to optimize the ORDER BY. The NTILE approach mitigates this by only
+//! requiring one full-table scan at Tier 1; subsequent tiers only scan mismatched
+//! partitions.
 
 use crate::config::BatchVerifyConfig;
 use crate::error::Result;
@@ -513,6 +521,9 @@ impl UniversalVerifyEngine {
 
                 columns.push(self.row_hash_column.clone());
 
+                // Capture count before moving rows_with_hash
+                let expected_count = rows_with_hash.len();
+
                 // Upsert to target
                 let upserted = self
                     .target
@@ -529,6 +540,13 @@ impl UniversalVerifyEngine {
 
                 stats.rows_inserted = diff.missing_in_target.len() as i64;
                 stats.rows_updated = diff.hash_mismatches.len() as i64;
+
+                if upserted as usize != expected_count {
+                    warn!(
+                        "Upserted {} rows but expected {} for {}.{}",
+                        upserted, expected_count, target_schema, table.name
+                    );
+                }
 
                 info!(
                     "Upserted {} rows to {}.{}",

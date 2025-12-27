@@ -1051,6 +1051,13 @@ impl MssqlPool {
     /// Fetch specific rows by composite primary key values for sync operations.
     ///
     /// Returns rows with all columns for the specified composite PKs.
+    ///
+    /// # Query Size
+    ///
+    /// Fetches are batched in chunks of 500 rows to avoid exceeding database
+    /// query size limits. For composite PKs with many columns, the OR-based
+    /// WHERE clause can still become large. Consider reducing chunk size
+    /// for very wide composite PKs.
     pub async fn fetch_rows_by_composite_pks(
         &self,
         table: &Table,
@@ -1143,8 +1150,12 @@ fn extract_pk_value(row: &Row, idx: usize) -> PkValue {
     if let Some(v) = row.get::<&str, _>(idx) {
         return PkValue::String(v.to_string());
     }
-    // Default to empty string if nothing matched
-    PkValue::String(String::new())
+    // Panic instead of silently returning empty string - this indicates a data type
+    // issue that should be investigated rather than masked
+    panic!(
+        "Failed to extract primary key value from MSSQL row at index {} - unsupported type",
+        idx
+    );
 }
 
 /// Convert a row value to SqlValue based on the column type.

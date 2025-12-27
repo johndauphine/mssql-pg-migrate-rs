@@ -34,6 +34,7 @@ impl CompositePk {
     }
 
     /// Check if the PK is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -51,7 +52,9 @@ impl CompositePk {
 
 impl Hash for CompositePk {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Include type discriminator to distinguish Int(1) from String("1")
+        // Include type discriminator to distinguish Int(1) from String("1").
+        // NOTE: If PkValue is extended with new variants, update these discriminators
+        // and ensure they remain unique (0=Int, 1=Uuid, 2=String, 3+=future).
         for pk in &self.0 {
             match pk {
                 PkValue::Int(v) => {
