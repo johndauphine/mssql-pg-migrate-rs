@@ -756,15 +756,15 @@ impl MssqlPool {
         Ok(())
     }
 
-    /// Execute a batch hash query and return (hash, row_count).
+    /// Execute a count query and return row_count.
     ///
-    /// Used for Tier 1/2 verification to compare aggregate checksums.
-    pub async fn execute_batch_hash(
+    /// Used for Tier 1/2 quick verification.
+    pub async fn execute_count_query(
         &self,
         query: &str,
         min_pk: i64,
         max_pk: i64,
-    ) -> Result<(i64, i64)> {
+    ) -> Result<i64> {
         let mut client = self.get_client().await?;
 
         let mut q = Query::new(query);
@@ -774,11 +774,10 @@ impl MssqlPool {
         let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
 
         if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
-            let batch_hash: i32 = row.get::<i32, _>(0).unwrap_or(0);
-            let row_count: i32 = row.get::<i32, _>(1).unwrap_or(0);
-            Ok((batch_hash as i64, row_count as i64))
+            let row_count: i32 = row.get::<i32, _>(0).unwrap_or(0);
+            Ok(row_count as i64)
         } else {
-            Ok((0, 0))
+            Ok(0)
         }
     }
 
@@ -890,6 +889,42 @@ impl MssqlPool {
         }
 
         Ok(all_rows)
+    }
+
+    /// Fetch rows for a PK range (for Rust-side hashing).
+    ///
+    /// Returns rows with all columns for the specified PK range, ordered by PK.
+    /// Used by verify module to compute hashes in Rust instead of SQL.
+    pub async fn fetch_rows_for_range(
+        &self,
+        table: &Table,
+        pk_column: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query = format!(
+            "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] >= {} AND [{}] < {} ORDER BY [{}]",
+            col_list,
+            table.schema.replace(']', "]]"),
+            table.name.replace(']', "]]"),
+            pk_column.replace(']', "]]"),
+            min_pk,
+            pk_column.replace(']', "]]"),
+            max_pk,
+            pk_column.replace(']', "]]")
+        );
+
+        self.query_rows_fast(&query, &columns, &col_types).await
     }
 }
 

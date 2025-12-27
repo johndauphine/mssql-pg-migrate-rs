@@ -1,217 +1,112 @@
-//! SQL query generation for batch hash comparison.
+//! SQL query generation for batch verification.
 //!
-//! This module generates aggregate hash queries for both MSSQL and PostgreSQL
-//! that produce comparable results for the same data.
+//! This module generates queries for efficient multi-tier verification:
+//! - Tier 1/2: Count queries for quick mismatch detection
+//! - Tier 3: Row hash queries for detailed comparison
 //!
-//! ## MSSQL Strategy
-//! Uses `CHECKSUM_AGG(BINARY_CHECKSUM(...))` for fast 32-bit aggregate hashing.
-//! This has collision risk but is acceptable for Tier 1/2 coarse verification.
-//!
-//! ## PostgreSQL Strategy
-//! Uses `SUM(('x' || SUBSTR(MD5(...), 1, 8))::BIT(32)::INTEGER)` to produce
-//! a comparable aggregate hash.
+//! MSSQL computes hashes server-side using HASHBYTES to match Rust's format.
+//! PostgreSQL uses the existing row_hash column computed during migration.
 
 use crate::source::Table;
-use super::normalize::{mssql_normalize_expr, postgres_normalize_expr, mssql_column_separator, postgres_column_separator};
+use super::normalize::mssql_row_hash_expr;
 
-/// Generate MSSQL batch hash query for a PK range.
+/// Generate MSSQL query to get row count for a PK range.
 ///
-/// Returns a query that computes:
-/// - `batch_hash`: CHECKSUM_AGG of all rows in the range
-/// - `row_count`: Number of rows in the range
-///
-/// # Arguments
-/// * `schema` - Schema name
-/// * `table` - Table metadata with columns and primary key info
-/// * `pk_column` - Name of the primary key column (must be single integer PK)
-pub fn mssql_batch_hash_query(
-    schema: &str,
-    table: &Table,
-    pk_column: &str,
-) -> String {
-    // Build normalized column expressions for non-PK columns
-    let column_exprs: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|c| !table.primary_key.contains(&c.name))
-        .map(mssql_normalize_expr)
-        .collect();
-
-    let columns_sql = column_exprs.join(mssql_column_separator());
-
-    // Build the query with parameterized PK range (tiberius uses @P1, @P2 for parameters)
+/// Used for Tier 1/2 quick verification.
+pub fn mssql_count_query(schema: &str, table_name: &str, pk_column: &str) -> String {
     format!(
-        r#"SELECT
-    ISNULL(CHECKSUM_AGG(BINARY_CHECKSUM({columns_sql})), 0) AS batch_hash,
-    COUNT(*) AS row_count
+        r#"SELECT COUNT(*) AS row_count
 FROM [{schema}].[{table_name}] WITH (NOLOCK)
 WHERE [{pk_column}] >= @P1 AND [{pk_column}] < @P2"#,
-        columns_sql = columns_sql,
-        schema = schema,
-        table_name = table.name,
-        pk_column = pk_column,
+        schema = schema.replace(']', "]]"),
+        table_name = table_name.replace(']', "]]"),
+        pk_column = pk_column.replace(']', "]]"),
     )
 }
 
-/// Generate PostgreSQL batch hash query for a PK range.
+/// Generate PostgreSQL query to get row count for a PK range.
 ///
-/// Returns a query that computes:
-/// - `batch_hash`: Aggregate hash comparable to MSSQL CHECKSUM_AGG
-/// - `row_count`: Number of rows in the range
-///
-/// # Arguments
-/// * `schema` - Schema name
-/// * `table` - Table metadata with columns and primary key info
-/// * `pk_column` - Name of the primary key column (must be single integer PK)
-pub fn postgres_batch_hash_query(
-    schema: &str,
-    table: &Table,
-    pk_column: &str,
-) -> String {
-    // Build normalized column expressions for non-PK columns
-    let column_exprs: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|c| !table.primary_key.contains(&c.name))
-        .map(postgres_normalize_expr)
-        .collect();
-
-    let columns_sql = column_exprs.join(postgres_column_separator());
-
-    // Use MD5 and convert to BIGINT for aggregation
-    // Take first 8 hex chars (32 bits) and sum them as BIGINT to avoid overflow
-    // This won't produce identical results to MSSQL CHECKSUM_AGG but will be
-    // deterministic for comparison purposes
-    // Cast PK column to BIGINT for comparison to work with any integer type
+/// Used for Tier 1/2 quick verification.
+pub fn postgres_count_query(schema: &str, table_name: &str, pk_column: &str) -> String {
     format!(
-        r#"SELECT
-    COALESCE(SUM(
-        ('x' || SUBSTR(MD5({columns_sql}), 1, 8))::BIT(32)::BIGINT
-    ), 0)::BIGINT AS batch_hash,
-    COUNT(*)::BIGINT AS row_count
+        r#"SELECT COUNT(*) AS row_count
 FROM "{schema}"."{table_name}"
 WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2"#,
-        columns_sql = columns_sql,
-        schema = schema,
-        table_name = table.name,
-        pk_column = pk_column,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+        pk_column = pk_column.replace('"', "\"\""),
     )
 }
 
-/// Generate MSSQL query to fetch row hashes for Tier 3 comparison.
+/// Generate MSSQL query to fetch (pk, row_hash) pairs for a PK range.
 ///
-/// Returns (pk, row_hash) pairs for all rows in the PK range.
-pub fn mssql_row_hashes_query(
-    schema: &str,
-    table: &Table,
-    pk_column: &str,
-) -> String {
-    // Build normalized column expressions for non-PK columns
-    let column_exprs: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|c| !table.primary_key.contains(&c.name))
-        .map(mssql_normalize_expr)
-        .collect();
+/// Computes hashes server-side using HASHBYTES('MD5', ...) to match Rust's format.
+/// Used for Tier 3 row-level comparison.
+pub fn mssql_row_hashes_query(schema: &str, table: &Table, pk_column: &str) -> String {
+    let pk_columns: Vec<String> = table.primary_key.clone();
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, &pk_columns);
 
-    let columns_sql = column_exprs.join(" + N'|' + ");
-
-    // Use HASHBYTES with MD5 for row-level hashes (tiberius uses @P1, @P2 for parameters)
     format!(
-        r#"SELECT
-    [{pk_column}] AS pk,
-    LOWER(CONVERT(NVARCHAR(32), HASHBYTES('MD5', {columns_sql}), 2)) AS row_hash
+        r#"SELECT [{pk_column}], {row_hash_expr} AS row_hash
 FROM [{schema}].[{table_name}] WITH (NOLOCK)
 WHERE [{pk_column}] >= @P1 AND [{pk_column}] < @P2
 ORDER BY [{pk_column}]"#,
-        pk_column = pk_column,
-        columns_sql = columns_sql,
-        schema = schema,
-        table_name = table.name,
+        pk_column = pk_column.replace(']', "]]"),
+        row_hash_expr = row_hash_expr,
+        schema = schema.replace(']', "]]"),
+        table_name = table.name.replace(']', "]]"),
     )
 }
 
-/// Generate PostgreSQL query to fetch row hashes for Tier 3 comparison.
+/// Generate PostgreSQL query to fetch (pk, row_hash) pairs for a PK range.
 ///
-/// Returns (pk, row_hash) pairs for all rows in the PK range.
-/// This uses the existing row_hash column if available, otherwise computes MD5.
+/// Uses the existing row_hash column computed during migration.
+/// Used for Tier 3 row-level comparison.
 pub fn postgres_row_hashes_query(
     schema: &str,
     table_name: &str,
     pk_column: &str,
-    row_hash_column: Option<&str>,
+    row_hash_column: &str,
 ) -> String {
-    match row_hash_column {
-        Some(hash_col) => {
-            // Use existing row_hash column
-            // Cast PK column to BIGINT for comparison to work with any integer type
-            format!(
-                r#"SELECT
-    "{pk_column}"::BIGINT AS pk,
-    "{hash_col}" AS row_hash
+    format!(
+        r#"SELECT "{pk_column}"::BIGINT, "{row_hash_column}"
 FROM "{schema}"."{table_name}"
 WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2
 ORDER BY "{pk_column}""#,
-                pk_column = pk_column,
-                hash_col = hash_col,
-                schema = schema,
-                table_name = table_name,
-            )
-        }
-        None => {
-            // Compute hash on the fly (slower but works without row_hash column)
-            // Note: This would need the full column list - for now, require row_hash column
-            // Cast PK column to BIGINT for comparison to work with any integer type
-            format!(
-                r#"SELECT
-    "{pk_column}"::BIGINT AS pk,
-    NULL::TEXT AS row_hash
-FROM "{schema}"."{table_name}"
-WHERE "{pk_column}"::BIGINT >= $1 AND "{pk_column}"::BIGINT < $2
-ORDER BY "{pk_column}""#,
-                pk_column = pk_column,
-                schema = schema,
-                table_name = table_name,
-            )
-        }
-    }
+        pk_column = pk_column.replace('"', "\"\""),
+        row_hash_column = row_hash_column.replace('"', "\"\""),
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
 }
 
 /// Generate MSSQL query to get PK boundaries for range splitting.
 ///
 /// Returns min_pk, max_pk, and row_count for the table.
-pub fn mssql_pk_bounds_query(
-    schema: &str,
-    table_name: &str,
-    pk_column: &str,
-) -> String {
+pub fn mssql_pk_bounds_query(schema: &str, table_name: &str, pk_column: &str) -> String {
     format!(
         r#"SELECT
     CAST(MIN([{pk_column}]) AS BIGINT) AS min_pk,
     CAST(MAX([{pk_column}]) AS BIGINT) AS max_pk,
     CAST(COUNT(*) AS BIGINT) AS row_count
 FROM [{schema}].[{table_name}] WITH (NOLOCK)"#,
-        pk_column = pk_column,
-        schema = schema,
-        table_name = table_name,
+        pk_column = pk_column.replace(']', "]]"),
+        schema = schema.replace(']', "]]"),
+        table_name = table_name.replace(']', "]]"),
     )
 }
 
 /// Generate PostgreSQL query to get PK boundaries for range splitting.
-pub fn postgres_pk_bounds_query(
-    schema: &str,
-    table_name: &str,
-    pk_column: &str,
-) -> String {
+pub fn postgres_pk_bounds_query(schema: &str, table_name: &str, pk_column: &str) -> String {
     format!(
         r#"SELECT
     MIN("{pk_column}")::BIGINT AS min_pk,
     MAX("{pk_column}")::BIGINT AS max_pk,
     COUNT(*)::BIGINT AS row_count
 FROM "{schema}"."{table_name}""#,
-        pk_column = pk_column,
-        schema = schema,
-        table_name = table_name,
+        pk_column = pk_column.replace('"', "\"\""),
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
     )
 }
 
@@ -269,48 +164,41 @@ mod tests {
     }
 
     #[test]
-    fn test_mssql_batch_hash_query_structure() {
-        let table = make_test_table();
-        let query = mssql_batch_hash_query("dbo", &table, "id");
-
-        assert!(query.contains("CHECKSUM_AGG"));
-        assert!(query.contains("BINARY_CHECKSUM"));
-        assert!(query.contains("batch_hash"));
-        assert!(query.contains("row_count"));
+    fn test_mssql_count_query() {
+        let query = mssql_count_query("dbo", "users", "id");
+        assert!(query.contains("COUNT(*)"));
         assert!(query.contains("@P1"));
         assert!(query.contains("@P2"));
-        assert!(!query.contains("[id],")); // PK should be excluded from hash
     }
 
     #[test]
-    fn test_postgres_batch_hash_query_structure() {
-        let table = make_test_table();
-        let query = postgres_batch_hash_query("public", &table, "id");
-
-        assert!(query.contains("MD5"));
-        assert!(query.contains("SUM"));
-        assert!(query.contains("batch_hash"));
-        assert!(query.contains("row_count"));
+    fn test_postgres_count_query() {
+        let query = postgres_count_query("public", "users", "id");
+        assert!(query.contains("COUNT(*)"));
         assert!(query.contains("$1"));
         assert!(query.contains("$2"));
+        assert!(query.contains("::BIGINT"));
     }
 
     #[test]
-    fn test_mssql_row_hashes_query_structure() {
+    fn test_mssql_row_hashes_query() {
         let table = make_test_table();
         let query = mssql_row_hashes_query("dbo", &table, "id");
 
         assert!(query.contains("HASHBYTES"));
         assert!(query.contains("MD5"));
-        assert!(query.contains("row_hash"));
+        assert!(query.contains("[name]"));
+        assert!(query.contains("[created_at]"));
         assert!(query.contains("ORDER BY"));
     }
 
     #[test]
-    fn test_postgres_row_hashes_with_column() {
-        let query = postgres_row_hashes_query("public", "users", "id", Some("row_hash"));
+    fn test_postgres_row_hashes_query() {
+        let query = postgres_row_hashes_query("public", "users", "id", "row_hash");
 
-        assert!(query.contains("row_hash"));
+        assert!(query.contains("\"row_hash\""));
+        assert!(query.contains("$1"));
+        assert!(query.contains("$2"));
         assert!(query.contains("ORDER BY"));
     }
 
@@ -321,7 +209,9 @@ mod tests {
 
         assert!(mssql_query.contains("MIN"));
         assert!(mssql_query.contains("MAX"));
+        assert!(mssql_query.contains("BIGINT"));
         assert!(pg_query.contains("MIN"));
         assert!(pg_query.contains("MAX"));
+        assert!(pg_query.contains("BIGINT"));
     }
 }
