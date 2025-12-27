@@ -368,6 +368,10 @@ impl App {
                 self.cancel_token = None;
             }
 
+            AppEvent::Success(msg) => {
+                self.add_transcript(TranscriptEntry::success(msg));
+            }
+
             AppEvent::Cancel => {
                 if let Some(token) = &self.cancel_token {
                     token.cancel();
@@ -500,7 +504,7 @@ impl App {
                                     "Health check passed (source: {}ms, target: {}ms)",
                                     result.source_latency_ms, result.target_latency_ms
                                 );
-                                let _ = event_tx.send(AppEvent::Log(msg)).await;
+                                let _ = event_tx.send(AppEvent::Success(msg)).await;
                             } else {
                                 let msg = format!(
                                     "Health check failed: source={}, target={}",

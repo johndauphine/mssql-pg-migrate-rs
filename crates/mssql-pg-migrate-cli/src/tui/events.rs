@@ -63,6 +63,9 @@ pub enum AppEvent {
     /// Error occurred.
     Error(String),
 
+    /// Success message for transcript.
+    Success(String),
+
     /// Cancel current operation.
     Cancel,
 }
