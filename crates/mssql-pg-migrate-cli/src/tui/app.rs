@@ -551,6 +551,15 @@ impl App {
 
     /// Handle a progress update from the orchestrator.
     fn handle_progress(&mut self, update: ProgressUpdate) {
+        // Don't update phase if already in terminal state (handles race condition
+        // where progress events arrive after MigrationComplete)
+        if matches!(
+            self.phase,
+            MigrationPhase::Completed | MigrationPhase::Failed | MigrationPhase::Cancelled
+        ) {
+            return;
+        }
+
         // Update phase
         self.phase = match update.phase.as_str() {
             "extracting_schema" => MigrationPhase::ExtractingSchema,
@@ -592,24 +601,36 @@ impl App {
 
     /// Handle migration completion.
     fn handle_migration_complete(&mut self, result: MigrationResult) {
-        if result.status == "completed" {
-            self.phase = MigrationPhase::Completed;
-            self.add_transcript(TranscriptEntry::success(format!(
-                "Migration completed: {} rows in {:.1}s ({} rows/sec)",
-                result.rows_transferred,
-                result.duration_seconds,
-                result.rows_per_second
-            )));
-        } else if result.status == "cancelled" {
-            self.phase = MigrationPhase::Cancelled;
-            self.add_transcript(TranscriptEntry::info("Migration cancelled"));
-        } else {
-            self.phase = MigrationPhase::Failed;
-            let error_msg = result.error.clone().unwrap_or_else(|| "Unknown error".to_string());
-            self.add_transcript(TranscriptEntry::error(format!(
-                "Migration failed: {}",
-                error_msg
-            )));
+        match result.status.as_str() {
+            "completed" => {
+                self.phase = MigrationPhase::Completed;
+                self.add_transcript(TranscriptEntry::success(format!(
+                    "Migration completed: {} rows in {:.1}s ({} rows/sec)",
+                    result.rows_transferred,
+                    result.duration_seconds,
+                    result.rows_per_second
+                )));
+            }
+            "dry_run" => {
+                self.phase = MigrationPhase::Completed;
+                self.add_transcript(TranscriptEntry::success(format!(
+                    "Dry run completed: {} tables, {} rows would be transferred",
+                    result.tables_total,
+                    result.rows_transferred
+                )));
+            }
+            "cancelled" => {
+                self.phase = MigrationPhase::Cancelled;
+                self.add_transcript(TranscriptEntry::info("Migration cancelled"));
+            }
+            "failed" | _ => {
+                self.phase = MigrationPhase::Failed;
+                let error_msg = result.error.clone().unwrap_or_else(|| "Unknown error".to_string());
+                self.add_transcript(TranscriptEntry::error(format!(
+                    "Migration failed: {}",
+                    error_msg
+                )));
+            }
         }
         self.last_result = Some(result);
         self.cancel_token = None;
