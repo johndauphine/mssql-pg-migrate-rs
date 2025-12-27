@@ -605,6 +605,12 @@ impl App {
 
     /// Handle migration completion.
     fn handle_migration_complete(&mut self, result: MigrationResult) {
+        // Update final stats from result
+        self.tables_completed = result.tables_success;
+        self.tables_total = result.tables_total;
+        self.rows_transferred = result.rows_transferred;
+        self.rows_per_second = result.rows_per_second;
+
         match result.status.as_str() {
             "completed" => {
                 self.phase = MigrationPhase::Completed;
