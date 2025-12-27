@@ -105,6 +105,10 @@ enum Commands {
         /// Tier 2 (fine) batch size in rows (default: 10000)
         #[arg(long, default_value = "10000")]
         tier2_size: i64,
+
+        /// Use universal engine (supports any PK type: int, uuid, string, composite)
+        #[arg(long)]
+        universal: bool,
     },
 
     /// Test database connections
@@ -301,8 +305,9 @@ async fn run() -> Result<(), MigrateError> {
             sync,
             tier1_size,
             tier2_size,
+            universal,
         } => {
-            use mssql_pg_migrate::{BatchVerifyConfig, VerifyEngine};
+            use mssql_pg_migrate::{BatchVerifyConfig, UniversalVerifyEngine, VerifyEngine};
 
             let orchestrator = Orchestrator::new(config.clone()).await?;
 
@@ -322,52 +327,59 @@ async fn run() -> Result<(), MigrateError> {
             let source = orchestrator.source_pool();
             let target = orchestrator.target_pool();
 
-            let engine = VerifyEngine::new(
-                source,
-                target,
-                verify_config,
-                config.migration.row_hash_column.clone(),
+            let engine_type = if universal { "universal" } else { "legacy" };
+            println!(
+                "Starting multi-tier verification ({} engine){}...\n",
+                engine_type,
+                if sync { " with auto-sync" } else { "" }
             );
-
-            println!("Starting multi-tier verification{}...\n", if sync { " with auto-sync" } else { "" });
 
             let mut total_result = mssql_pg_migrate::VerifyResult::new();
             let start = std::time::Instant::now();
 
-            for table in &tables {
-                match engine
-                    .verify_table(table, source_schema, target_schema, sync)
-                    .await
-                {
-                    Ok(result) => {
-                        let status = if result.skipped {
-                            "⊘ Skipped"
-                        } else if result.is_in_sync() {
-                            "✓ In sync"
-                        } else {
-                            "✗ Differs"
-                        };
-                        if result.skipped {
-                            println!(
-                                "  {} {} ({})",
-                                status,
-                                result.table_name,
-                                result.skip_reason.as_deref().unwrap_or("unknown reason")
-                            );
-                        } else {
-                            println!(
-                                "  {} {} (insert: {}, update: {}, delete: {})",
-                                status,
-                                result.table_name,
-                                result.rows_to_insert,
-                                result.rows_to_update,
-                                result.rows_to_delete
-                            );
+            // Use either legacy or universal engine based on flag
+            if universal {
+                let engine = UniversalVerifyEngine::new(
+                    source,
+                    target,
+                    verify_config,
+                    config.migration.row_hash_column.clone(),
+                );
+
+                for table in &tables {
+                    match engine
+                        .verify_table(table, source_schema, target_schema, sync)
+                        .await
+                    {
+                        Ok(result) => {
+                            print_verify_result(&result);
+                            total_result.add_table(result);
                         }
-                        total_result.add_table(result);
+                        Err(e) => {
+                            println!("  ✗ Error verifying {}: {}", table.name, e);
+                        }
                     }
-                    Err(e) => {
-                        println!("  ✗ Error verifying {}: {}", table.name, e);
+                }
+            } else {
+                let engine = VerifyEngine::new(
+                    source,
+                    target,
+                    verify_config,
+                    config.migration.row_hash_column.clone(),
+                );
+
+                for table in &tables {
+                    match engine
+                        .verify_table(table, source_schema, target_schema, sync)
+                        .await
+                    {
+                        Ok(result) => {
+                            print_verify_result(&result);
+                            total_result.add_table(result);
+                        }
+                        Err(e) => {
+                            println!("  ✗ Error verifying {}: {}", table.name, e);
+                        }
                     }
                 }
             }
@@ -454,6 +466,34 @@ fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Print verification result for a single table.
+fn print_verify_result(result: &mssql_pg_migrate::TableVerifyResult) {
+    let status = if result.skipped {
+        "⊘ Skipped"
+    } else if result.is_in_sync() {
+        "✓ In sync"
+    } else {
+        "✗ Differs"
+    };
+    if result.skipped {
+        println!(
+            "  {} {} ({})",
+            status,
+            result.table_name,
+            result.skip_reason.as_deref().unwrap_or("unknown reason")
+        );
+    } else {
+        println!(
+            "  {} {} (insert: {}, update: {}, delete: {})",
+            status,
+            result.table_name,
+            result.rows_to_insert,
+            result.rows_to_update,
+            result.rows_to_delete
+        );
+    }
 }
 
 /// Setup signal handlers for graceful shutdown.

@@ -1686,8 +1686,13 @@ impl PgPool {
 
         let mut partitions = Vec::new();
         for row in rows {
-            let partition_id: i64 = row.get(0);
-            let row_count: i64 = row.get(1);
+            // NTILE returns int4, COUNT returns int8
+            let partition_id: i64 = row.try_get::<_, i64>(0)
+                .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
+                .unwrap_or(0);
+            let row_count: i64 = row.try_get::<_, i64>(1)
+                .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
+                .unwrap_or(0);
             partitions.push((partition_id, row_count));
         }
 
