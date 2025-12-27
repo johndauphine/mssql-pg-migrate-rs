@@ -322,6 +322,14 @@ async fn run() -> Result<(), MigrateError> {
             let source = orchestrator.source_pool();
             let target = orchestrator.target_pool();
 
+            println!(
+                "Starting multi-tier verification{}...\n",
+                if sync { " with auto-sync" } else { "" }
+            );
+
+            let mut total_result = mssql_pg_migrate::VerifyResult::new();
+            let start = std::time::Instant::now();
+
             let engine = VerifyEngine::new(
                 source,
                 target,
@@ -329,41 +337,13 @@ async fn run() -> Result<(), MigrateError> {
                 config.migration.row_hash_column.clone(),
             );
 
-            println!("Starting multi-tier verification{}...\n", if sync { " with auto-sync" } else { "" });
-
-            let mut total_result = mssql_pg_migrate::VerifyResult::new();
-            let start = std::time::Instant::now();
-
             for table in &tables {
                 match engine
                     .verify_table(table, source_schema, target_schema, sync)
                     .await
                 {
                     Ok(result) => {
-                        let status = if result.skipped {
-                            "⊘ Skipped"
-                        } else if result.is_in_sync() {
-                            "✓ In sync"
-                        } else {
-                            "✗ Differs"
-                        };
-                        if result.skipped {
-                            println!(
-                                "  {} {} ({})",
-                                status,
-                                result.table_name,
-                                result.skip_reason.as_deref().unwrap_or("unknown reason")
-                            );
-                        } else {
-                            println!(
-                                "  {} {} (insert: {}, update: {}, delete: {})",
-                                status,
-                                result.table_name,
-                                result.rows_to_insert,
-                                result.rows_to_update,
-                                result.rows_to_delete
-                            );
-                        }
+                        print_verify_result(&result);
                         total_result.add_table(result);
                     }
                     Err(e) => {
@@ -454,6 +434,34 @@ fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Print verification result for a single table.
+fn print_verify_result(result: &mssql_pg_migrate::TableVerifyResult) {
+    let status = if result.skipped {
+        "⊘ Skipped"
+    } else if result.is_in_sync() {
+        "✓ In sync"
+    } else {
+        "✗ Differs"
+    };
+    if result.skipped {
+        println!(
+            "  {} {} ({})",
+            status,
+            result.table_name,
+            result.skip_reason.as_deref().unwrap_or("unknown reason")
+        );
+    } else {
+        println!(
+            "  {} {} (insert: {}, update: {}, delete: {})",
+            status,
+            result.table_name,
+            result.rows_to_insert,
+            result.rows_to_update,
+            result.rows_to_delete
+        );
+    }
 }
 
 /// Setup signal handlers for graceful shutdown.
