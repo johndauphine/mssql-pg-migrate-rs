@@ -736,8 +736,6 @@ fn render_wizard(frame: &mut Frame, app: &App) {
             Span::raw(" Select "),
             Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
             Span::raw(" Confirm "),
-            Span::styled(" Bksp ", Style::default().bg(Color::DarkGray)),
-            Span::raw(" Back "),
             Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
             Span::raw(" Cancel "),
         ]));
@@ -745,7 +743,7 @@ fn render_wizard(frame: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
             Span::raw(" Submit "),
-            Span::styled(" Bksp ", Style::default().bg(Color::DarkGray)),
+            Span::styled(" ↑ ", Style::default().bg(Color::DarkGray)),
             Span::raw(" Back "),
             Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
             Span::raw(" Cancel "),
