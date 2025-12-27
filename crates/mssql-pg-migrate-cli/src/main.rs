@@ -306,7 +306,7 @@ async fn run() -> Result<(), MigrateError> {
 
             let orchestrator = Orchestrator::new(config.clone()).await?;
 
-            // Extract schema from source
+            // Extract schema from source (already filtered by orchestrator.extract_schema())
             let source_schema = &config.source.schema;
             let target_schema = &config.target.schema;
             let tables = orchestrator.extract_schema().await?;
