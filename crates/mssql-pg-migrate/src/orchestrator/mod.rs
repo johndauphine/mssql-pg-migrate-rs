@@ -607,12 +607,11 @@ impl Orchestrator {
         match self.config.migration.target_mode {
             TargetMode::DropRecreate => {
                 // Drop and recreate all tables
-                for table in tables {
+                for (i, table) in tables.iter().enumerate() {
                     let table_name = table.full_name();
-                    debug!("Dropping table: {}", table_name);
+                    info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
                     self.target.drop_table(target_schema, &table.name).await?;
 
-                    debug!("Creating table: {}", table_name);
                     // Use UNLOGGED for faster inserts if configured (tables stay UNLOGGED)
                     if self.config.migration.use_unlogged_tables {
                         self.target
@@ -624,12 +623,12 @@ impl Orchestrator {
                 }
             }
             TargetMode::Truncate => {
-                for table in tables {
+                for (i, table) in tables.iter().enumerate() {
                     let table_name = table.full_name();
+                    info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
 
                     // Create if not exists, truncate if exists
                     if self.target.table_exists(target_schema, &table.name).await? {
-                        debug!("Truncating table: {}", table_name);
                         self.target
                             .truncate_table(target_schema, &table.name)
                             .await?;
@@ -640,7 +639,6 @@ impl Orchestrator {
                                 .await?;
                         }
                     } else {
-                        debug!("Creating table: {}", table_name);
                         if self.config.migration.use_unlogged_tables {
                             self.target
                                 .create_table_unlogged(table, target_schema)
@@ -669,8 +667,9 @@ impl Orchestrator {
                     );
                 }
 
-                for table in tables {
+                for (i, table) in tables.iter().enumerate() {
                     let table_name = table.full_name();
+                    info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
 
                     // Check for primary key (required for upsert)
                     if table.primary_key.is_empty() {
@@ -678,7 +677,6 @@ impl Orchestrator {
                     }
 
                     if !self.target.table_exists(target_schema, &table.name).await? {
-                        debug!("Creating table for upsert: {}", table_name);
                         if use_hash_detection {
                             // Create table with row_hash column for change detection
                             self.target
