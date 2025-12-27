@@ -221,6 +221,84 @@ pub fn calculate_row_hash(row: &[SqlValue], pk_indices: &[usize]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Convert a PostgreSQL row value to SqlValue.
+///
+/// Used by fetch_rows_for_range to convert query results to a consistent type.
+fn convert_pg_value(row: &tokio_postgres::Row, idx: usize) -> SqlValue {
+    // Try each type in order of likelihood
+    // Note: PostgreSQL doesn't have column type info in Row without metadata,
+    // so we try types in a reasonable order
+
+    // Integers
+    if let Ok(v) = row.try_get::<_, i64>(idx) {
+        return SqlValue::I64(v);
+    }
+    if let Ok(v) = row.try_get::<_, i32>(idx) {
+        return SqlValue::I32(v);
+    }
+    if let Ok(v) = row.try_get::<_, i16>(idx) {
+        return SqlValue::I16(v);
+    }
+
+    // String
+    if let Ok(v) = row.try_get::<_, String>(idx) {
+        return SqlValue::String(v);
+    }
+
+    // Boolean
+    if let Ok(v) = row.try_get::<_, bool>(idx) {
+        return SqlValue::Bool(v);
+    }
+
+    // Floats
+    if let Ok(v) = row.try_get::<_, f64>(idx) {
+        return SqlValue::F64(v);
+    }
+    if let Ok(v) = row.try_get::<_, f32>(idx) {
+        return SqlValue::F32(v);
+    }
+
+    // UUID
+    if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
+        return SqlValue::Uuid(v);
+    }
+
+    // Decimal
+    if let Ok(v) = row.try_get::<_, rust_decimal::Decimal>(idx) {
+        return SqlValue::Decimal(v);
+    }
+
+    // Date/Time types
+    if let Ok(v) = row.try_get::<_, chrono::NaiveDateTime>(idx) {
+        return SqlValue::DateTime(v);
+    }
+    if let Ok(v) = row.try_get::<_, chrono::NaiveDate>(idx) {
+        return SqlValue::Date(v);
+    }
+    if let Ok(v) = row.try_get::<_, chrono::NaiveTime>(idx) {
+        return SqlValue::Time(v);
+    }
+    if let Ok(v) = row.try_get::<_, chrono::DateTime<chrono::FixedOffset>>(idx) {
+        return SqlValue::DateTimeOffset(v);
+    }
+
+    // Binary
+    if let Ok(v) = row.try_get::<_, Vec<u8>>(idx) {
+        return SqlValue::Bytes(v);
+    }
+
+    // Check for NULL - try to get as Option<String> which works for most types
+    if let Ok(None) = row.try_get::<_, Option<String>>(idx) {
+        return SqlValue::Null(SqlNullType::String);
+    }
+    if let Ok(None) = row.try_get::<_, Option<i64>>(idx) {
+        return SqlValue::Null(SqlNullType::I64);
+    }
+
+    // Default to null if we can't determine the type
+    SqlValue::Null(SqlNullType::String)
+}
+
 /// Certificate verifier that accepts any certificate.
 /// Used for ssl_mode=require which needs TLS but doesn't verify certificates.
 #[derive(Debug)]
@@ -1377,6 +1455,194 @@ impl PgPool {
             .map_err(|e| MigrateError::pool(e, "testing PostgreSQL connection"))?;
         client.simple_query("SELECT 1").await?;
         Ok(())
+    }
+}
+
+// Batch verification methods
+impl PgPool {
+    /// Execute a count query and return row_count.
+    ///
+    /// Used for Tier 1/2 quick verification.
+    pub async fn execute_count_query(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "executing count query"))?;
+
+        let row = client
+            .query_one(query, &[&min_pk, &max_pk])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let row_count: i64 = row.get(0);
+
+        Ok(row_count)
+    }
+
+    /// Fetch row hashes for a PK range (Tier 3 verification).
+    ///
+    /// Returns a map of PK -> MD5 hash for comparison with source.
+    pub async fn fetch_row_hashes_for_verify(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "fetching row hashes"))?;
+
+        let rows = client
+            .query(query, &[&min_pk, &max_pk])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        for row in rows {
+            let pk: i64 = row.get(0);
+            let hash: Option<String> = row.get(1);
+            if let Some(h) = hash {
+                hashes.insert(pk, h);
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Get PK boundaries (min, max, count) for a table.
+    pub async fn get_pk_bounds(&self, query: &str) -> Result<(i64, i64, i64)> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PK bounds"))?;
+
+        let row = client
+            .query_one(query, &[])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let min_pk: Option<i64> = row.get(0);
+        let max_pk: Option<i64> = row.get(1);
+        let row_count: i64 = row.get(2);
+
+        Ok((min_pk.unwrap_or(0), max_pk.unwrap_or(0), row_count))
+    }
+
+    /// Delete rows by primary key values.
+    ///
+    /// Used for sync operations to remove rows that exist in target but not source.
+    pub async fn delete_rows_by_pks(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_column: &str,
+        pks: &[i64],
+    ) -> Result<i64> {
+        if pks.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(e, format!("getting connection for DELETE on {}.{}", schema, table))
+        })?;
+
+        let mut total_deleted = 0i64;
+
+        // Batch deletions to avoid query size limits
+        for chunk in pks.chunks(1000) {
+            // Build parameterized query
+            let params: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
+            let param_list = params.join(", ");
+
+            let query = format!(
+                "DELETE FROM {}.{} WHERE {} IN ({})",
+                pg_quote_ident(schema),
+                pg_quote_ident(table),
+                pg_quote_ident(pk_column),
+                param_list
+            );
+
+            // Convert PKs to references for parameter binding
+            let pk_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = chunk
+                .iter()
+                .map(|pk| pk as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+
+            let rows_deleted = client
+                .execute_raw(&query, pk_refs)
+                .await
+                .map_err(MigrateError::Target)?;
+
+            total_deleted += rows_deleted as i64;
+        }
+
+        Ok(total_deleted)
+    }
+
+    /// Fetch rows for a PK range (for Rust-side hashing).
+    ///
+    /// Returns rows with all columns for the specified PK range, ordered by PK.
+    /// Used by verify module to compute hashes in Rust instead of SQL.
+    pub async fn fetch_rows_for_range(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+        pk_column: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e,
+                format!("getting connection for fetch_rows_for_range on {}.{}", schema, table),
+            )
+        })?;
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| pg_quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Cast pk_column to BIGINT for comparison with i64 parameters
+        let query = format!(
+            "SELECT {} FROM {}.{} WHERE {}::BIGINT >= $1 AND {}::BIGINT < $2 ORDER BY {}",
+            col_list,
+            pg_quote_ident(schema),
+            pg_quote_ident(table),
+            pg_quote_ident(pk_column),
+            pg_quote_ident(pk_column),
+            pg_quote_ident(pk_column)
+        );
+
+        let rows = client
+            .query(&query, &[&min_pk, &max_pk])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(columns.len());
+            for i in 0..columns.len() {
+                let value = convert_pg_value(&row, i);
+                values.push(value);
+            }
+            result.push(values);
+        }
+
+        Ok(result)
     }
 }
 

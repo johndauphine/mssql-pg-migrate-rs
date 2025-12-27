@@ -36,12 +36,19 @@ pub mod state;
 pub mod target;
 pub mod transfer;
 pub mod typemap;
+pub mod verify;
 
 // Re-exports for convenient access
-pub use config::{Config, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode};
+pub use config::{
+    BatchVerifyConfig, Config, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode,
+};
 pub use error::{MigrateError, Result};
 pub use orchestrator::{HealthCheckResult, MigrationResult, Orchestrator, ProgressUpdate, TableError};
 pub use source::{MssqlPool, Table};
 pub use state::MigrationState;
 pub use target::{PgPool, SqlNullType, SqlValue};
 pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};
+pub use verify::{
+    BatchHashResult, PkRange, RowHashDiff, TableVerifyResult, VerifyEngine, VerifyProgressUpdate,
+    VerifyResult, VerifyTier,
+};

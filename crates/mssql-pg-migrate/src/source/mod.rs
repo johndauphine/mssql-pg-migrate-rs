@@ -755,6 +755,177 @@ impl MssqlPool {
         client.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
+
+    /// Execute a count query and return row_count.
+    ///
+    /// Used for Tier 1/2 quick verification.
+    pub async fn execute_count_query(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(min_pk);
+        q.bind(max_pk);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            let row_count: i32 = row.get::<i32, _>(0).unwrap_or(0);
+            Ok(row_count as i64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Fetch row hashes for a PK range (Tier 3 verification).
+    ///
+    /// Returns a map of PK -> MD5 hash for comparison with target.
+    pub async fn fetch_row_hashes(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(min_pk);
+        q.bind(max_pk);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        for row in rows {
+            // Try i32 first (common case), then i64 for BIGINT columns
+            let pk: Option<i64> = row.get::<i32, _>(0)
+                .map(|v| v as i64)
+                .or_else(|| row.get::<i64, _>(0));
+            let hash: Option<&str> = row.get(1);
+
+            if let (Some(pk), Some(hash)) = (pk, hash) {
+                hashes.insert(pk, hash.to_string());
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Get PK boundaries (min, max, count) for a table.
+    pub async fn get_pk_bounds(
+        &self,
+        query: &str,
+    ) -> Result<(i64, i64, i64)> {
+        let mut client = self.get_client().await?;
+
+        let result = client
+            .simple_query(query)
+            .await
+            .map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            // Try i64 first (query uses CAST AS BIGINT), fallback to i32 for compatibility
+            let min_pk: i64 = row.get::<i64, _>(0)
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+            let max_pk: i64 = row.get::<i64, _>(1)
+                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
+            let row_count: i64 = row.get::<i64, _>(2)
+                .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
+            Ok((min_pk, max_pk, row_count))
+        } else {
+            Ok((0, 0, 0))
+        }
+    }
+
+    /// Fetch specific rows by primary key values for sync operations.
+    ///
+    /// Returns rows with all columns for the specified PKs.
+    pub async fn fetch_rows_by_pks(
+        &self,
+        table: &Table,
+        pk_column: &str,
+        pks: &[i64],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Build PK list for IN clause (batch to avoid query size limits)
+        let mut all_rows = Vec::new();
+
+        for chunk in pks.chunks(1000) {
+            let pk_list = chunk
+                .iter()
+                .map(|pk| pk.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let query = format!(
+                "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] IN ({}) ORDER BY [{}]",
+                col_list,
+                table.schema.replace(']', "]]"),
+                table.name.replace(']', "]]"),
+                pk_column.replace(']', "]]"),
+                pk_list,
+                pk_column.replace(']', "]]")
+            );
+
+            let rows = self.query_rows_fast(&query, &columns, &col_types).await?;
+            all_rows.extend(rows);
+        }
+
+        Ok(all_rows)
+    }
+
+    /// Fetch rows for a PK range (for Rust-side hashing).
+    ///
+    /// Returns rows with all columns for the specified PK range, ordered by PK.
+    /// Used by verify module to compute hashes in Rust instead of SQL.
+    pub async fn fetch_rows_for_range(
+        &self,
+        table: &Table,
+        pk_column: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let query = format!(
+            "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] >= {} AND [{}] < {} ORDER BY [{}]",
+            col_list,
+            table.schema.replace(']', "]]"),
+            table.name.replace(']', "]]"),
+            pk_column.replace(']', "]]"),
+            min_pk,
+            pk_column.replace(']', "]]"),
+            max_pk,
+            pk_column.replace(']', "]]")
+        );
+
+        self.query_rows_fast(&query, &columns, &col_types).await
+    }
 }
 
 /// Convert a row value to SqlValue based on the column type.
