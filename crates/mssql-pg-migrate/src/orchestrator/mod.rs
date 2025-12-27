@@ -145,12 +145,19 @@ pub struct ProgressUpdate {
     /// Rows transferred so far.
     pub rows_transferred: i64,
 
+    /// Total rows to transfer (across all tables).
+    pub total_rows: i64,
+
     /// Current throughput (rows/second).
     pub rows_per_second: i64,
 
     /// Table currently being processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_table: Option<String>,
+
+    /// Table status: "started" or "completed" (when current_table is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_status: Option<String>,
 }
 
 /// Write a progress update as JSON to stderr.
@@ -165,7 +172,10 @@ fn emit_progress_json(update: &ProgressUpdate) {
 struct ProgressTracker {
     tables_completed: AtomicUsize,
     tables_total: usize,
-    rows_transferred: AtomicI64,
+    /// Rows transferred - shared with TransferEngine for real-time updates.
+    rows_transferred: Arc<AtomicI64>,
+    /// Total rows across all tables.
+    total_rows: i64,
     started_at: Instant,
     progress_enabled: bool,
     progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
@@ -177,6 +187,7 @@ impl std::fmt::Debug for ProgressTracker {
             .field("tables_completed", &self.tables_completed)
             .field("tables_total", &self.tables_total)
             .field("rows_transferred", &self.rows_transferred)
+            .field("total_rows", &self.total_rows)
             .field("progress_enabled", &self.progress_enabled)
             .field("has_progress_tx", &self.progress_tx.is_some())
             .finish()
@@ -186,22 +197,37 @@ impl std::fmt::Debug for ProgressTracker {
 impl ProgressTracker {
     fn new(
         tables_total: usize,
+        total_rows: i64,
         progress_enabled: bool,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Self {
         Self {
             tables_completed: AtomicUsize::new(0),
             tables_total,
-            rows_transferred: AtomicI64::new(0),
+            rows_transferred: Arc::new(AtomicI64::new(0)),
+            total_rows,
             started_at: Instant::now(),
             progress_enabled,
             progress_tx,
         }
     }
 
-    fn complete_table(&self, rows: i64) {
-        self.rows_transferred.fetch_add(rows, Ordering::Relaxed);
+    /// Get a clone of the shared rows counter for the transfer engine.
+    fn rows_counter(&self) -> Arc<AtomicI64> {
+        self.rows_transferred.clone()
+    }
+
+    fn complete_table(&self, _rows: i64) {
+        // Rows are counted incrementally by the transfer engine via the shared counter.
+        // This method just tracks table completion. The rows parameter is ignored since
+        // the transfer engine has already counted them in real-time.
         self.tables_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Manually add rows to the counter (for testing or non-transfer scenarios).
+    #[cfg(test)]
+    fn add_rows(&self, rows: i64) {
+        self.rows_transferred.fetch_add(rows, Ordering::Relaxed);
     }
 
     fn increment_table_count(&self) {
@@ -218,7 +244,7 @@ impl ProgressTracker {
         }
     }
 
-    fn emit(&self, phase: &str, current_table: Option<String>) {
+    fn emit(&self, phase: &str, current_table: Option<String>, table_status: Option<&str>) {
         if !self.progress_enabled && self.progress_tx.is_none() {
             return;
         }
@@ -229,8 +255,10 @@ impl ProgressTracker {
             tables_completed: self.tables_completed.load(Ordering::Relaxed),
             tables_total: self.tables_total,
             rows_transferred: self.rows_transferred.load(Ordering::Relaxed),
+            total_rows: self.total_rows,
             rows_per_second: self.get_rows_per_second(),
             current_table,
+            table_status: table_status.map(|s| s.to_string()),
         };
 
         if self.progress_enabled {
@@ -291,7 +319,7 @@ impl Orchestrator {
     }
 
     /// Emit a progress update (for phase transitions before transfer starts).
-    fn emit_progress(&self, phase: &str, tables_total: usize) {
+    fn emit_progress(&self, phase: &str, tables_total: usize, total_rows: i64) {
         if !self.progress_enabled && self.progress_tx.is_none() {
             return;
         }
@@ -302,8 +330,10 @@ impl Orchestrator {
             tables_completed: 0,
             tables_total,
             rows_transferred: 0,
+            total_rows,
             rows_per_second: 0,
             current_table: None,
+            table_status: None,
         };
 
         if self.progress_enabled {
@@ -382,7 +412,7 @@ impl Orchestrator {
 
         // Phase 1: Extract schema
         info!("Phase 1: Extracting schema from source");
-        self.emit_progress("extracting_schema", 0);
+        self.emit_progress("extracting_schema", 0, 0);
         let mut tables = self
             .source
             .extract_schema(&self.config.source.schema)
@@ -435,7 +465,8 @@ impl Orchestrator {
         }
 
         info!("Found {} tables to migrate", tables.len());
-        self.emit_progress("schema_extracted", tables.len());
+        let total_rows: i64 = tables.iter().map(|t| t.row_count).sum();
+        self.emit_progress("schema_extracted", tables.len(), total_rows);
 
         // Apply auto-tuning now that we know actual table sizes
         let table_stats: Vec<TableStats> = tables
@@ -469,7 +500,7 @@ impl Orchestrator {
                 "Phase 2: Preparing target database (mode: {:?})",
                 self.config.migration.target_mode
             );
-            self.emit_progress("preparing_target", tables.len());
+            self.emit_progress("preparing_target", tables.len(), total_rows);
             self.prepare_target(&tables, &mut state).await?;
 
             // Save state after preparation
@@ -484,7 +515,7 @@ impl Orchestrator {
         // Phase 3: Transfer data (skip in dry-run)
         let transfer_result = if !dry_run {
             info!("Phase 3: Transferring data");
-            self.emit_progress("transferring", tables.len());
+            self.emit_progress("transferring", tables.len(), total_rows);
             self.transfer_data(&tables, &mut state, &cancel).await
         } else {
             info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
@@ -494,7 +525,7 @@ impl Orchestrator {
         // Phase 4: Finalize (only on success, skip in dry-run)
         if transfer_result.is_ok() && !dry_run {
             info!("Phase 4: Finalizing (indexes, constraints)");
-            self.emit_progress("finalizing", tables.len());
+            self.emit_progress("finalizing", tables.len(), total_rows);
             self.finalize(&tables).await?;
         } else if dry_run {
             info!("Phase 4: [DRY RUN] Would finalize (indexes, constraints)");
@@ -779,11 +810,30 @@ impl Orchestrator {
         let semaphore = Arc::new(Semaphore::new(workers));
 
         // Create progress tracker
+        let total_rows: i64 = tables.iter().map(|t| t.row_count).sum();
         let progress = Arc::new(ProgressTracker::new(
             tables.len(),
+            total_rows,
             self.progress_enabled,
             self.progress_tx.clone(),
         ));
+
+        // Spawn periodic progress emitter (updates every 500ms during transfer)
+        let progress_emitter = progress.clone();
+        let progress_cancel = cancel.clone();
+        let progress_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        progress_emitter.emit("transferring", None, None);
+                    }
+                    _ = progress_cancel.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
 
         let transfer_config = TransferConfig {
             chunk_size: self.config.migration.get_chunk_size(),
@@ -792,11 +842,10 @@ impl Orchestrator {
             parallel_writers: self.config.migration.get_write_ahead_writers(),
         };
 
-        let engine = Arc::new(TransferEngine::new(
-            self.source.clone(),
-            self.target.clone(),
-            transfer_config,
-        ));
+        let engine = Arc::new(
+            TransferEngine::new(self.source.clone(), self.target.clone(), transfer_config)
+                .with_progress_counter(progress.rows_counter()),
+        );
 
         // Filter tables that need processing
         let pending_tables: Vec<_> = tables
@@ -860,6 +909,9 @@ impl Orchestrator {
                         }
                         self.save_state(state)?;
 
+                        // Emit "started" progress event for the table
+                        progress.emit("transferring", Some(table_name.clone()), Some("started"));
+
                         // Create a job for each partition
                         for partition in partitions {
                             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -908,6 +960,9 @@ impl Orchestrator {
                 ts.status = TaskStatus::InProgress;
             }
             self.save_state(state)?;
+
+            // Emit "started" progress event
+            progress.emit("transferring", Some(table_name.clone()), Some("started"));
 
             let job = TransferJob {
                 table: table.clone(),
@@ -1010,7 +1065,9 @@ impl Orchestrator {
                     } else {
                         progress.complete_table(total_rows);
                     }
-                    progress.emit("transferring", Some(base_table.clone()));
+                    progress.emit("transferring", Some(base_table.clone()), Some("completed"));
+                    // Yield to allow TUI to process the progress event
+                    tokio::task::yield_now().await;
                 }
             } else {
                 // Non-partitioned table - update state directly based on result
@@ -1037,7 +1094,9 @@ impl Orchestrator {
                 } else {
                     progress.increment_table_count();
                 }
-                progress.emit("transferring", Some(base_table.clone()));
+                progress.emit("transferring", Some(base_table.clone()), Some("completed"));
+                // Yield to allow TUI to process the progress event
+                tokio::task::yield_now().await;
             }
         }
 
@@ -1068,6 +1127,9 @@ impl Orchestrator {
                 }
             }
         }
+
+        // Stop the periodic progress emitter
+        progress_handle.abort();
 
         // Save final state
         self.save_state(state)?;
@@ -1335,6 +1397,7 @@ mod tests {
             tables_success: 10,
             tables_failed: 0,
             rows_transferred: 100000,
+            rows_skipped: 0,
             rows_per_second: 2200,
             failed_tables: vec![],
             table_errors: vec![],
@@ -1363,6 +1426,7 @@ mod tests {
             tables_success: 8,
             tables_failed: 2,
             rows_transferred: 80000,
+            rows_skipped: 0,
             rows_per_second: 1777,
             failed_tables: vec!["dbo.Orders".into(), "dbo.Items".into()],
             table_errors: vec![
@@ -1396,6 +1460,7 @@ mod tests {
             tables_success: 0,
             tables_failed: 0,
             rows_transferred: 0,
+            rows_skipped: 0,
             rows_per_second: 0,
             failed_tables: vec![],
             table_errors: vec![],
@@ -1421,6 +1486,7 @@ mod tests {
             tables_success: 1,
             tables_failed: 0,
             rows_transferred: 100,
+            rows_skipped: 0,
             rows_per_second: 100,
             failed_tables: vec![],
             table_errors: vec![],
@@ -1447,6 +1513,7 @@ mod tests {
             tables_success: 0,
             tables_failed: 0,
             rows_transferred: 0,
+            rows_skipped: 0,
             rows_per_second: 0,
             failed_tables: vec![],
             table_errors: vec![],
@@ -1475,10 +1542,13 @@ mod tests {
     fn test_progress_tracker_complete_table() {
         let tracker = ProgressTracker::new(5, false, None);
 
+        // Simulate transfer engine counting rows, then complete_table is called
+        tracker.add_rows(1000);
         tracker.complete_table(1000);
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 1);
         assert_eq!(tracker.rows_transferred.load(Ordering::Relaxed), 1000);
 
+        tracker.add_rows(2000);
         tracker.complete_table(2000);
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 2);
         assert_eq!(tracker.rows_transferred.load(Ordering::Relaxed), 3000);
@@ -1503,7 +1573,8 @@ mod tests {
         // Initially should be 0
         assert_eq!(tracker.get_rows_per_second(), 0);
 
-        // Add some rows and check calculation
+        // Add some rows (simulating transfer engine) and check calculation
+        tracker.add_rows(10000);
         tracker.complete_table(10000);
         // Since time has passed, rows_per_second should be > 0
         // We can't test exact value due to timing, but it should be reasonable
@@ -1529,10 +1600,12 @@ mod tests {
         let mut handles = vec![];
 
         // Spawn 10 threads, each completing 10 tables with 100 rows each
+        // This simulates the transfer engine adding rows and then completing tables
         for _ in 0..10 {
             let t = tracker.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..10 {
+                    t.add_rows(100);
                     t.complete_table(100);
                 }
             }));

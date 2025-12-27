@@ -190,6 +190,8 @@ pub struct TransferEngine {
     target: Arc<PgPool>,
     config: TransferConfig,
     rows_transferred: AtomicI64,
+    /// Optional shared counter for real-time progress reporting.
+    progress_counter: Option<Arc<AtomicI64>>,
 }
 
 impl TransferEngine {
@@ -200,7 +202,14 @@ impl TransferEngine {
             target,
             config,
             rows_transferred: AtomicI64::new(0),
+            progress_counter: None,
         }
+    }
+
+    /// Set a shared progress counter for real-time row tracking.
+    pub fn with_progress_counter(mut self, counter: Arc<AtomicI64>) -> Self {
+        self.progress_counter = Some(counter);
+        self
     }
 
     /// Get the total rows transferred so far.
@@ -458,6 +467,12 @@ impl TransferEngine {
             // Track completed ranges for safe resume point calculation.
             // Only contiguous ranges from start are considered safe.
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
+
+            // Count all rows read for progress tracking (including those that will be skipped)
+            let chunk_row_count = chunk.rows.len() as i64;
+            if let Some(ref counter) = self.progress_counter {
+                counter.fetch_add(chunk_row_count, Ordering::Relaxed);
+            }
 
             // Filter rows: hashes are already computed by readers, just filter unchanged
             let (filtered_rows, skipped) = if use_hash {

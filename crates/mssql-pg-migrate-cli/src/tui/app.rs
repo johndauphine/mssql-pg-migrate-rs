@@ -5,8 +5,9 @@
 //! - Update: handle_event method that transforms state based on events
 //! - View: Separate ui module renders state to terminal
 
-use crate::tui::events::AppEvent;
+use crate::tui::events::{AppEvent, SharedInputMode, INPUT_MODE_NORMAL, INPUT_MODE_COMMAND, INPUT_MODE_FILE, INPUT_MODE_WIZARD};
 use crate::tui::actions::Action;
+use crate::tui::wizard::WizardState;
 use mssql_pg_migrate::{Config, MigrateError, Orchestrator, ProgressUpdate, MigrationResult};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -21,6 +22,63 @@ const MAX_LOG_LINES: usize = 1000;
 
 /// Maximum number of throughput samples for sparkline.
 const MAX_THROUGHPUT_SAMPLES: usize = 60;
+
+/// Maximum number of suggestions to show.
+const MAX_SUGGESTIONS: usize = 10;
+
+/// Maximum command history size.
+const MAX_HISTORY: usize = 100;
+
+/// Input mode for the TUI.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum InputMode {
+    /// Normal mode - keyboard shortcuts active.
+    #[default]
+    Normal,
+    /// Command mode - typing a slash command.
+    Command,
+    /// File input mode - typing a file path after @.
+    FileInput,
+    /// Wizard mode - step-by-step configuration.
+    Wizard,
+}
+
+/// A slash command with metadata for auto-completion.
+#[derive(Debug, Clone)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub shortcut: Option<&'static str>,
+}
+
+impl SlashCommand {
+    /// Get all available slash commands.
+    pub fn all() -> Vec<Self> {
+        vec![
+            SlashCommand { name: "/run", description: "Start migration", shortcut: None },
+            SlashCommand { name: "/resume", description: "Resume interrupted migration", shortcut: None },
+            SlashCommand { name: "/dry-run", description: "Run without making changes", shortcut: None },
+            SlashCommand { name: "/validate", description: "Validate row counts", shortcut: None },
+            SlashCommand { name: "/health", description: "Run health check", shortcut: None },
+            SlashCommand { name: "/wizard", description: "Configuration wizard", shortcut: None },
+            SlashCommand { name: "/logs", description: "Save logs to file", shortcut: None },
+            SlashCommand { name: "/clear", description: "Clear transcript", shortcut: None },
+            SlashCommand { name: "/help", description: "Show help", shortcut: Some("?") },
+            SlashCommand { name: "/quit", description: "Exit application", shortcut: Some("q") },
+        ]
+    }
+}
+
+/// An auto-completion suggestion.
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    /// Display text shown in the dropdown.
+    pub display: String,
+    /// Value to insert when selected.
+    pub value: String,
+    /// Whether this is a directory (for file completion).
+    pub is_dir: bool,
+}
 
 /// Migration phase for display.
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +234,9 @@ pub struct App {
     /// Total rows transferred.
     pub rows_transferred: i64,
 
+    /// Total rows to transfer.
+    pub total_rows: i64,
+
     /// Current rows per second.
     pub rows_per_second: i64,
 
@@ -185,6 +246,9 @@ pub struct App {
 
     /// Elapsed time since migration started.
     pub started_at: Option<Instant>,
+
+    /// When the migration completed (to freeze the timer).
+    pub completed_at: Option<Instant>,
 
     /// Whether command palette is open (shared with event handler).
     pub palette_open: Arc<AtomicBool>,
@@ -204,6 +268,9 @@ pub struct App {
     /// Log panel scroll offset.
     pub log_scroll: usize,
 
+    /// Transcript scroll offset.
+    pub transcript_scroll: usize,
+
     /// Whether log panel is expanded.
     pub log_expanded: bool,
 
@@ -221,6 +288,35 @@ pub struct App {
 
     /// Event sender for spawning background tasks.
     event_tx: mpsc::Sender<AppEvent>,
+
+    // --- Command input state ---
+    /// Current input mode (local copy for rendering).
+    pub input_mode: InputMode,
+
+    /// Shared input mode state (synced with EventHandler).
+    shared_input_mode: SharedInputMode,
+
+    /// Command input buffer.
+    pub command_input: String,
+
+    /// Auto-completion suggestions.
+    pub suggestions: Vec<Suggestion>,
+
+    /// Selected suggestion index.
+    pub selected_suggestion: usize,
+
+    /// Command history.
+    pub command_history: Vec<String>,
+
+    /// Current position in command history (-1 = current input).
+    pub history_index: isize,
+
+    /// Saved input when navigating history.
+    pub saved_input: String,
+
+    // --- Wizard state ---
+    /// Active wizard state (None when not in wizard mode).
+    pub wizard: Option<WizardState>,
 }
 
 impl App {
@@ -230,6 +326,7 @@ impl App {
         config_path: PathBuf,
         event_tx: mpsc::Sender<AppEvent>,
         palette_open: Arc<AtomicBool>,
+        shared_input_mode: SharedInputMode,
     ) -> Self {
         let config_summary = ConfigSummary::from(&config);
 
@@ -241,22 +338,36 @@ impl App {
             config_summary,
             throughput_history: Vec::with_capacity(MAX_THROUGHPUT_SAMPLES),
             rows_transferred: 0,
+            total_rows: 0,
             rows_per_second: 0,
             tables_completed: 0,
             tables_total: 0,
             started_at: None,
+            completed_at: None,
             palette_open,
             palette_query: String::new(),
             selected_action: 0,
             filtered_actions: Action::all(),
             show_help: false,
             log_scroll: 0,
+            transcript_scroll: 0,
             log_expanded: false,
             config,
             config_path,
             cancel_token: None,
             last_result: None,
             event_tx,
+            // Command input state
+            input_mode: InputMode::Normal,
+            shared_input_mode,
+            command_input: String::new(),
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+            command_history: Vec::with_capacity(MAX_HISTORY),
+            history_index: -1,
+            saved_input: String::new(),
+            // Wizard state
+            wizard: None,
         };
 
         app.add_transcript(TranscriptEntry::info(format!(
@@ -349,6 +460,18 @@ impl App {
                 }
             }
 
+            AppEvent::ScrollTranscriptUp => {
+                if self.transcript_scroll > 0 {
+                    self.transcript_scroll -= 1;
+                }
+            }
+
+            AppEvent::ScrollTranscriptDown => {
+                if self.transcript_scroll < self.transcript.len().saturating_sub(1) {
+                    self.transcript_scroll += 1;
+                }
+            }
+
             AppEvent::Progress(update) => {
                 self.handle_progress(update);
             }
@@ -377,6 +500,165 @@ impl App {
                     token.cancel();
                     self.add_transcript(TranscriptEntry::info("Cancellation requested..."));
                 }
+            }
+
+            // --- Command input events ---
+            AppEvent::CommandInput(c) => {
+                // Handle starting command mode with '/'
+                if c == '/' && self.input_mode == InputMode::Normal && self.command_input.is_empty() {
+                    self.input_mode = InputMode::Command;
+                    self.shared_input_mode.store(INPUT_MODE_COMMAND, Ordering::Relaxed);
+                }
+
+                self.command_input.push(c);
+                self.update_suggestions();
+                self.history_index = -1;
+            }
+
+            AppEvent::CommandBackspace => {
+                self.command_input.pop();
+
+                // Exit command mode if input is empty
+                if self.command_input.is_empty() {
+                    self.input_mode = InputMode::Normal;
+                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                    self.suggestions.clear();
+                } else {
+                    self.update_suggestions();
+                }
+            }
+
+            AppEvent::CommandUp => {
+                if !self.suggestions.is_empty() {
+                    // Navigate suggestions
+                    if self.selected_suggestion > 0 {
+                        self.selected_suggestion -= 1;
+                    }
+                } else {
+                    // Navigate command history
+                    self.navigate_history_up();
+                }
+            }
+
+            AppEvent::CommandDown => {
+                if !self.suggestions.is_empty() {
+                    // Navigate suggestions
+                    if self.selected_suggestion < self.suggestions.len().saturating_sub(1) {
+                        self.selected_suggestion += 1;
+                    }
+                } else {
+                    // Navigate command history
+                    self.navigate_history_down();
+                }
+            }
+
+            AppEvent::AcceptSuggestion => {
+                if let Some(suggestion) = self.suggestions.get(self.selected_suggestion).cloned() {
+                    // Replace command input with suggestion value
+                    self.command_input = suggestion.value;
+                    if suggestion.is_dir {
+                        // Keep file mode open for directory
+                        self.command_input.push('/');
+                    }
+                    self.suggestions.clear();
+                    self.selected_suggestion = 0;
+                    self.update_suggestions();
+                }
+            }
+
+            AppEvent::ExecuteCommand => {
+                let command = self.command_input.trim().to_string();
+                if !command.is_empty() {
+                    // Add to history
+                    if self.command_history.last() != Some(&command) {
+                        self.command_history.push(command.clone());
+                        if self.command_history.len() > MAX_HISTORY {
+                            self.command_history.remove(0);
+                        }
+                    }
+
+                    // Execute the command
+                    self.execute_slash_command(&command).await?;
+                }
+
+                // Reset command input state
+                self.command_input.clear();
+                self.suggestions.clear();
+                self.selected_suggestion = 0;
+                self.history_index = -1;
+                self.input_mode = InputMode::Normal;
+                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+            }
+
+            AppEvent::ExitCommandMode => {
+                self.command_input.clear();
+                self.suggestions.clear();
+                self.selected_suggestion = 0;
+                self.history_index = -1;
+                self.input_mode = InputMode::Normal;
+                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+            }
+
+            AppEvent::ClearTranscript => {
+                self.transcript.clear();
+            }
+
+            // --- Wizard events ---
+            AppEvent::WizardInput(c) => {
+                if let Some(ref mut wizard) = self.wizard {
+                    wizard.input.push(c);
+                }
+            }
+
+            AppEvent::WizardBackspace => {
+                if let Some(ref mut wizard) = self.wizard {
+                    wizard.input.pop();
+                }
+            }
+
+            AppEvent::WizardSubmit => {
+                let (done, message) = if let Some(ref mut wizard) = self.wizard {
+                    match wizard.process_input() {
+                        Ok(done) => {
+                            let msg = if done && wizard.is_done() {
+                                Some(format!("Configuration saved to {}", wizard.output_path.display()))
+                            } else {
+                                None
+                            };
+                            (done, msg)
+                        }
+                        Err(e) => {
+                            wizard.error = Some(e);
+                            (false, None)
+                        }
+                    }
+                } else {
+                    (false, None)
+                };
+
+                if done {
+                    self.input_mode = InputMode::Normal;
+                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                    if let Some(msg) = message {
+                        self.add_transcript(TranscriptEntry::success(msg));
+                    }
+                    self.wizard = None;
+                }
+            }
+
+            AppEvent::WizardBack => {
+                if let Some(ref mut wizard) = self.wizard {
+                    wizard.step = wizard.step.prev();
+                    wizard.input.clear();
+                    wizard.error = None;
+                }
+            }
+
+            AppEvent::WizardCancel => {
+                self.wizard = None;
+                self.input_mode = InputMode::Normal;
+                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                self.add_transcript(TranscriptEntry::info("Wizard cancelled"));
             }
         }
 
@@ -574,6 +856,9 @@ impl App {
             return;
         }
 
+        // Capture old phase before updating (for transcript logic)
+        let old_phase = self.phase.clone();
+
         // Update phase
         self.phase = match update.phase.as_str() {
             "extracting_schema" => MigrationPhase::ExtractingSchema,
@@ -584,37 +869,73 @@ impl App {
             _ => self.phase.clone(),
         };
 
-        // Update stats
+        // Update stats (always update, even if values are the same)
         self.tables_completed = update.tables_completed;
         self.tables_total = update.tables_total;
         self.rows_transferred = update.rows_transferred;
+        self.total_rows = update.total_rows;
         self.rows_per_second = update.rows_per_second;
 
+        // Debug: log when tables_completed changes
+        tracing::trace!(
+            "Stats update: tables={}/{}, rows={}, rps={}",
+            self.tables_completed, self.tables_total,
+            self.rows_transferred, self.rows_per_second
+        );
+
         // Update transcript for phase changes
+
         if update.phase == "extracting_schema" && self.started_at.is_none() {
             self.started_at = Some(Instant::now());
+            self.completed_at = None; // Reset for new migration
             self.add_transcript(TranscriptEntry::info("Extracting schema from source..."));
-        } else if update.phase == "preparing_target" {
+        } else if update.phase == "preparing_target" && old_phase != MigrationPhase::PreparingTarget {
             self.add_transcript(TranscriptEntry::success(format!(
                 "Schema extracted ({} tables)",
                 update.tables_total
             )));
             self.add_transcript(TranscriptEntry::info("Preparing target database..."));
         } else if update.phase == "transferring" {
-            if let Some(table) = &update.current_table {
-                // Update or add transcript for current table
-                self.add_transcript(TranscriptEntry::progress(
-                    format!("Transferring {}", table),
-                    format!("{} rows/sec", update.rows_per_second),
-                ));
+            // Show "Target prepared" message once when entering transfer phase
+            if old_phase == MigrationPhase::PreparingTarget {
+                self.add_transcript(TranscriptEntry::success("Target database prepared"));
+                self.add_transcript(TranscriptEntry::info("Starting data transfer..."));
             }
-        } else if update.phase == "finalizing" {
-            self.add_transcript(TranscriptEntry::info("Finalizing (creating indexes)..."));
+            // Show table status when current_table is provided
+            if let Some(table) = &update.current_table {
+                match update.table_status.as_deref() {
+                    Some("started") => {
+                        self.add_transcript(TranscriptEntry::progress(
+                            format!("Transferring {}", table),
+                            format!("{} rows", update.rows_transferred),
+                        ));
+                    }
+                    Some("completed") => {
+                        self.add_transcript(TranscriptEntry::success(format!(
+                            "Completed {} ({}/{} tables)",
+                            table,
+                            update.tables_completed,
+                            update.tables_total
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        } else if update.phase == "finalizing" && old_phase != MigrationPhase::Finalizing {
+            let msg = if self.config.migration.create_indexes {
+                "Finalizing (creating indexes)..."
+            } else {
+                "Finalizing..."
+            };
+            self.add_transcript(TranscriptEntry::info(msg));
         }
     }
 
     /// Handle migration completion.
     fn handle_migration_complete(&mut self, result: MigrationResult) {
+        // Freeze the timer
+        self.completed_at = Some(Instant::now());
+
         // Update final stats from result
         self.tables_completed = result.tables_success;
         self.tables_total = result.tables_total;
@@ -689,7 +1010,11 @@ impl App {
 
     /// Get elapsed time as Duration.
     pub fn elapsed(&self) -> Duration {
-        self.started_at.map(|s| s.elapsed()).unwrap_or(Duration::ZERO)
+        match (self.started_at, self.completed_at) {
+            (Some(start), Some(end)) => end.duration_since(start),
+            (Some(start), None) => start.elapsed(),
+            _ => Duration::ZERO,
+        }
     }
 
     /// Format elapsed time as HH:MM:SS.
@@ -699,5 +1024,211 @@ impl App {
         let mins = (secs % 3600) / 60;
         let secs = secs % 60;
         format!("{:02}:{:02}:{:02}", hours, mins, secs)
+    }
+
+    // --- Command input helpers ---
+
+    /// Update auto-completion suggestions based on current input.
+    fn update_suggestions(&mut self) {
+        self.suggestions.clear();
+        self.selected_suggestion = 0;
+
+        let input = &self.command_input;
+
+        // Check for file completion (@ prefix)
+        if let Some(at_idx) = input.rfind('@') {
+            // Only trigger if @ is after a space or at start
+            if at_idx == 0 || input.chars().nth(at_idx.saturating_sub(1)) == Some(' ') {
+                let path_prefix = &input[at_idx + 1..];
+                self.suggestions = self.glob_files(path_prefix);
+                self.input_mode = InputMode::FileInput;
+                self.shared_input_mode.store(INPUT_MODE_FILE, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Command completion (starts with /)
+        if input.starts_with('/') {
+            let query = input.to_lowercase();
+            for cmd in SlashCommand::all() {
+                if cmd.name.to_lowercase().starts_with(&query) {
+                    self.suggestions.push(Suggestion {
+                        display: format!("{:<12} {}", cmd.name, cmd.description),
+                        value: cmd.name.to_string(),
+                        is_dir: false,
+                    });
+                }
+            }
+
+            // Limit suggestions
+            if self.suggestions.len() > MAX_SUGGESTIONS {
+                self.suggestions.truncate(MAX_SUGGESTIONS);
+            }
+        }
+    }
+
+    /// Glob files for auto-completion.
+    fn glob_files(&self, prefix: &str) -> Vec<Suggestion> {
+        use std::path::Path;
+
+        let mut suggestions = Vec::new();
+
+        // Determine the directory and pattern
+        let (dir, file_prefix) = if prefix.contains('/') || prefix.contains('\\') {
+            let path = Path::new(prefix);
+            (
+                path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+                path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+        } else {
+            (std::env::current_dir().unwrap_or_default(), prefix.to_string())
+        };
+
+        // Read directory
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.to_lowercase().starts_with(&file_prefix.to_lowercase()) {
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let full_path = if prefix.contains('/') || prefix.contains('\\') {
+                        let base = Path::new(prefix)
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default();
+                        base.join(&name).to_string_lossy().to_string()
+                    } else {
+                        name.clone()
+                    };
+
+                    // Filter for yaml/yml files or directories
+                    if is_dir || name.ends_with(".yaml") || name.ends_with(".yml") {
+                        suggestions.push(Suggestion {
+                            display: if is_dir {
+                                format!("{}/", name)
+                            } else {
+                                name
+                            },
+                            value: format!("@{}", full_path),
+                            is_dir,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort and limit
+        suggestions.sort_by(|a, b| a.display.cmp(&b.display));
+        if suggestions.len() > MAX_SUGGESTIONS {
+            suggestions.truncate(MAX_SUGGESTIONS);
+        }
+
+        suggestions
+    }
+
+    /// Navigate command history up.
+    fn navigate_history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        // Save current input when starting to navigate
+        if self.history_index == -1 {
+            self.saved_input = self.command_input.clone();
+        }
+
+        // Move up in history
+        let max_index = self.command_history.len() as isize - 1;
+        if self.history_index < max_index {
+            self.history_index += 1;
+            let idx = self.command_history.len() - 1 - self.history_index as usize;
+            self.command_input = self.command_history[idx].clone();
+        }
+    }
+
+    /// Navigate command history down.
+    fn navigate_history_down(&mut self) {
+        if self.history_index > 0 {
+            self.history_index -= 1;
+            let idx = self.command_history.len() - 1 - self.history_index as usize;
+            self.command_input = self.command_history[idx].clone();
+        } else if self.history_index == 0 {
+            // Restore saved input
+            self.history_index = -1;
+            self.command_input = self.saved_input.clone();
+        }
+    }
+
+    /// Execute a slash command.
+    async fn execute_slash_command(&mut self, command: &str) -> Result<(), MigrateError> {
+        // Parse command and arguments
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        let (cmd, args) = match parts.split_first() {
+            Some((cmd, args)) => (*cmd, args),
+            None => return Ok(()),
+        };
+
+        // Extract config path from args (look for @path)
+        let _config_path = args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..]);
+
+        match cmd {
+            "/run" => {
+                if !self.can_start_migration() {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                self.add_transcript(TranscriptEntry::info("Starting migration..."));
+                self.spawn_migration(false, false).await;
+            }
+            "/resume" => {
+                if !self.can_start_migration() {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                self.add_transcript(TranscriptEntry::info("Resuming migration..."));
+                self.spawn_migration(false, true).await;
+            }
+            "/dry-run" => {
+                if !self.can_start_migration() {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                self.add_transcript(TranscriptEntry::info("Starting dry run..."));
+                self.spawn_migration(true, false).await;
+            }
+            "/validate" => {
+                self.add_transcript(TranscriptEntry::info("Validation not yet implemented"));
+            }
+            "/health" => {
+                self.spawn_health_check().await;
+            }
+            "/wizard" => {
+                // Start the configuration wizard
+                let output_path = PathBuf::from("config.yaml");
+                self.wizard = Some(WizardState::new(output_path));
+                self.input_mode = InputMode::Wizard;
+                self.shared_input_mode.store(INPUT_MODE_WIZARD, Ordering::Relaxed);
+                self.add_transcript(TranscriptEntry::info("Starting configuration wizard..."));
+            }
+            "/logs" => {
+                self.save_logs();
+            }
+            "/clear" => {
+                self.transcript.clear();
+            }
+            "/help" => {
+                self.show_help = true;
+            }
+            "/quit" | "/q" => {
+                // This will be caught by the event loop
+                self.add_transcript(TranscriptEntry::info("Use 'q' key or Ctrl+C to quit"));
+            }
+            _ => {
+                self.add_transcript(TranscriptEntry::error(format!("Unknown command: {}", cmd)));
+            }
+        }
+
+        Ok(())
     }
 }

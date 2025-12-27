@@ -3,7 +3,8 @@
 //! Implements the View function of the Elm architecture - pure rendering
 //! from application state to terminal frames.
 
-use crate::tui::app::{App, MigrationPhase};
+use crate::tui::app::{App, InputMode, MigrationPhase};
+use crate::tui::wizard::WizardStep;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -15,21 +16,65 @@ use std::sync::atomic::Ordering;
 
 /// Render the entire application UI.
 pub fn render(frame: &mut Frame, app: &App) {
-    // Main layout: status bar (top), content (middle), footer (bottom)
+    // Log panel height: 3 lines collapsed, 40% of screen expanded
+    let log_height = if app.log_expanded {
+        Constraint::Percentage(40)
+    } else {
+        Constraint::Length(3)
+    };
+
+    // Command input height: 1 line when in command mode, 0 when not
+    let command_input_height = if app.input_mode != InputMode::Normal {
+        Constraint::Length(1)
+    } else {
+        Constraint::Length(0)
+    };
+
+    // Progress bar height: show during active phases
+    let show_progress = matches!(
+        app.phase,
+        MigrationPhase::Transferring | MigrationPhase::PreparingTarget | MigrationPhase::Finalizing
+    );
+    let progress_height = if show_progress {
+        Constraint::Length(3)
+    } else {
+        Constraint::Length(0)
+    };
+
+    // Main layout: status bar (top), progress, content (middle), logs, command input, footer (bottom)
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // Status bar
+            progress_height,        // Progress bars (only during transfer)
             Constraint::Min(10),    // Content
-            Constraint::Length(3),  // Log panel (collapsed)
+            log_height,             // Log panel (collapsed or expanded)
+            command_input_height,   // Command input line
             Constraint::Length(1),  // Footer
         ])
         .split(frame.area());
 
     render_status_bar(frame, app, main_chunks[0]);
-    render_content(frame, app, main_chunks[1]);
-    render_logs(frame, app, main_chunks[2]);
-    render_footer(frame, app, main_chunks[3]);
+
+    // Render progress bars if in transfer phase
+    if show_progress {
+        render_progress_bars(frame, app, main_chunks[1]);
+    }
+
+    render_content(frame, app, main_chunks[2]);
+    render_logs(frame, app, main_chunks[3]);
+
+    // Render command input if in command mode
+    if app.input_mode != InputMode::Normal {
+        render_command_input(frame, app, main_chunks[4]);
+    }
+
+    render_footer(frame, app, main_chunks[5]);
+
+    // Render suggestions dropdown above command input
+    if app.input_mode != InputMode::Normal && !app.suggestions.is_empty() {
+        render_suggestions(frame, app, main_chunks[4]);
+    }
 
     // Render overlays on top
     if app.palette_open.load(Ordering::Relaxed) {
@@ -38,6 +83,11 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.show_help {
         render_help(frame);
+    }
+
+    // Render wizard overlay if active
+    if app.wizard.is_some() {
+        render_wizard(frame, app);
     }
 }
 
@@ -81,6 +131,66 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(status_bar, area);
 }
 
+/// Render progress bars during migration.
+fn render_progress_bars(frame: &mut Frame, app: &App, area: Rect) {
+    // Calculate row-based progress percentage (more responsive than table-based)
+    let rows_percent = if app.total_rows > 0 {
+        (app.rows_transferred as f64 / app.total_rows as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Build the progress bar
+    let bar_width = area.width.saturating_sub(60) as usize;
+    let filled = ((rows_percent / 100.0) * bar_width as f64) as usize;
+    let empty = bar_width.saturating_sub(filled);
+
+    let bar = format!(
+        "[{}{}]",
+        "█".repeat(filled),
+        "░".repeat(empty),
+    );
+
+    // Phase-specific message
+    let phase_msg = match app.phase {
+        MigrationPhase::PreparingTarget => "Preparing target database...",
+        MigrationPhase::Transferring => "Transferring data...",
+        MigrationPhase::Finalizing => "Finalizing...",
+        _ => "",
+    };
+
+    let progress_line = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(&bar, Style::default().fg(Color::Cyan)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:5.1}%", rows_percent),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" │ "),
+        Span::styled(
+            format!("{}/{} tables", app.tables_completed, app.tables_total),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw(" │ "),
+        Span::styled(
+            format!("{} rows/sec", format_number(app.rows_per_second)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" │ "),
+        Span::styled(phase_msg, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let progress = Paragraph::new(vec![
+        Line::from(""),
+        progress_line,
+        Line::from(""),
+    ])
+    .block(Block::default().borders(Borders::BOTTOM));
+
+    frame.render_widget(progress, area);
+}
+
 /// Render the main content area (transcript + side panel).
 fn render_content(frame: &mut Frame, app: &App, area: Rect) {
     // Split content: transcript (left) and side panel (right)
@@ -98,9 +208,18 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the conversation-style transcript.
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
+    // Calculate visible height (excluding borders)
+    let visible_height = area.height.saturating_sub(2) as usize;
+
+    // Clamp scroll to valid range
+    let max_scroll = app.transcript.len().saturating_sub(visible_height);
+    let actual_scroll = app.transcript_scroll.min(max_scroll);
+
     let items: Vec<ListItem> = app
         .transcript
         .iter()
+        .skip(actual_scroll)
+        .take(visible_height)
         .map(|entry| {
             let icon_style = match entry.icon {
                 '\u{2713}' => Style::default().fg(Color::Green),  // Check
@@ -126,11 +245,12 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let title = format!(" Transcript ({}) ", app.transcript.len());
     let transcript = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Transcript "),
+                .title(title),
         );
 
     frame.render_widget(transcript, area);
@@ -195,11 +315,19 @@ fn render_side_panel(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render the log panel.
 fn render_logs(frame: &mut Frame, app: &App, area: Rect) {
+    // Calculate visible height (excluding borders)
+    let visible_height = area.height.saturating_sub(2) as usize;
+
+    // Clamp scroll to ensure we show as many logs as possible
+    // If log_scroll is past the point where we can fill the screen, clamp it
+    let max_scroll = app.logs.len().saturating_sub(visible_height);
+    let actual_scroll = app.log_scroll.min(max_scroll);
+
     let log_lines: Vec<Line> = app
         .logs
         .iter()
-        .skip(app.log_scroll)
-        .take(area.height as usize)
+        .skip(actual_scroll)
+        .take(visible_height)
         .map(|line| {
             let style = if line.contains("ERROR") || line.contains("error") {
                 Style::default().fg(Color::Red)
@@ -214,11 +342,17 @@ fn render_logs(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let title = if app.log_expanded {
+        format!(" Logs ({}) - Press 'l' to collapse ", app.logs.len())
+    } else {
+        format!(" Logs ({}) - Press 'l' to expand ", app.logs.len())
+    };
+
     let logs = Paragraph::new(log_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Logs ({}) ", app.logs.len())),
+                .title(title),
         )
         .wrap(Wrap { trim: true });
 
@@ -226,19 +360,109 @@ fn render_logs(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the footer with key hints.
-fn render_footer(frame: &mut Frame, _app: &App, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(" Ctrl+P ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Command palette "),
-        Span::styled(" q ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Quit "),
-        Span::styled(" ? ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Help "),
-        Span::styled(" l ", Style::default().bg(Color::DarkGray)),
-        Span::raw(" Logs "),
-    ]));
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let spans = if app.input_mode != InputMode::Normal {
+        // Command mode footer
+        vec![
+            Span::styled(" Tab ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Accept "),
+            Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Execute "),
+            Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Cancel "),
+            Span::styled(" ↑↓ ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Navigate "),
+        ]
+    } else {
+        // Normal mode footer
+        vec![
+            Span::styled(" / ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Commands "),
+            Span::styled(" Ctrl+P ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Palette "),
+            Span::styled(" q ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Quit "),
+            Span::styled(" ? ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Help "),
+            Span::styled(" l ", Style::default().bg(Color::DarkGray)),
+            Span::raw(" Logs "),
+        ]
+    };
 
+    let footer = Paragraph::new(Line::from(spans));
     frame.render_widget(footer, area);
+}
+
+/// Render the command input line.
+fn render_command_input(frame: &mut Frame, app: &App, area: Rect) {
+    let mode_indicator = match app.input_mode {
+        InputMode::Command => ":",
+        InputMode::FileInput => "@",
+        InputMode::Normal => ">",
+        InputMode::Wizard => "wizard>",
+    };
+
+    let input_style = Style::default().fg(Color::Cyan);
+
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled(mode_indicator, input_style),
+        Span::raw(" "),
+        Span::raw(&app.command_input),
+        Span::styled("█", Style::default().fg(Color::Gray)), // Cursor
+    ]))
+    .style(Style::default().bg(Color::Black));
+
+    frame.render_widget(input, area);
+}
+
+/// Render the suggestions dropdown above the command input.
+fn render_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
+    let suggestion_count = app.suggestions.len().min(8);
+    if suggestion_count == 0 {
+        return;
+    }
+
+    // Position dropdown above the input line
+    let dropdown_height = suggestion_count as u16;
+    let dropdown_area = Rect {
+        x: input_area.x + 2,
+        y: input_area.y.saturating_sub(dropdown_height + 1),
+        width: input_area.width.saturating_sub(4).min(60),
+        height: dropdown_height,
+    };
+
+    // Clear the area first
+    frame.render_widget(Clear, dropdown_area);
+
+    let items: Vec<ListItem> = app
+        .suggestions
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(i, suggestion)| {
+            let style = if i == app.selected_suggestion {
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(Color::DarkGray)
+            };
+
+            let display = if suggestion.is_dir {
+                format!(" {}/ ", suggestion.display.trim_end_matches('/'))
+            } else {
+                format!(" {} ", suggestion.display)
+            };
+
+            ListItem::new(Line::styled(display, style))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().style(Style::default().bg(Color::DarkGray)));
+
+    frame.render_widget(list, dropdown_area);
 }
 
 /// Render the command palette overlay.
@@ -313,47 +537,76 @@ fn render_palette(frame: &mut Frame, app: &App) {
 
 /// Render the help overlay.
 fn render_help(frame: &mut Frame) {
-    let area = centered_rect(50, 60, frame.area());
+    let area = centered_rect(60, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let help_text = vec![
         Line::from(""),
+        Line::from(Span::styled(" Keyboard Shortcuts ", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  Ctrl+P  ", Style::default().fg(Color::Cyan)),
+            Span::styled("  /         ", Style::default().fg(Color::Cyan)),
+            Span::raw("Start typing a command"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+P    ", Style::default().fg(Color::Cyan)),
             Span::raw("Open command palette"),
         ]),
         Line::from(vec![
-            Span::styled("  :       ", Style::default().fg(Color::Cyan)),
-            Span::raw("Open command palette"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Ctrl+C  ", Style::default().fg(Color::Cyan)),
+            Span::styled("  Ctrl+C    ", Style::default().fg(Color::Cyan)),
             Span::raw("Cancel current operation"),
         ]),
         Line::from(vec![
-            Span::styled("  q       ", Style::default().fg(Color::Cyan)),
+            Span::styled("  q         ", Style::default().fg(Color::Cyan)),
             Span::raw("Quit"),
         ]),
         Line::from(vec![
-            Span::styled("  ?       ", Style::default().fg(Color::Cyan)),
+            Span::styled("  ?         ", Style::default().fg(Color::Cyan)),
             Span::raw("Toggle this help"),
         ]),
         Line::from(vec![
-            Span::styled("  l       ", Style::default().fg(Color::Cyan)),
+            Span::styled("  l         ", Style::default().fg(Color::Cyan)),
             Span::raw("Toggle log panel"),
         ]),
         Line::from(vec![
-            Span::styled("  j/k     ", Style::default().fg(Color::Cyan)),
+            Span::styled("  j/k       ", Style::default().fg(Color::Cyan)),
             Span::raw("Scroll logs"),
         ]),
         Line::from(""),
+        Line::from(Span::styled(" Slash Commands ", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
         Line::from(vec![
-            Span::styled("  Esc     ", Style::default().fg(Color::Cyan)),
-            Span::raw("Close palette/help"),
+            Span::styled("  /run      ", Style::default().fg(Color::Green)),
+            Span::raw("Start migration"),
         ]),
         Line::from(vec![
-            Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
-            Span::raw("Select action"),
+            Span::styled("  /resume   ", Style::default().fg(Color::Green)),
+            Span::raw("Resume interrupted migration"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /dry-run  ", Style::default().fg(Color::Green)),
+            Span::raw("Run without making changes"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /validate ", Style::default().fg(Color::Green)),
+            Span::raw("Validate row counts"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /health   ", Style::default().fg(Color::Green)),
+            Span::raw("Run health check"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /logs     ", Style::default().fg(Color::Green)),
+            Span::raw("Save logs to file"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /clear    ", Style::default().fg(Color::Green)),
+            Span::raw("Clear transcript"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  @path     ", Style::default().fg(Color::Yellow)),
+            Span::raw("File path completion (Tab to accept)"),
         ]),
         Line::from(""),
     ];
@@ -367,6 +620,92 @@ fn render_help(frame: &mut Frame) {
         );
 
     frame.render_widget(help, area);
+}
+
+/// Render the configuration wizard overlay.
+fn render_wizard(frame: &mut Frame, app: &App) {
+    let wizard = match &app.wizard {
+        Some(w) => w,
+        None => return,
+    };
+
+    let area = centered_rect(70, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    // Build wizard content
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Configuration Wizard ",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+        )),
+        Line::from(format!(
+            " Step {} of {} ",
+            wizard.step.step_number(),
+            WizardStep::total_steps()
+        )),
+        Line::from(""),
+    ];
+
+    // Add transcript of previous answers
+    for line in &wizard.transcript {
+        lines.push(Line::from(vec![
+            Span::styled(" \u{2713} ", Style::default().fg(Color::Green)),
+            Span::raw(line),
+        ]));
+    }
+
+    if !wizard.transcript.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    // Current prompt
+    let prompt = wizard.get_prompt();
+    let input_display = if wizard.step.is_password() {
+        "*".repeat(wizard.input.len())
+    } else {
+        wizard.input.clone()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(&prompt, Style::default().fg(Color::Yellow)),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled(" > ", Style::default().fg(Color::Cyan)),
+        Span::raw(&input_display),
+        Span::styled("█", Style::default().fg(Color::Gray)),
+    ]));
+
+    // Error message if any
+    if let Some(ref error) = wizard.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" Error: ", Style::default().fg(Color::Red)),
+            Span::styled(error, Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    // Footer hints
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" Submit "),
+        Span::styled(" ↑ ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" Back "),
+        Span::styled(" Esc ", Style::default().bg(Color::DarkGray)),
+        Span::raw(" Cancel "),
+    ]));
+
+    let wizard_widget = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Wizard ")
+                .style(Style::default().bg(Color::Black)),
+        );
+
+    frame.render_widget(wizard_widget, area);
 }
 
 /// Create a centered rectangle.

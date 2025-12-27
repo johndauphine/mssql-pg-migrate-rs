@@ -12,9 +12,11 @@ mod ui;
 mod actions;
 mod logging;
 mod widgets;
+mod wizard;
 
-pub use app::App;
-pub use events::{AppEvent, EventHandler};
+pub use app::{App, InputMode, SlashCommand, Suggestion};
+pub use wizard::{WizardState, WizardStep};
+pub use events::{AppEvent, EventHandler, SharedInputMode, INPUT_MODE_NORMAL, INPUT_MODE_COMMAND, INPUT_MODE_FILE, INPUT_MODE_WIZARD};
 pub use actions::Action;
 pub use logging::TuiLogLayer;
 
@@ -29,7 +31,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::panic;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -85,8 +87,9 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     // Create event channels
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
-    // Create shared state for palette
+    // Create shared state for palette and input mode
     let palette_open = Arc::new(AtomicBool::new(false));
+    let shared_input_mode: SharedInputMode = Arc::new(AtomicU8::new(INPUT_MODE_NORMAL));
 
     // Create log channel and layer
     let (log_tx, mut log_rx) = mpsc::channel::<String>(500);
@@ -113,6 +116,7 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
         config_path.as_ref().to_path_buf(),
         event_tx.clone(),
         palette_open.clone(),
+        shared_input_mode.clone(),
     );
 
     // Spawn log forwarder
@@ -124,7 +128,7 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     });
 
     // Create event handler for keyboard/tick events
-    let event_handler = EventHandler::new(event_tx.clone(), palette_open);
+    let event_handler = EventHandler::new(event_tx.clone(), palette_open, shared_input_mode);
     let _event_handle = tokio::spawn(async move {
         event_handler.run().await;
     });
@@ -134,17 +138,23 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
         // Render UI
         terminal.draw(|frame| render(frame, &app))?;
 
-        // Handle events
+        // Wait for at least one event
         if let Some(event) = event_rx.recv().await {
+            // Check if this is a progress event with table completion
+            let is_table_completion = matches!(&event, AppEvent::Progress(p) if p.current_table.is_some());
+
             match app.handle_event(event).await {
                 Ok(should_quit) => {
                     if should_quit {
                         break;
                     }
                 }
-                Err(e) => {
-                    app.add_error(format!("Error: {}", e));
-                }
+                Err(e) => app.add_error(format!("Error: {}", e)),
+            }
+
+            // Force immediate render after table completion for visual feedback
+            if is_table_completion {
+                terminal.draw(|frame| render(frame, &app))?;
             }
         }
     }
