@@ -481,42 +481,63 @@ fn prompt_connection_test() -> WizardResult<bool> {
 }
 
 async fn test_connections(config: &Config) -> WizardResult<()> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
     println!("\nTesting connections...");
 
-    match Orchestrator::new(config.clone()).await {
-        Ok(orchestrator) => {
-            let result = orchestrator.health_check().await;
-            match result {
-                Ok(health) => {
-                    println!(
-                        "  Source (MSSQL): {} ({}ms)",
-                        if health.source_connected { "OK" } else { "FAILED" },
-                        health.source_latency_ms
-                    );
-                    if let Some(ref err) = health.source_error {
-                        println!("    Error: {}", err);
-                    }
+    // Use a 30-second timeout to prevent hanging indefinitely
+    let timeout_duration = Duration::from_secs(30);
 
-                    println!(
-                        "  Target (PostgreSQL): {} ({}ms)",
-                        if health.target_connected { "OK" } else { "FAILED" },
-                        health.target_latency_ms
-                    );
-                    if let Some(ref err) = health.target_error {
-                        println!("    Error: {}", err);
-                    }
+    let orchestrator = match timeout(timeout_duration, Orchestrator::new(config.clone())).await {
+        Ok(Ok(orch)) => orch,
+        Ok(Err(e)) => {
+            println!("  Failed to initialize: {}", e);
+            println!();
+            return Ok(());
+        }
+        Err(_) => {
+            println!("  Connection timed out after 30 seconds");
+            println!();
+            return Ok(());
+        }
+    };
 
-                    if !health.healthy {
-                        println!("\n  Warning: One or more connections failed.");
-                    }
-                }
-                Err(e) => {
-                    println!("  Connection test failed: {}", e);
-                }
+    let result = match timeout(timeout_duration, orchestrator.health_check()).await {
+        Ok(r) => r,
+        Err(_) => {
+            println!("  Health check timed out after 30 seconds");
+            println!();
+            return Ok(());
+        }
+    };
+
+    match result {
+        Ok(health) => {
+            println!(
+                "  Source (MSSQL): {} ({}ms)",
+                if health.source_connected { "OK" } else { "FAILED" },
+                health.source_latency_ms
+            );
+            if let Some(ref err) = health.source_error {
+                println!("    Error: {}", err);
+            }
+
+            println!(
+                "  Target (PostgreSQL): {} ({}ms)",
+                if health.target_connected { "OK" } else { "FAILED" },
+                health.target_latency_ms
+            );
+            if let Some(ref err) = health.target_error {
+                println!("    Error: {}", err);
+            }
+
+            if !health.healthy {
+                println!("\n  Warning: One or more connections failed.");
             }
         }
         Err(e) => {
-            println!("  Failed to initialize: {}", e);
+            println!("  Connection test failed: {}", e);
         }
     }
 
