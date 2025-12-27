@@ -49,6 +49,6 @@ pub use state::MigrationState;
 pub use target::{PgPool, SqlNullType, SqlValue};
 pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};
 pub use verify::{
-    BatchHashResult, PkRange, RowHashDiff, TableVerifyResult, UniversalVerifyEngine, VerifyEngine,
-    VerifyProgressUpdate, VerifyResult, VerifyTier,
+    BatchHashResult, CompositePk, RowHashDiffComposite, RowRange, TableVerifyResult,
+    UniversalVerifyEngine, VerifyEngine, VerifyProgressUpdate, VerifyResult, VerifyTier,
 };
