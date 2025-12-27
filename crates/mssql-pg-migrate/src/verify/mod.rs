@@ -104,6 +104,8 @@ impl VerifyEngine {
                 rows_to_update: 0,
                 rows_to_delete: 0,
                 sync_performed: false,
+                skipped: true,
+                skip_reason: Some("Table does not have a single integer primary key".to_string()),
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
@@ -163,6 +165,8 @@ impl VerifyEngine {
                 rows_to_update: 0,
                 rows_to_delete: 0,
                 sync_performed: false,
+                skipped: false,
+                skip_reason: None,
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
@@ -215,9 +219,15 @@ impl VerifyEngine {
         // Tier 4: Sync if requested
         let sync_performed = if auto_sync && total_diff.has_differences() {
             info!("Tier 4: Syncing {} changed rows", total_diff.total_differences());
-            // TODO: Implement actual sync using existing upsert mechanism
-            // For now, just report what would be synced
-            false
+            self.sync_differences(
+                table,
+                source_schema,
+                target_schema,
+                pk_column,
+                &total_diff,
+            )
+            .await?;
+            true
         } else {
             false
         };
@@ -234,6 +244,8 @@ impl VerifyEngine {
             rows_to_update,
             rows_to_delete,
             sync_performed,
+            skipped: false,
+            skip_reason: None,
             duration_ms: start.elapsed().as_millis() as u64,
         })
     }
@@ -352,5 +364,116 @@ impl VerifyEngine {
         }
 
         Ok(diff)
+    }
+
+    /// Sync differences from source to target.
+    ///
+    /// - Inserts: Fetch rows from source and upsert to target
+    /// - Updates: Fetch rows from source and upsert to target
+    /// - Deletes: Delete rows from target that don't exist in source
+    async fn sync_differences(
+        &self,
+        table: &Table,
+        source_schema: &str,
+        target_schema: &str,
+        pk_column: &str,
+        diff: &RowHashDiff,
+    ) -> Result<SyncStats> {
+        use crate::target::{calculate_row_hash, TargetPool};
+
+        let mut stats = SyncStats::default();
+
+        // Combine inserts and updates - both need to fetch from source and upsert
+        let mut pks_to_upsert: Vec<i64> = diff.missing_in_target.clone();
+        pks_to_upsert.extend(diff.hash_mismatches.iter().copied());
+
+        if !pks_to_upsert.is_empty() {
+            info!(
+                "Syncing {} rows ({} inserts, {} updates) for {}.{}",
+                pks_to_upsert.len(),
+                diff.missing_in_target.len(),
+                diff.hash_mismatches.len(),
+                source_schema,
+                table.name
+            );
+
+            // Fetch rows from source
+            let rows = self
+                .source
+                .fetch_rows_by_pks(table, pk_column, &pks_to_upsert)
+                .await?;
+
+            if !rows.is_empty() {
+                // Build column list
+                let mut columns: Vec<String> =
+                    table.columns.iter().map(|c| c.name.clone()).collect();
+                let pk_cols = vec![pk_column.to_string()];
+
+                // Find PK column indices for hash calculation
+                let pk_indices: Vec<usize> = pk_cols
+                    .iter()
+                    .filter_map(|pk| columns.iter().position(|c| c == pk))
+                    .collect();
+
+                // Compute row hashes and add hash column
+                let rows_with_hash: Vec<Vec<crate::target::SqlValue>> = rows
+                    .into_iter()
+                    .map(|mut row| {
+                        let hash = calculate_row_hash(&row, &pk_indices);
+                        row.push(crate::target::SqlValue::String(hash));
+                        row
+                    })
+                    .collect();
+
+                columns.push(self.row_hash_column.clone());
+
+                // Upsert to target
+                let upserted = self
+                    .target
+                    .upsert_chunk_with_hash(
+                        target_schema,
+                        &table.name,
+                        &columns,
+                        &pk_cols,
+                        rows_with_hash,
+                        0, // writer_id
+                        Some(&self.row_hash_column),
+                    )
+                    .await?;
+
+                stats.rows_inserted = diff.missing_in_target.len() as i64;
+                stats.rows_updated = diff.hash_mismatches.len() as i64;
+
+                info!(
+                    "Upserted {} rows to {}.{}",
+                    upserted, target_schema, table.name
+                );
+            }
+        }
+
+        // Handle deletes
+        if !diff.missing_in_source.is_empty() {
+            info!(
+                "Deleting {} rows from {}.{}",
+                diff.missing_in_source.len(),
+                target_schema,
+                table.name
+            );
+
+            let deleted = self
+                .target
+                .delete_rows_by_pks(
+                    target_schema,
+                    &table.name,
+                    pk_column,
+                    &diff.missing_in_source,
+                )
+                .await?;
+
+            stats.rows_deleted = deleted;
+            info!("Deleted {} rows from {}.{}", deleted, target_schema, table.name);
+        }
+
+        Ok(stats)
     }
 }

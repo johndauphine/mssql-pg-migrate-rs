@@ -78,8 +78,8 @@ pub fn postgres_batch_hash_query(
 
     let columns_sql = column_exprs.join(postgres_column_separator());
 
-    // Use MD5 and convert to integer for aggregation
-    // Take first 8 hex chars (32 bits) and sum them
+    // Use MD5 and convert to BIGINT for aggregation
+    // Take first 8 hex chars (32 bits) and sum them as BIGINT to avoid overflow
     // This won't produce identical results to MSSQL CHECKSUM_AGG but will be
     // deterministic for comparison purposes
     format!(

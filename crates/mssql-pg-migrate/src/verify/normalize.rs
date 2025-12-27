@@ -41,9 +41,13 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
             )
         }
         "datetimeoffset" => {
-            // Include timezone offset
+            // Apply 3ms rounding (like other datetime types) while preserving timezone offset
             format!(
-                "ISNULL(CONVERT(NVARCHAR(34), [{name}], 127), N'NULL')"
+                "ISNULL(CONVERT(NVARCHAR(34), \
+                 TODATETIMEOFFSET( \
+                     DATEADD(ms, (DATEDIFF_BIG(ms, '19000101', CAST([{name}] AS datetime2)) / 3) * 3, '19000101'), \
+                     DATEPART(TZOFFSET, [{name}]) \
+                 ), 127), N'NULL')"
             )
         }
         "date" => {

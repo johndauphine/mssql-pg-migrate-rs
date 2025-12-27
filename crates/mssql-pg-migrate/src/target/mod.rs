@@ -1459,6 +1459,57 @@ impl PgPool {
 
         Ok((min_pk.unwrap_or(0), max_pk.unwrap_or(0), row_count))
     }
+
+    /// Delete rows by primary key values.
+    ///
+    /// Used for sync operations to remove rows that exist in target but not source.
+    pub async fn delete_rows_by_pks(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_column: &str,
+        pks: &[i64],
+    ) -> Result<i64> {
+        if pks.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(e, format!("getting connection for DELETE on {}.{}", schema, table))
+        })?;
+
+        let mut total_deleted = 0i64;
+
+        // Batch deletions to avoid query size limits
+        for chunk in pks.chunks(1000) {
+            // Build parameterized query
+            let params: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
+            let param_list = params.join(", ");
+
+            let query = format!(
+                "DELETE FROM {}.{} WHERE {} IN ({})",
+                pg_quote_ident(schema),
+                pg_quote_ident(table),
+                pg_quote_ident(pk_column),
+                param_list
+            );
+
+            // Convert PKs to references for parameter binding
+            let pk_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = chunk
+                .iter()
+                .map(|pk| pk as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+
+            let rows_deleted = client
+                .execute_raw(&query, pk_refs)
+                .await
+                .map_err(MigrateError::Target)?;
+
+            total_deleted += rows_deleted as i64;
+        }
+
+        Ok(total_deleted)
+    }
 }
 
 impl PgPool {

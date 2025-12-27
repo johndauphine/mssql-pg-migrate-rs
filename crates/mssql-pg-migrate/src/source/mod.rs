@@ -840,6 +840,56 @@ impl MssqlPool {
             Ok((0, 0, 0))
         }
     }
+
+    /// Fetch specific rows by primary key values for sync operations.
+    ///
+    /// Returns rows with all columns for the specified PKs.
+    pub async fn fetch_rows_by_pks(
+        &self,
+        table: &Table,
+        pk_column: &str,
+        pks: &[i64],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Build PK list for IN clause (batch to avoid query size limits)
+        let mut all_rows = Vec::new();
+
+        for chunk in pks.chunks(1000) {
+            let pk_list = chunk
+                .iter()
+                .map(|pk| pk.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let query = format!(
+                "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] IN ({}) ORDER BY [{}]",
+                col_list,
+                table.schema.replace(']', "]]"),
+                table.name.replace(']', "]]"),
+                pk_column.replace(']', "]]"),
+                pk_list,
+                pk_column.replace(']', "]]")
+            );
+
+            let rows = self.query_rows_fast(&query, &columns, &col_types).await?;
+            all_rows.extend(rows);
+        }
+
+        Ok(all_rows)
+    }
 }
 
 /// Convert a row value to SqlValue based on the column type.

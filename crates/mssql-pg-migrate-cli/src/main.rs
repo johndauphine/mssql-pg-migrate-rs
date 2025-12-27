@@ -329,7 +329,7 @@ async fn run() -> Result<(), MigrateError> {
                 config.migration.row_hash_column.clone(),
             );
 
-            println!("Starting multi-tier verification...\n");
+            println!("Starting multi-tier verification{}...\n", if sync { " with auto-sync" } else { "" });
 
             let mut total_result = mssql_pg_migrate::VerifyResult::new();
             let start = std::time::Instant::now();
@@ -340,19 +340,30 @@ async fn run() -> Result<(), MigrateError> {
                     .await
                 {
                     Ok(result) => {
-                        let status = if result.is_in_sync() {
+                        let status = if result.skipped {
+                            "⊘ Skipped"
+                        } else if result.is_in_sync() {
                             "✓ In sync"
                         } else {
                             "✗ Differs"
                         };
-                        println!(
-                            "  {} {} (insert: {}, update: {}, delete: {})",
-                            status,
-                            result.table_name,
-                            result.rows_to_insert,
-                            result.rows_to_update,
-                            result.rows_to_delete
-                        );
+                        if result.skipped {
+                            println!(
+                                "  {} {} ({})",
+                                status,
+                                result.table_name,
+                                result.skip_reason.as_deref().unwrap_or("unknown reason")
+                            );
+                        } else {
+                            println!(
+                                "  {} {} (insert: {}, update: {}, delete: {})",
+                                status,
+                                result.table_name,
+                                result.rows_to_insert,
+                                result.rows_to_update,
+                                result.rows_to_delete
+                            );
+                        }
                         total_result.add_table(result);
                     }
                     Err(e) => {
@@ -370,6 +381,9 @@ async fn run() -> Result<(), MigrateError> {
                 "  Tables with differences: {}",
                 total_result.tables_with_differences
             );
+            if total_result.tables_skipped > 0 {
+                println!("  Tables skipped: {}", total_result.tables_skipped);
+            }
             println!("  Total rows to insert: {}", total_result.total_rows_to_insert);
             println!("  Total rows to update: {}", total_result.total_rows_to_update);
             println!("  Total rows to delete: {}", total_result.total_rows_to_delete);

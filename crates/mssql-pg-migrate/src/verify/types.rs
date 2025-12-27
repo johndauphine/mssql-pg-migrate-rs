@@ -149,6 +149,10 @@ pub struct TableVerifyResult {
     pub rows_to_delete: i64,
     /// Whether sync was performed.
     pub sync_performed: bool,
+    /// Whether the table was skipped (e.g., no single integer PK).
+    pub skipped: bool,
+    /// Reason for skipping (if skipped).
+    pub skip_reason: Option<String>,
     /// Duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -171,6 +175,8 @@ pub struct VerifyResult {
     pub tables_in_sync: usize,
     /// Tables with differences.
     pub tables_with_differences: usize,
+    /// Tables that were skipped (no single integer PK).
+    pub tables_skipped: usize,
     /// Total rows that need to be inserted across all tables.
     pub total_rows_to_insert: i64,
     /// Total rows that need to be updated across all tables.
@@ -191,6 +197,7 @@ impl VerifyResult {
             tables_checked: 0,
             tables_in_sync: 0,
             tables_with_differences: 0,
+            tables_skipped: 0,
             total_rows_to_insert: 0,
             total_rows_to_update: 0,
             total_rows_to_delete: 0,
@@ -201,17 +208,21 @@ impl VerifyResult {
 
     /// Add a table result.
     pub fn add_table(&mut self, result: TableVerifyResult) {
-        self.tables_checked += 1;
-        if result.is_in_sync() {
-            self.tables_in_sync += 1;
+        if result.skipped {
+            self.tables_skipped += 1;
         } else {
-            self.tables_with_differences += 1;
-        }
-        self.total_rows_to_insert += result.rows_to_insert;
-        self.total_rows_to_update += result.rows_to_update;
-        self.total_rows_to_delete += result.rows_to_delete;
-        if result.sync_performed {
-            self.sync_performed = true;
+            self.tables_checked += 1;
+            if result.is_in_sync() {
+                self.tables_in_sync += 1;
+            } else {
+                self.tables_with_differences += 1;
+            }
+            self.total_rows_to_insert += result.rows_to_insert;
+            self.total_rows_to_update += result.rows_to_update;
+            self.total_rows_to_delete += result.rows_to_delete;
+            if result.sync_performed {
+                self.sync_performed = true;
+            }
         }
         self.tables.push(result);
     }
