@@ -26,9 +26,6 @@ const COPY_SEND_BUF_SIZE: usize = 65536 - 5; // Account for packet header
 /// Number of buffer chunks to queue for concurrent network I/O.
 const COPY_CHANNEL_SIZE: usize = 4;
 
-/// Minimum row count for logging detailed upsert profiling information.
-const UPSERT_PROFILING_ROW_THRESHOLD: u64 = 10_000;
-
 /// Trait for target database operations.
 #[async_trait]
 pub trait TargetPool: Send + Sync {
@@ -101,7 +98,6 @@ pub trait TargetPool: Send + Sync {
 
     /// Upsert a chunk of rows.
     /// `writer_id` is used to create a unique staging table per writer to avoid conflicts.
-    /// `row_hash_column` is the configured column name for row hash detection (if present in cols).
     async fn upsert_chunk(
         &self,
         schema: &str,
@@ -110,7 +106,6 @@ pub trait TargetPool: Send + Sync {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64>;
 
     /// Upsert a chunk of rows (used when hash-based change detection pre-filtered rows).
@@ -124,7 +119,6 @@ pub trait TargetPool: Send + Sync {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64>;
 
     /// Get the database type.
@@ -1181,7 +1175,6 @@ impl TargetPool for PgPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64> {
         use std::time::Instant;
 
@@ -1308,8 +1301,7 @@ impl TargetPool for PgPool {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql =
-            build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, row_hash_column);
+        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1321,10 +1313,9 @@ impl TargetPool for PgPool {
         let total_time = chunk_start.elapsed();
 
         // Log detailed timing for profiling (only for larger chunks to avoid spam)
-        if row_count >= UPSERT_PROFILING_ROW_THRESHOLD {
+        if row_count >= 10000 {
             tracing::debug!(
-                "{}.{}: upsert chunk {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
-                schema,
+                "dbo.{}: upsert chunk {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
                 table,
                 row_count,
                 staging_time,
@@ -1350,11 +1341,10 @@ impl TargetPool for PgPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64> {
         // Hash filtering reduces network transfer, but we still use the DB-side
         // WHERE clause to prevent unnecessary writes (WAL, triggers, etc.)
-        self.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
+        self.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
             .await
     }
 
@@ -1877,15 +1867,14 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
 /// Build SQL to merge from staging table into target table.
 /// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
 ///
-/// If `row_hash_column` is provided and present in `cols`, uses it for efficient change detection
-/// (single column compare). Otherwise falls back to comparing all non-PK columns with IS DISTINCT FROM.
+/// If row_hash column is present, uses it for efficient change detection (single column compare).
+/// Otherwise falls back to comparing all non-PK columns with IS DISTINCT FROM.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
-    row_hash_column: Option<&str>,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -1918,21 +1907,13 @@ fn build_staging_merge_sql(
         )
     } else {
         // Use row_hash for change detection if available (much faster than comparing all columns)
-        let hash_col_in_cols = row_hash_column.and_then(|h| {
-            if cols.iter().any(|c| c == h) {
-                Some(h)
-            } else {
-                None
-            }
-        });
+        let has_row_hash = cols.iter().any(|c| c == "row_hash");
 
-        let change_detection = if let Some(hash_col) = hash_col_in_cols {
+        let change_detection = if has_row_hash {
             // Single column comparison using pre-computed hash
             format!(
-                "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                pg_quote_ident(table),
-                pg_quote_ident(hash_col),
-                pg_quote_ident(hash_col)
+                "{}.\"row_hash\" IS DISTINCT FROM EXCLUDED.\"row_hash\"",
+                pg_quote_ident(table)
             )
         } else {
             // Fallback: compare all non-PK columns
@@ -2165,21 +2146,17 @@ mod tests {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        // Should always include change detection WHERE clause (fallback to column comparison)
+        // Should always include change detection WHERE clause
         let sql = build_staging_merge_sql(
             "public",
             "users",
             "_staging_users",
             &cols,
             &pk_cols,
-            None,
         );
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("IS DISTINCT FROM"));
         assert!(sql.contains("DO UPDATE SET"));
-        // Should compare name and value columns
-        assert!(sql.contains(r#""name" IS DISTINCT FROM"#));
-        assert!(sql.contains(r#""value" IS DISTINCT FROM"#));
     }
 
     #[test]
@@ -2194,80 +2171,8 @@ mod tests {
             "_staging_lookup",
             &cols,
             &pk_cols,
-            None,
         );
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_with_row_hash_optimization() {
-        // When row_hash column is present, should use single column comparison
-        let cols = vec![
-            "id".to_string(),
-            "name".to_string(),
-            "value".to_string(),
-            "row_hash".to_string(),
-        ];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("row_hash"),
-        );
-        assert!(sql.contains("WHERE"));
-        // Should use row_hash for change detection
-        assert!(sql.contains(r#""row_hash" IS DISTINCT FROM EXCLUDED."row_hash""#));
-        // Should NOT compare individual columns in WHERE clause
-        assert!(!sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-        assert!(!sql.contains(r#""value" IS DISTINCT FROM EXCLUDED."value""#));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_with_custom_hash_column() {
-        // When using a custom hash column name
-        let cols = vec![
-            "id".to_string(),
-            "name".to_string(),
-            "_hash".to_string(),
-        ];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("_hash"),
-        );
-        // Should use custom hash column
-        assert!(sql.contains(r#""_hash" IS DISTINCT FROM EXCLUDED."_hash""#));
-        assert!(!sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_hash_column_not_in_cols() {
-        // When row_hash_column is specified but not in cols, should fallback
-        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("row_hash"), // specified but not in cols
-        );
-        // Should fallback to comparing all non-PK columns
-        assert!(sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-        assert!(sql.contains(r#""value" IS DISTINCT FROM EXCLUDED."value""#));
-        // Should NOT reference row_hash since it's not in cols
-        assert!(!sql.contains("row_hash"));
     }
 }
