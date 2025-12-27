@@ -276,19 +276,29 @@ impl UniversalVerifyEngine {
     }
 
     /// Convert NTILE partition results to RowRanges.
+    ///
+    /// # Design Note: Using max(source, target) for partition sizes
+    ///
+    /// We use the maximum row count between source and target for each partition.
+    /// This is intentional: when databases have different row counts, the ROW_NUMBER
+    /// queries in Tier 2/3 will naturally return fewer results for the database with
+    /// fewer rows. The comparison logic in `compare_partition_counts` and
+    /// `compare_row_hashes_composite` correctly handles this asymmetry by detecting
+    /// rows that exist in one database but not the other.
     fn partitions_to_row_ranges(
         &self,
         source_partitions: &[(i64, i64)],
         target_partitions: &[(i64, i64)],
     ) -> Vec<RowRange> {
-        // Use the max of source/target partitions
+        // Use the max of source/target partitions to ensure we check all rows
         let max_partitions = source_partitions.len().max(target_partitions.len());
 
         let mut ranges = Vec::with_capacity(max_partitions);
         let mut current_row = 1i64;
 
         for i in 0..max_partitions {
-            // Get row count for this partition from either source or target
+            // Use max to ensure we cover all rows from both databases.
+            // ROW_NUMBER queries handle the case where one database has fewer rows.
             let source_count = source_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
             let target_count = target_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
             let partition_rows = source_count.max(target_count);

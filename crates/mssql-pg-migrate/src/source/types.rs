@@ -20,6 +20,13 @@ pub enum PkValue {
 
 impl PkValue {
     /// Convert to a SQL literal string for use in queries.
+    ///
+    /// # Security Note
+    ///
+    /// This method performs basic SQL escaping (single quotes doubled) which is
+    /// sufficient for typical primary key values (integers, UUIDs, short identifiers).
+    /// For untrusted input or complex strings, prefer parameterized queries.
+    /// This is used internally for building WHERE clauses when fetching rows by PK.
     pub fn to_sql_literal(&self) -> String {
         match self {
             PkValue::Int(v) => v.to_string(),
@@ -29,6 +36,13 @@ impl PkValue {
     }
 
     /// Convert to a SQL literal for MSSQL (with N prefix for Unicode strings).
+    ///
+    /// # Security Note
+    ///
+    /// This method performs basic SQL escaping (single quotes doubled) which is
+    /// sufficient for typical primary key values (integers, UUIDs, short identifiers).
+    /// For untrusted input or complex strings, prefer parameterized queries.
+    /// This is used internally for building WHERE clauses when fetching rows by PK.
     pub fn to_mssql_literal(&self) -> String {
         match self {
             PkValue::Int(v) => v.to_string(),
