@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -27,6 +27,7 @@ pub struct Orchestrator {
     source: Arc<MssqlPool>,
     target: Arc<PgPool>,
     progress_enabled: bool,
+    progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
 }
 
 /// Result of a migration run.
@@ -58,6 +59,10 @@ pub struct MigrationResult {
 
     /// Total rows transferred.
     pub rows_transferred: i64,
+
+    /// Total rows skipped (unchanged in upsert mode with hash detection).
+    #[serde(default)]
+    pub rows_skipped: i64,
 
     /// Average throughput (rows/second).
     pub rows_per_second: i64,
@@ -157,23 +162,40 @@ fn emit_progress_json(update: &ProgressUpdate) {
 }
 
 /// Thread-safe progress tracker for concurrent table transfers.
-#[derive(Debug)]
 struct ProgressTracker {
     tables_completed: AtomicUsize,
     tables_total: usize,
     rows_transferred: AtomicI64,
     started_at: Instant,
     progress_enabled: bool,
+    progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+}
+
+impl std::fmt::Debug for ProgressTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressTracker")
+            .field("tables_completed", &self.tables_completed)
+            .field("tables_total", &self.tables_total)
+            .field("rows_transferred", &self.rows_transferred)
+            .field("progress_enabled", &self.progress_enabled)
+            .field("has_progress_tx", &self.progress_tx.is_some())
+            .finish()
+    }
 }
 
 impl ProgressTracker {
-    fn new(tables_total: usize, progress_enabled: bool) -> Self {
+    fn new(
+        tables_total: usize,
+        progress_enabled: bool,
+        progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
+    ) -> Self {
         Self {
             tables_completed: AtomicUsize::new(0),
             tables_total,
             rows_transferred: AtomicI64::new(0),
             started_at: Instant::now(),
             progress_enabled,
+            progress_tx,
         }
     }
 
@@ -197,7 +219,7 @@ impl ProgressTracker {
     }
 
     fn emit(&self, phase: &str, current_table: Option<String>) {
-        if !self.progress_enabled {
+        if !self.progress_enabled && self.progress_tx.is_none() {
             return;
         }
 
@@ -211,7 +233,13 @@ impl ProgressTracker {
             current_table,
         };
 
-        emit_progress_json(&update);
+        if self.progress_enabled {
+            emit_progress_json(&update);
+        }
+
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.try_send(update);
+        }
     }
 }
 
@@ -240,6 +268,7 @@ impl Orchestrator {
             source: Arc::new(source),
             target: Arc::new(target),
             progress_enabled: false,
+            progress_tx: None,
         })
     }
 
@@ -255,9 +284,15 @@ impl Orchestrator {
         self
     }
 
-    /// Emit a progress update to stderr (for phase transitions before transfer starts).
+    /// Set a channel for progress updates (used by TUI).
+    pub fn with_progress_channel(mut self, tx: mpsc::Sender<ProgressUpdate>) -> Self {
+        self.progress_tx = Some(tx);
+        self
+    }
+
+    /// Emit a progress update (for phase transitions before transfer starts).
     fn emit_progress(&self, phase: &str, tables_total: usize) {
-        if !self.progress_enabled {
+        if !self.progress_enabled && self.progress_tx.is_none() {
             return;
         }
 
@@ -271,7 +306,13 @@ impl Orchestrator {
             current_table: None,
         };
 
-        emit_progress_json(&update);
+        if self.progress_enabled {
+            emit_progress_json(&update);
+        }
+
+        if let Some(tx) = &self.progress_tx {
+            let _ = tx.try_send(update);
+        }
     }
 
     /// Load existing state for resume.
@@ -467,12 +508,14 @@ impl Orchestrator {
         let mut tables_failed = 0;
         let mut failed_tables = Vec::new();
         let mut rows_transferred: i64 = 0;
+        let mut rows_skipped: i64 = 0;
 
         for (name, table_state) in &state.tables {
             match table_state.status {
                 TaskStatus::Completed => {
                     tables_success += 1;
                     rows_transferred += table_state.rows_transferred;
+                    rows_skipped += table_state.rows_skipped;
                 }
                 TaskStatus::Failed => {
                     tables_failed += 1;
@@ -529,6 +572,7 @@ impl Orchestrator {
             tables_success,
             tables_failed,
             rows_transferred,
+            rows_skipped,
             rows_per_second,
             failed_tables,
             table_errors,
@@ -737,7 +781,11 @@ impl Orchestrator {
         let semaphore = Arc::new(Semaphore::new(workers));
 
         // Create progress tracker
-        let progress = Arc::new(ProgressTracker::new(tables.len(), self.progress_enabled));
+        let progress = Arc::new(ProgressTracker::new(
+            tables.len(),
+            self.progress_enabled,
+            self.progress_tx.clone(),
+        ));
 
         let transfer_config = TransferConfig {
             chunk_size: self.config.migration.get_chunk_size(),
@@ -1418,7 +1466,7 @@ mod tests {
     // ProgressTracker tests
     #[test]
     fn test_progress_tracker_new() {
-        let tracker = ProgressTracker::new(10, true);
+        let tracker = ProgressTracker::new(10, true, None);
         assert_eq!(tracker.tables_total, 10);
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 0);
         assert_eq!(tracker.rows_transferred.load(Ordering::Relaxed), 0);
@@ -1427,7 +1475,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_complete_table() {
-        let tracker = ProgressTracker::new(5, false);
+        let tracker = ProgressTracker::new(5, false, None);
 
         tracker.complete_table(1000);
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 1);
@@ -1440,7 +1488,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_increment_table_count() {
-        let tracker = ProgressTracker::new(3, false);
+        let tracker = ProgressTracker::new(3, false, None);
 
         tracker.increment_table_count();
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 1);
@@ -1452,7 +1500,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_rows_per_second() {
-        let tracker = ProgressTracker::new(1, false);
+        let tracker = ProgressTracker::new(1, false, None);
 
         // Initially should be 0
         assert_eq!(tracker.get_rows_per_second(), 0);
@@ -1468,7 +1516,7 @@ mod tests {
     #[test]
     fn test_progress_tracker_disabled_emit() {
         // When progress_enabled is false, emit should not panic
-        let tracker = ProgressTracker::new(5, false);
+        let tracker = ProgressTracker::new(5, false, None);
         tracker.complete_table(1000);
         // This should be a no-op and not panic
         tracker.emit("transferring", Some("test_table".to_string()));
@@ -1479,7 +1527,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(ProgressTracker::new(100, false));
+        let tracker = Arc::new(ProgressTracker::new(100, false, None));
         let mut handles = vec![];
 
         // Spawn 10 threads, each completing 10 tables with 100 rows each

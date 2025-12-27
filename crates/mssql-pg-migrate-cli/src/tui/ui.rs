@@ -3,7 +3,7 @@
 //! Implements the View function of the Elm architecture - pure rendering
 //! from application state to terminal frames.
 
-use crate::tui::app::{App, MigrationPhase, TranscriptEntry};
+use crate::tui::app::{App, MigrationPhase};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Sparkline, Wrap},
     Frame,
 };
+use std::sync::atomic::Ordering;
 
 /// Render the entire application UI.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -31,7 +32,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_footer(frame, app, main_chunks[3]);
 
     // Render overlays on top
-    if app.palette_open {
+    if app.palette_open.load(Ordering::Relaxed) {
         render_palette(frame, app);
     }
 

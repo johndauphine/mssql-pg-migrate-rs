@@ -4,6 +4,8 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use mssql_pg_migrate::{MigrationResult, ProgressUpdate};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -69,14 +71,16 @@ pub enum AppEvent {
 pub struct EventHandler {
     tx: mpsc::Sender<AppEvent>,
     tick_rate: Duration,
+    palette_open: Arc<AtomicBool>,
 }
 
 impl EventHandler {
     /// Create a new event handler.
-    pub fn new(tx: mpsc::Sender<AppEvent>) -> Self {
+    pub fn new(tx: mpsc::Sender<AppEvent>, palette_open: Arc<AtomicBool>) -> Self {
         Self {
             tx,
             tick_rate: Duration::from_millis(250),
+            palette_open,
         }
     }
 
@@ -103,6 +107,8 @@ impl EventHandler {
 
     /// Convert a key event to an app event.
     fn handle_key(&self, key: KeyEvent) -> Option<AppEvent> {
+        let is_palette_open = self.palette_open.load(Ordering::Relaxed);
+
         // Handle Ctrl combinations first
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
@@ -112,43 +118,29 @@ impl EventHandler {
             };
         }
 
-        // Regular keys
-        match key.code {
-            KeyCode::Char('q') => Some(AppEvent::Quit),
-            KeyCode::Char(':') => Some(AppEvent::OpenPalette),
-            KeyCode::Char('?') => Some(AppEvent::ToggleHelp),
-            KeyCode::Char('l') => Some(AppEvent::ToggleLogs),
-            KeyCode::Char('j') | KeyCode::Down => Some(AppEvent::ScrollLogsDown),
-            KeyCode::Char('k') | KeyCode::Up => Some(AppEvent::ScrollLogsUp),
-            KeyCode::Esc => Some(AppEvent::ClosePalette),
-            KeyCode::Enter => Some(AppEvent::PaletteSelect),
-            KeyCode::Backspace => Some(AppEvent::PaletteBackspace),
-            KeyCode::Char(c) => Some(AppEvent::PaletteInput(c)),
-            _ => None,
-        }
-    }
-}
-
-/// Context for palette key handling (different behavior when palette is open).
-pub struct PaletteKeyHandler;
-
-impl PaletteKeyHandler {
-    /// Handle a key event when palette is open.
-    pub fn handle_key(key: KeyEvent) -> Option<AppEvent> {
-        match key.code {
-            KeyCode::Esc => Some(AppEvent::ClosePalette),
-            KeyCode::Enter => Some(AppEvent::PaletteSelect),
-            KeyCode::Up | KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(AppEvent::PaletteUp)
+        if is_palette_open {
+            // Palette mode key handling
+            match key.code {
+                KeyCode::Esc => Some(AppEvent::ClosePalette),
+                KeyCode::Enter => Some(AppEvent::PaletteSelect),
+                KeyCode::Up => Some(AppEvent::PaletteUp),
+                KeyCode::Down => Some(AppEvent::PaletteDown),
+                KeyCode::Backspace => Some(AppEvent::PaletteBackspace),
+                KeyCode::Char(c) => Some(AppEvent::PaletteInput(c)),
+                _ => None,
             }
-            KeyCode::Down | KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Some(AppEvent::PaletteDown)
+        } else {
+            // Normal mode key handling
+            match key.code {
+                KeyCode::Char('q') => Some(AppEvent::Quit),
+                KeyCode::Char(':') => Some(AppEvent::OpenPalette),
+                KeyCode::Char('?') => Some(AppEvent::ToggleHelp),
+                KeyCode::Char('l') => Some(AppEvent::ToggleLogs),
+                KeyCode::Char('j') | KeyCode::Down => Some(AppEvent::ScrollLogsDown),
+                KeyCode::Char('k') | KeyCode::Up => Some(AppEvent::ScrollLogsUp),
+                KeyCode::Esc => Some(AppEvent::ClosePalette),
+                _ => None,
             }
-            KeyCode::Up => Some(AppEvent::PaletteUp),
-            KeyCode::Down => Some(AppEvent::PaletteDown),
-            KeyCode::Backspace => Some(AppEvent::PaletteBackspace),
-            KeyCode::Char(c) => Some(AppEvent::PaletteInput(c)),
-            _ => None,
         }
     }
 }

@@ -29,7 +29,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::panic;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Type alias for the terminal backend.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -79,14 +82,43 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     // Load config for display (don't connect yet)
     let config = Config::load(config_path.as_ref())?;
 
-    // Create application state
-    let mut app = App::new(config, config_path.as_ref().to_path_buf());
-
     // Create event channels
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
+    // Create shared state for palette
+    let palette_open = Arc::new(AtomicBool::new(false));
+
+    // Create log channel and layer
+    let (log_tx, mut log_rx) = mpsc::channel::<String>(500);
+    let tui_layer = TuiLogLayer::new(log_tx);
+
+    // Set up tracing with the TUI layer
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,mssql_pg_migrate=debug"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tui_layer)
+        .init();
+
+    // Create application state
+    let mut app = App::new(
+        config,
+        config_path.as_ref().to_path_buf(),
+        event_tx.clone(),
+        palette_open.clone(),
+    );
+
+    // Spawn log forwarder
+    let log_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(log_line) = log_rx.recv().await {
+            let _ = log_event_tx.send(AppEvent::Log(log_line)).await;
+        }
+    });
+
     // Create event handler for keyboard/tick events
-    let event_handler = EventHandler::new(event_tx.clone());
+    let event_handler = EventHandler::new(event_tx.clone(), palette_open);
     let _event_handle = tokio::spawn(async move {
         event_handler.run().await;
     });

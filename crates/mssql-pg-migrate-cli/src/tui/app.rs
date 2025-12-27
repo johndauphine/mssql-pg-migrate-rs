@@ -7,10 +7,13 @@
 
 use crate::tui::events::AppEvent;
 use crate::tui::actions::Action;
-use mssql_pg_migrate::{Config, MigrateError, ProgressUpdate, MigrationResult};
+use mssql_pg_migrate::{Config, MigrateError, Orchestrator, ProgressUpdate, MigrationResult};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum number of log lines to keep in memory.
@@ -183,8 +186,8 @@ pub struct App {
     /// Elapsed time since migration started.
     pub started_at: Option<Instant>,
 
-    /// Whether command palette is open.
-    pub palette_open: bool,
+    /// Whether command palette is open (shared with event handler).
+    pub palette_open: Arc<AtomicBool>,
 
     /// Current palette search query.
     pub palette_query: String,
@@ -215,11 +218,19 @@ pub struct App {
 
     /// Last migration result.
     pub last_result: Option<MigrationResult>,
+
+    /// Event sender for spawning background tasks.
+    event_tx: mpsc::Sender<AppEvent>,
 }
 
 impl App {
     /// Create a new application with the given config.
-    pub fn new(config: Config, config_path: PathBuf) -> Self {
+    pub fn new(
+        config: Config,
+        config_path: PathBuf,
+        event_tx: mpsc::Sender<AppEvent>,
+        palette_open: Arc<AtomicBool>,
+    ) -> Self {
         let config_summary = ConfigSummary::from(&config);
 
         let mut app = Self {
@@ -234,7 +245,7 @@ impl App {
             tables_completed: 0,
             tables_total: 0,
             started_at: None,
-            palette_open: false,
+            palette_open,
             palette_query: String::new(),
             selected_action: 0,
             filtered_actions: Action::all(),
@@ -245,6 +256,7 @@ impl App {
             config_path,
             cancel_token: None,
             last_result: None,
+            event_tx,
         };
 
         app.add_transcript(TranscriptEntry::info(format!(
@@ -278,14 +290,14 @@ impl App {
             }
 
             AppEvent::OpenPalette => {
-                self.palette_open = true;
+                self.palette_open.store(true, Ordering::Relaxed);
                 self.palette_query.clear();
                 self.selected_action = 0;
                 self.filtered_actions = Action::all();
             }
 
             AppEvent::ClosePalette => {
-                self.palette_open = false;
+                self.palette_open.store(false, Ordering::Relaxed);
             }
 
             AppEvent::PaletteInput(c) => {
@@ -312,7 +324,7 @@ impl App {
 
             AppEvent::PaletteSelect => {
                 if let Some(action) = self.filtered_actions.get(self.selected_action).cloned() {
-                    self.palette_open = false;
+                    self.palette_open.store(false, Ordering::Relaxed);
                     self.execute_action(action).await?;
                 }
             }
@@ -368,28 +380,37 @@ impl App {
     async fn execute_action(&mut self, action: Action) -> Result<(), MigrateError> {
         match action {
             Action::RunMigration => {
+                if self.phase != MigrationPhase::Idle {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting migration..."));
-                // TODO: Spawn migration task
+                self.spawn_migration(false, false).await;
             }
             Action::DryRun => {
+                if self.phase != MigrationPhase::Idle {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting dry run..."));
-                // TODO: Spawn dry run task
+                self.spawn_migration(true, false).await;
             }
             Action::Resume => {
+                if self.phase != MigrationPhase::Idle {
+                    self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Resuming migration..."));
-                // TODO: Spawn resume task
+                self.spawn_migration(false, true).await;
             }
             Action::Validate => {
-                self.add_transcript(TranscriptEntry::info("Starting validation..."));
-                // TODO: Spawn validation task
+                self.add_transcript(TranscriptEntry::info("Validation not yet implemented"));
             }
             Action::HealthCheck => {
-                self.add_transcript(TranscriptEntry::info("Running health check..."));
-                // TODO: Spawn health check task
+                self.spawn_health_check().await;
             }
             Action::SaveLogs => {
-                self.add_transcript(TranscriptEntry::info("Saving logs..."));
-                // TODO: Save logs to file
+                self.save_logs();
             }
             Action::Cancel => {
                 if let Some(token) = &self.cancel_token {
@@ -402,6 +423,113 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Spawn a migration task in the background.
+    async fn spawn_migration(&mut self, dry_run: bool, resume: bool) {
+        // Create cancellation token
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+        self.phase = MigrationPhase::Connecting;
+
+        // Clone what we need for the spawned task
+        let config = self.config.clone();
+        let event_tx = self.event_tx.clone();
+
+        // Create progress channel
+        let (progress_tx, mut progress_rx) = mpsc::channel::<ProgressUpdate>(100);
+
+        // Spawn progress forwarder
+        let progress_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(update) = progress_rx.recv().await {
+                let _ = progress_event_tx.send(AppEvent::Progress(update)).await;
+            }
+        });
+
+        // Spawn migration task
+        tokio::spawn(async move {
+            let result = Self::run_migration(config, progress_tx, cancel, dry_run, resume).await;
+            match result {
+                Ok(migration_result) => {
+                    let _ = event_tx.send(AppEvent::MigrationComplete(migration_result)).await;
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(e.to_string())).await;
+                }
+            }
+        });
+    }
+
+    /// Run the actual migration (called in background task).
+    async fn run_migration(
+        config: Config,
+        progress_tx: mpsc::Sender<ProgressUpdate>,
+        cancel: CancellationToken,
+        dry_run: bool,
+        resume: bool,
+    ) -> Result<MigrationResult, MigrateError> {
+        let mut orchestrator = Orchestrator::new(config)
+            .await?
+            .with_progress_channel(progress_tx);
+
+        if resume {
+            orchestrator = orchestrator.resume()?;
+        }
+
+        orchestrator.run(cancel, dry_run).await
+    }
+
+    /// Spawn a health check task.
+    async fn spawn_health_check(&mut self) {
+        self.add_transcript(TranscriptEntry::info("Running health check..."));
+
+        let config = self.config.clone();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            match Orchestrator::new(config).await {
+                Ok(orchestrator) => {
+                    match orchestrator.health_check().await {
+                        Ok(result) => {
+                            if result.healthy {
+                                let msg = format!(
+                                    "Health check passed (source: {}ms, target: {}ms)",
+                                    result.source_latency_ms, result.target_latency_ms
+                                );
+                                let _ = event_tx.send(AppEvent::Log(msg)).await;
+                            } else {
+                                let msg = format!(
+                                    "Health check failed: source={}, target={}",
+                                    result.source_error.unwrap_or_else(|| "ok".to_string()),
+                                    result.target_error.unwrap_or_else(|| "ok".to_string())
+                                );
+                                let _ = event_tx.send(AppEvent::Error(msg)).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AppEvent::Error(format!("Health check error: {}", e))).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(format!("Failed to connect: {}", e))).await;
+                }
+            }
+        });
+    }
+
+    /// Save logs to a file.
+    fn save_logs(&mut self) {
+        let filename = format!("migration-logs-{}.txt", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+        match std::fs::write(&filename, self.logs.iter().cloned().collect::<Vec<_>>().join("\n")) {
+            Ok(()) => {
+                self.add_transcript(TranscriptEntry::success(format!("Logs saved to {}", filename)));
+            }
+            Err(e) => {
+                self.add_transcript(TranscriptEntry::error(format!("Failed to save logs: {}", e)));
+            }
+        }
     }
 
     /// Filter actions based on the current palette query.
