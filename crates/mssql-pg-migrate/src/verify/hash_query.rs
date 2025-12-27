@@ -110,6 +110,227 @@ FROM "{schema}"."{table_name}""#,
     )
 }
 
+// ============================================================================
+// Universal PK Support: NTILE and ROW_NUMBER based queries
+// ============================================================================
+
+/// Build ORDER BY clause for composite primary keys (MSSQL).
+pub fn mssql_pk_order_by(pk_columns: &[String]) -> String {
+    pk_columns
+        .iter()
+        .map(|col| format!("[{}]", col.replace(']', "]]")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build ORDER BY clause for composite primary keys (PostgreSQL).
+pub fn postgres_pk_order_by(pk_columns: &[String]) -> String {
+    pk_columns
+        .iter()
+        .map(|col| format!("\"{}\"", col.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build SELECT clause for PK columns (MSSQL).
+pub fn mssql_pk_select(pk_columns: &[String]) -> String {
+    pk_columns
+        .iter()
+        .map(|col| format!("[{}]", col.replace(']', "]]")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Build SELECT clause for PK columns (PostgreSQL).
+pub fn postgres_pk_select(pk_columns: &[String]) -> String {
+    pk_columns
+        .iter()
+        .map(|col| format!("\"{}\"", col.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Generate MSSQL query to partition table using NTILE for Tier 1.
+///
+/// Returns partition_id and row_count for each partition.
+/// This is a one-time query to divide the table into N equal partitions.
+pub fn mssql_ntile_partition_query(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+    num_partitions: i64,
+) -> String {
+    let pk_order_by = mssql_pk_order_by(pk_columns);
+    format!(
+        r#"WITH partitioned AS (
+    SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id
+    FROM [{schema}].[{table_name}] WITH (NOLOCK)
+)
+SELECT
+    partition_id,
+    CAST(COUNT(*) AS BIGINT) AS row_count
+FROM partitioned
+GROUP BY partition_id
+ORDER BY partition_id"#,
+        num_partitions = num_partitions,
+        pk_order_by = pk_order_by,
+        schema = schema.replace(']', "]]"),
+        table_name = table_name.replace(']', "]]"),
+    )
+}
+
+/// Generate PostgreSQL query to partition table using NTILE for Tier 1.
+pub fn postgres_ntile_partition_query(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+    num_partitions: i64,
+) -> String {
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    format!(
+        r#"WITH partitioned AS (
+    SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id
+    FROM "{schema}"."{table_name}"
+)
+SELECT
+    partition_id,
+    COUNT(*)::BIGINT AS row_count
+FROM partitioned
+GROUP BY partition_id
+ORDER BY partition_id"#,
+        num_partitions = num_partitions,
+        pk_order_by = pk_order_by,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
+/// Generate MSSQL query to count rows using ROW_NUMBER range.
+///
+/// Used for Tier 2 verification with any PK type.
+pub fn mssql_row_count_with_rownum_query(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+) -> String {
+    let pk_order_by = mssql_pk_order_by(pk_columns);
+    format!(
+        r#"WITH numbered AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num
+    FROM [{schema}].[{table_name}] WITH (NOLOCK)
+)
+SELECT COUNT(*) AS row_count
+FROM numbered
+WHERE row_num >= @P1 AND row_num < @P2"#,
+        pk_order_by = pk_order_by,
+        schema = schema.replace(']', "]]"),
+        table_name = table_name.replace(']', "]]"),
+    )
+}
+
+/// Generate PostgreSQL query to count rows using ROW_NUMBER range.
+pub fn postgres_row_count_with_rownum_query(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+) -> String {
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    format!(
+        r#"WITH numbered AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num
+    FROM "{schema}"."{table_name}"
+)
+SELECT COUNT(*) AS row_count
+FROM numbered
+WHERE row_num >= $1 AND row_num < $2"#,
+        pk_order_by = pk_order_by,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
+/// Generate MSSQL query to fetch (pk_cols..., row_hash) using ROW_NUMBER range.
+///
+/// Returns all PK columns plus computed row_hash for Tier 3 comparison.
+/// Works with any PK type including composite keys.
+pub fn mssql_row_hashes_with_rownum_query(
+    schema: &str,
+    table: &Table,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = mssql_pk_order_by(pk_columns);
+    let pk_select = mssql_pk_select(pk_columns);
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+
+    format!(
+        r#"WITH numbered AS (
+    SELECT {pk_select}, {row_hash_expr} AS row_hash,
+           ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num
+    FROM [{schema}].[{table_name}] WITH (NOLOCK)
+)
+SELECT {pk_select}, row_hash
+FROM numbered
+WHERE row_num >= @P1 AND row_num < @P2
+ORDER BY row_num"#,
+        pk_select = pk_select,
+        row_hash_expr = row_hash_expr,
+        pk_order_by = pk_order_by,
+        schema = schema.replace(']', "]]"),
+        table_name = table.name.replace(']', "]]"),
+    )
+}
+
+/// Generate PostgreSQL query to fetch (pk_cols..., row_hash) using ROW_NUMBER range.
+///
+/// Returns all PK columns plus existing row_hash column for Tier 3 comparison.
+pub fn postgres_row_hashes_with_rownum_query(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+    row_hash_column: &str,
+) -> String {
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let pk_select = postgres_pk_select(pk_columns);
+    let row_hash_col = row_hash_column.replace('"', "\"\"");
+
+    format!(
+        r#"WITH numbered AS (
+    SELECT {pk_select}, "{row_hash_col}" AS row_hash,
+           ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num
+    FROM "{schema}"."{table_name}"
+)
+SELECT {pk_select}, row_hash
+FROM numbered
+WHERE row_num >= $1 AND row_num < $2
+ORDER BY row_num"#,
+        pk_select = pk_select,
+        row_hash_col = row_hash_col,
+        pk_order_by = pk_order_by,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
+/// Generate MSSQL query to get total row count for a table.
+pub fn mssql_total_row_count_query(schema: &str, table_name: &str) -> String {
+    format!(
+        r#"SELECT CAST(COUNT(*) AS BIGINT) AS row_count
+FROM [{schema}].[{table_name}] WITH (NOLOCK)"#,
+        schema = schema.replace(']', "]]"),
+        table_name = table_name.replace(']', "]]"),
+    )
+}
+
+/// Generate PostgreSQL query to get total row count for a table.
+pub fn postgres_total_row_count_query(schema: &str, table_name: &str) -> String {
+    format!(
+        r#"SELECT COUNT(*)::BIGINT AS row_count
+FROM "{schema}"."{table_name}""#,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

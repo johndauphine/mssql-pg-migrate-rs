@@ -1,6 +1,72 @@
 //! Schema and metadata types.
 
 use serde::{Deserialize, Serialize};
+use std::hash::Hash;
+use uuid::Uuid;
+
+/// Represents a primary key value of various types.
+///
+/// This enum allows handling different PK types uniformly for verification
+/// and sync operations.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PkValue {
+    /// Integer primary key (covers int, bigint, smallint, tinyint).
+    Int(i64),
+    /// UUID/GUID primary key.
+    Uuid(Uuid),
+    /// String primary key (varchar, nvarchar, char, nchar).
+    String(String),
+}
+
+impl PkValue {
+    /// Convert to a SQL literal string for use in queries.
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            PkValue::Int(v) => v.to_string(),
+            PkValue::Uuid(v) => format!("'{}'", v),
+            PkValue::String(v) => format!("'{}'", v.replace('\'', "''")),
+        }
+    }
+
+    /// Convert to a SQL literal for MSSQL (with N prefix for Unicode strings).
+    pub fn to_mssql_literal(&self) -> String {
+        match self {
+            PkValue::Int(v) => v.to_string(),
+            PkValue::Uuid(v) => format!("'{}'", v),
+            PkValue::String(v) => format!("N'{}'", v.replace('\'', "''")),
+        }
+    }
+}
+
+impl From<i64> for PkValue {
+    fn from(v: i64) -> Self {
+        PkValue::Int(v)
+    }
+}
+
+impl From<i32> for PkValue {
+    fn from(v: i32) -> Self {
+        PkValue::Int(v as i64)
+    }
+}
+
+impl From<Uuid> for PkValue {
+    fn from(v: Uuid) -> Self {
+        PkValue::Uuid(v)
+    }
+}
+
+impl From<String> for PkValue {
+    fn from(v: String) -> Self {
+        PkValue::String(v)
+    }
+}
+
+impl From<&str> for PkValue {
+    fn from(v: &str) -> Self {
+        PkValue::String(v.to_string())
+    }
+}
 
 /// Table metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]

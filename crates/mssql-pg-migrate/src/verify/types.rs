@@ -2,9 +2,95 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+// Re-export types from source module
+pub use crate::source::PkValue;
 
 // Re-export BatchVerifyConfig from config module
 pub use crate::config::BatchVerifyConfig;
+
+/// Composite primary key (supports single and multi-column PKs).
+///
+/// This is a newtype wrapper around `Vec<PkValue>` that implements `Hash`
+/// for use as a HashMap key in row hash lookups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositePk(pub Vec<PkValue>);
+
+impl CompositePk {
+    /// Create a new composite PK from a vector of values.
+    pub fn new(values: Vec<PkValue>) -> Self {
+        Self(values)
+    }
+
+    /// Create a single-column PK.
+    pub fn single(value: PkValue) -> Self {
+        Self(vec![value])
+    }
+
+    /// Get the number of columns in this PK.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if the PK is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Get the inner values.
+    pub fn values(&self) -> &[PkValue] {
+        &self.0
+    }
+
+    /// Convert to SQL literal for WHERE clause (e.g., for IN or equality).
+    pub fn to_sql_literals(&self) -> Vec<String> {
+        self.0.iter().map(|v| v.to_sql_literal()).collect()
+    }
+}
+
+impl Hash for CompositePk {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Include type discriminator to distinguish Int(1) from String("1")
+        for pk in &self.0 {
+            match pk {
+                PkValue::Int(v) => {
+                    0u8.hash(state);
+                    v.hash(state);
+                }
+                PkValue::Uuid(v) => {
+                    1u8.hash(state);
+                    v.hash(state);
+                }
+                PkValue::String(v) => {
+                    2u8.hash(state);
+                    v.hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl From<i64> for CompositePk {
+    fn from(value: i64) -> Self {
+        Self::single(PkValue::Int(value))
+    }
+}
+
+impl From<PkValue> for CompositePk {
+    fn from(value: PkValue) -> Self {
+        Self::single(value)
+    }
+}
+
+impl From<Vec<PkValue>> for CompositePk {
+    fn from(values: Vec<PkValue>) -> Self {
+        Self::new(values)
+    }
+}
+
+/// Map of composite PK to row hash for efficient lookup.
+pub type CompositeRowHashMap = HashMap<CompositePk, String>;
 
 /// Represents a PK range for batch hashing.
 #[derive(Debug, Clone)]
@@ -31,6 +117,63 @@ impl PkRange {
         while current < self.max_pk {
             let next = (current + batch_size).min(self.max_pk);
             ranges.push(PkRange::new(current, next, next_tier));
+            current = next;
+        }
+
+        ranges
+    }
+}
+
+/// Represents a row-number-based range for batch verification.
+///
+/// Unlike `PkRange`, this uses ROW_NUMBER() positions instead of PK values,
+/// allowing verification of tables with any PK type (int, uuid, string, composite).
+#[derive(Debug, Clone)]
+pub struct RowRange {
+    /// Starting row number (1-based, inclusive).
+    pub start_row: i64,
+    /// Ending row number (exclusive).
+    pub end_row: i64,
+    /// Tier level for this range.
+    pub tier: VerifyTier,
+    /// Partition ID for NTILE-based ranges (Tier 1 only).
+    pub partition_id: Option<i64>,
+}
+
+impl RowRange {
+    /// Create a new row range.
+    pub fn new(start_row: i64, end_row: i64, tier: VerifyTier) -> Self {
+        Self {
+            start_row,
+            end_row,
+            tier,
+            partition_id: None,
+        }
+    }
+
+    /// Create a row range for a NTILE partition.
+    pub fn from_partition(partition_id: i64, start_row: i64, end_row: i64) -> Self {
+        Self {
+            start_row,
+            end_row,
+            tier: VerifyTier::Coarse,
+            partition_id: Some(partition_id),
+        }
+    }
+
+    /// Number of rows in this range.
+    pub fn row_count(&self) -> i64 {
+        self.end_row - self.start_row
+    }
+
+    /// Subdivide this range into smaller row ranges for the next tier.
+    pub fn subdivide(&self, batch_size: i64, next_tier: VerifyTier) -> Vec<RowRange> {
+        let mut ranges = Vec::new();
+        let mut current = self.start_row;
+
+        while current < self.end_row {
+            let next = (current + batch_size).min(self.end_row);
+            ranges.push(RowRange::new(current, next, next_tier));
             current = next;
         }
 
@@ -107,6 +250,38 @@ impl RowHashDiff {
 
     /// Merge another diff into this one.
     pub fn merge(&mut self, other: RowHashDiff) {
+        self.missing_in_target.extend(other.missing_in_target);
+        self.missing_in_source.extend(other.missing_in_source);
+        self.hash_mismatches.extend(other.hash_mismatches);
+    }
+}
+
+/// Result of row-level hash comparison with composite PK support (Tier 3).
+///
+/// Unlike `RowHashDiff`, this supports any PK type including composite keys.
+#[derive(Debug, Clone, Default)]
+pub struct RowHashDiffComposite {
+    /// PKs that exist in source but not target (need INSERT).
+    pub missing_in_target: Vec<CompositePk>,
+    /// PKs that exist in target but not source (may need DELETE).
+    pub missing_in_source: Vec<CompositePk>,
+    /// PKs that exist in both but have different hashes (need UPDATE).
+    pub hash_mismatches: Vec<CompositePk>,
+}
+
+impl RowHashDiffComposite {
+    /// Total number of differences.
+    pub fn total_differences(&self) -> usize {
+        self.missing_in_target.len() + self.missing_in_source.len() + self.hash_mismatches.len()
+    }
+
+    /// Check if there are any differences.
+    pub fn has_differences(&self) -> bool {
+        self.total_differences() > 0
+    }
+
+    /// Merge another diff into this one.
+    pub fn merge(&mut self, other: RowHashDiffComposite) {
         self.missing_in_target.extend(other.missing_in_target);
         self.missing_in_source.extend(other.missing_in_source);
         self.hash_mismatches.extend(other.hash_mismatches);

@@ -17,8 +17,11 @@ pub mod types;
 
 // Re-exports
 pub use types::{
+    // Legacy types (for backward compatibility)
     BatchHashResult, PkRange, RowHashDiff, RowHashEntry, RowHashMap, SyncStats, TableVerifyResult,
     VerifyProgressUpdate, VerifyResult, VerifyTier,
+    // New types for universal PK support
+    CompositePk, CompositeRowHashMap, PkValue, RowHashDiffComposite, RowRange,
 };
 
 use crate::config::BatchVerifyConfig;
