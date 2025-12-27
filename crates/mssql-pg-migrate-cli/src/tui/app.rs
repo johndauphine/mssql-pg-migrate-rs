@@ -10,7 +10,7 @@ use crate::tui::actions::Action;
 use crate::tui::wizard::WizardState;
 use mssql_pg_migrate::{Config, MigrateError, Orchestrator, ProgressUpdate, MigrationResult};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,7 +60,7 @@ impl SlashCommand {
             SlashCommand { name: "/dry-run", description: "Run without making changes", shortcut: None },
             SlashCommand { name: "/validate", description: "Validate row counts", shortcut: None },
             SlashCommand { name: "/health", description: "Run health check", shortcut: None },
-            SlashCommand { name: "/wizard", description: "Configuration wizard", shortcut: None },
+            SlashCommand { name: "/wizard", description: "Configuration wizard [@path]", shortcut: None },
             SlashCommand { name: "/logs", description: "Save logs to file", shortcut: None },
             SlashCommand { name: "/clear", description: "Clear transcript", shortcut: None },
             SlashCommand { name: "/help", description: "Show help", shortcut: Some("?") },
@@ -188,6 +188,7 @@ impl TranscriptEntry {
 /// Summary of loaded configuration.
 #[derive(Debug, Clone)]
 pub struct ConfigSummary {
+    pub config_path: PathBuf,
     pub source_host: String,
     pub source_database: String,
     pub target_host: String,
@@ -197,9 +198,11 @@ pub struct ConfigSummary {
     pub state_file: Option<PathBuf>,
 }
 
-impl From<&Config> for ConfigSummary {
-    fn from(config: &Config) -> Self {
+impl ConfigSummary {
+    /// Create a ConfigSummary from a Config and its file path.
+    pub fn from_config(config: &Config, path: &Path) -> Self {
         Self {
+            config_path: path.to_path_buf(),
             source_host: config.source.host.clone(),
             source_database: config.source.database.clone(),
             target_host: config.target.host.clone(),
@@ -328,7 +331,7 @@ impl App {
         palette_open: Arc<AtomicBool>,
         shared_input_mode: SharedInputMode,
     ) -> Self {
-        let config_summary = ConfigSummary::from(&config);
+        let config_summary = ConfigSummary::from_config(&config, &config_path);
 
         let mut app = Self {
             phase: MigrationPhase::Idle,
@@ -408,7 +411,9 @@ impl App {
             }
 
             AppEvent::ClosePalette => {
+                // Close palette, help, and any other overlays - return to home screen
                 self.palette_open.store(false, Ordering::Relaxed);
+                self.show_help = false;
             }
 
             AppEvent::PaletteInput(c) => {
@@ -554,8 +559,15 @@ impl App {
 
             AppEvent::AcceptSuggestion => {
                 if let Some(suggestion) = self.suggestions.get(self.selected_suggestion).cloned() {
-                    // Replace command input with suggestion value
-                    self.command_input = suggestion.value;
+                    // Check if we're in file completion mode (has @)
+                    if let Some(at_idx) = self.command_input.rfind('@') {
+                        // Preserve the command prefix before @, replace only the path portion
+                        let prefix = &self.command_input[..=at_idx]; // Include the @
+                        self.command_input = format!("{}{}", prefix, suggestion.value);
+                    } else {
+                        // Regular command suggestion - replace entirely
+                        self.command_input = suggestion.value;
+                    }
                     if suggestion.is_dir {
                         // Keep file mode open for directory
                         self.command_input.push('/');
@@ -586,8 +598,12 @@ impl App {
                 self.suggestions.clear();
                 self.selected_suggestion = 0;
                 self.history_index = -1;
-                self.input_mode = InputMode::Normal;
-                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+
+                // Only reset to Normal mode if we didn't start the wizard
+                if self.wizard.is_none() {
+                    self.input_mode = InputMode::Normal;
+                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                }
             }
 
             AppEvent::ExitCommandMode => {
@@ -606,13 +622,19 @@ impl App {
             // --- Wizard events ---
             AppEvent::WizardInput(c) => {
                 if let Some(ref mut wizard) = self.wizard {
-                    wizard.input.push(c);
+                    // Ignore text input for enum selection steps
+                    if !wizard.step.is_enum_selection() {
+                        wizard.input.push(c);
+                    }
                 }
             }
 
             AppEvent::WizardBackspace => {
                 if let Some(ref mut wizard) = self.wizard {
-                    wizard.input.pop();
+                    // Ignore backspace for enum selection steps
+                    if !wizard.step.is_enum_selection() {
+                        wizard.input.pop();
+                    }
                 }
             }
 
@@ -648,9 +670,27 @@ impl App {
 
             AppEvent::WizardBack => {
                 if let Some(ref mut wizard) = self.wizard {
-                    wizard.step = wizard.step.prev();
-                    wizard.input.clear();
-                    wizard.error = None;
+                    if wizard.step.is_enum_selection() {
+                        // Navigate up in enum selection
+                        wizard.select_prev();
+                    } else {
+                        // Go back to previous step
+                        wizard.step = wizard.step.prev();
+                        wizard.input.clear();
+                        wizard.error = None;
+                        wizard.selected_option = 0;
+                        wizard.init_selection_for_step();
+                    }
+                }
+            }
+
+            AppEvent::WizardDown => {
+                if let Some(ref mut wizard) = self.wizard {
+                    if wizard.step.is_enum_selection() {
+                        // Navigate down in enum selection
+                        wizard.select_next();
+                    }
+                    // Down arrow does nothing in text input mode
                 }
             }
 
@@ -1110,7 +1150,7 @@ impl App {
                             } else {
                                 name
                             },
-                            value: format!("@{}", full_path),
+                            value: full_path,
                             is_dir,
                         });
                     }
@@ -1163,14 +1203,44 @@ impl App {
     /// Execute a slash command.
     async fn execute_slash_command(&mut self, command: &str) -> Result<(), MigrateError> {
         // Parse command and arguments
+        // Handle both "/cmd @path" and "/cmd@path" formats
         let parts: Vec<&str> = command.split_whitespace().collect();
         let (cmd, args) = match parts.split_first() {
             Some((cmd, args)) => (*cmd, args),
             None => return Ok(()),
         };
 
-        // Extract config path from args (look for @path)
-        let _config_path = args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..]);
+        // Check if @ is attached to the command (e.g., "/wizard@path")
+        let (cmd, inline_path) = if let Some(at_pos) = cmd.find('@') {
+            (&cmd[..at_pos], Some(&cmd[at_pos + 1..]))
+        } else {
+            (cmd, None)
+        };
+
+        // Extract file path from args (look for @path) or use inline path
+        let file_path = inline_path.or_else(|| {
+            args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..])
+        });
+
+        // For commands that use config files (not /wizard which uses it as output path),
+        // reload config if a file path is provided
+        let commands_that_load_config = ["/run", "/resume", "/dry-run", "/health", "/validate"];
+        if commands_that_load_config.contains(&cmd) {
+            if let Some(path) = file_path.filter(|p| !p.is_empty()) {
+                match Config::load(path) {
+                    Ok(new_config) => {
+                        self.config_path = PathBuf::from(path);
+                        self.config_summary = ConfigSummary::from_config(&new_config, &self.config_path);
+                        self.config = new_config;
+                        self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
+                    }
+                    Err(e) => {
+                        self.add_transcript(TranscriptEntry::error(format!("Failed to load config: {}", e)));
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         match cmd {
             "/run" => {
@@ -1205,11 +1275,44 @@ impl App {
             }
             "/wizard" => {
                 // Start the configuration wizard
-                let output_path = PathBuf::from("config.yaml");
-                self.wizard = Some(WizardState::new(output_path));
+                // Use @path if specified, otherwise default to config.yaml
+                // Strip any leading @ that might have been included
+                let output_path = file_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.strip_prefix('@').unwrap_or(p))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("config.yaml"));
+                let path_display = output_path.display().to_string();
+
+                // If the file exists, load it for editing; otherwise use current config
+                let config_for_wizard = if output_path.exists() {
+                    match Config::load(&output_path) {
+                        Ok(loaded_config) => {
+                            self.add_transcript(TranscriptEntry::info(format!(
+                                "Loading existing config: {}",
+                                path_display
+                            )));
+                            loaded_config
+                        }
+                        Err(e) => {
+                            self.add_transcript(TranscriptEntry::error(format!(
+                                "Failed to load {}: {}. Using current config.",
+                                path_display, e
+                            )));
+                            self.config.clone()
+                        }
+                    }
+                } else {
+                    self.config.clone()
+                };
+
+                self.wizard = Some(WizardState::with_config(output_path, &config_for_wizard));
                 self.input_mode = InputMode::Wizard;
                 self.shared_input_mode.store(INPUT_MODE_WIZARD, Ordering::Relaxed);
-                self.add_transcript(TranscriptEntry::info("Starting configuration wizard..."));
+                self.add_transcript(TranscriptEntry::info(format!(
+                    "Starting configuration wizard (output: {})...",
+                    path_display
+                )));
             }
             "/logs" => {
                 self.save_logs();

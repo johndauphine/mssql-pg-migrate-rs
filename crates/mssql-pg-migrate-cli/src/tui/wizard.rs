@@ -2,6 +2,7 @@
 //!
 //! Provides a step-by-step interactive configuration builder similar to the Go implementation.
 
+use mssql_pg_migrate::Config;
 use std::path::PathBuf;
 
 /// Wizard step enumeration.
@@ -25,7 +26,56 @@ pub enum WizardStep {
     Done,
 }
 
+/// Options for enum selection steps.
+#[derive(Debug, Clone)]
+pub struct EnumOption {
+    pub value: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+}
+
 impl WizardStep {
+    /// Check if this step is an enum selection (not free text input).
+    pub fn is_enum_selection(&self) -> bool {
+        matches!(self, Self::TargetMode | Self::Confirm)
+    }
+
+    /// Get the available options for enum selection steps.
+    pub fn get_options(&self) -> Vec<EnumOption> {
+        match self {
+            Self::TargetMode => vec![
+                EnumOption {
+                    value: "drop_recreate",
+                    label: "Drop & Recreate",
+                    description: "Drop target tables and recreate them (clean migration)",
+                },
+                EnumOption {
+                    value: "truncate",
+                    label: "Truncate",
+                    description: "Truncate existing tables before inserting data",
+                },
+                EnumOption {
+                    value: "upsert",
+                    label: "Upsert",
+                    description: "Insert or update rows based on primary key",
+                },
+            ],
+            Self::Confirm => vec![
+                EnumOption {
+                    value: "y",
+                    label: "Yes",
+                    description: "Save configuration and exit wizard",
+                },
+                EnumOption {
+                    value: "n",
+                    label: "No",
+                    description: "Cancel without saving",
+                },
+            ],
+            _ => vec![],
+        }
+    }
+
     /// Advance to the next step.
     pub fn next(self) -> Self {
         match self {
@@ -136,6 +186,30 @@ impl WizardConfig {
         }
     }
 
+    /// Create a config pre-populated from an existing Config.
+    pub fn from_config(config: &Config) -> Self {
+        use mssql_pg_migrate::TargetMode;
+        let target_mode = match config.migration.target_mode {
+            TargetMode::DropRecreate => "drop_recreate",
+            TargetMode::Truncate => "truncate",
+            TargetMode::Upsert => "upsert",
+        };
+        Self {
+            source_host: config.source.host.clone(),
+            source_port: config.source.port,
+            source_database: config.source.database.clone(),
+            source_user: config.source.user.clone(),
+            source_password: config.source.password.clone(),
+            target_host: config.target.host.clone(),
+            target_port: config.target.port,
+            target_database: config.target.database.clone(),
+            target_user: config.target.user.clone(),
+            target_password: config.target.password.clone(),
+            target_mode: target_mode.to_string(),
+            workers: config.migration.get_workers(),
+        }
+    }
+
     /// Generate YAML configuration string.
     pub fn to_yaml(&self) -> String {
         format!(
@@ -196,6 +270,9 @@ pub struct WizardState {
 
     /// Error message to display.
     pub error: Option<String>,
+
+    /// Selected option index for enum selection steps.
+    pub selected_option: usize,
 }
 
 impl WizardState {
@@ -208,7 +285,58 @@ impl WizardState {
             transcript: Vec::new(),
             input: String::new(),
             error: None,
+            selected_option: 0,
         }
+    }
+
+    /// Create a wizard state pre-populated from an existing Config.
+    pub fn with_config(output_path: PathBuf, config: &Config) -> Self {
+        Self {
+            step: WizardStep::default(),
+            config: WizardConfig::from_config(config),
+            output_path,
+            transcript: Vec::new(),
+            input: String::new(),
+            error: None,
+            selected_option: 0,
+        }
+    }
+
+    /// Move selection up in enum selection mode.
+    pub fn select_prev(&mut self) {
+        if self.step.is_enum_selection() {
+            let options = self.step.get_options();
+            if !options.is_empty() && self.selected_option > 0 {
+                self.selected_option -= 1;
+            }
+        }
+    }
+
+    /// Move selection down in enum selection mode.
+    pub fn select_next(&mut self) {
+        if self.step.is_enum_selection() {
+            let options = self.step.get_options();
+            if !options.is_empty() && self.selected_option < options.len() - 1 {
+                self.selected_option += 1;
+            }
+        }
+    }
+
+    /// Initialize selection to match current config value when entering an enum step.
+    pub fn init_selection_for_step(&mut self) {
+        if !self.step.is_enum_selection() {
+            return;
+        }
+        let options = self.step.get_options();
+        let current_value = match self.step {
+            WizardStep::TargetMode => &self.config.target_mode,
+            WizardStep::Confirm => return, // Always start at "Yes"
+            _ => return,
+        };
+        self.selected_option = options
+            .iter()
+            .position(|o| o.value == current_value)
+            .unwrap_or(0);
     }
 
     /// Get the prompt for the current step.
@@ -223,9 +351,27 @@ impl WizardState {
                 "{}Source Port [{}]: ",
                 step_info, self.config.source_port
             ),
-            WizardStep::SourceDatabase => format!("{}Source Database: ", step_info),
-            WizardStep::SourceUser => format!("{}Source User: ", step_info),
-            WizardStep::SourcePassword => format!("{}Source Password: ", step_info),
+            WizardStep::SourceDatabase => {
+                if self.config.source_database.is_empty() {
+                    format!("{}Source Database: ", step_info)
+                } else {
+                    format!("{}Source Database [{}]: ", step_info, self.config.source_database)
+                }
+            }
+            WizardStep::SourceUser => {
+                if self.config.source_user.is_empty() {
+                    format!("{}Source User: ", step_info)
+                } else {
+                    format!("{}Source User [{}]: ", step_info, self.config.source_user)
+                }
+            }
+            WizardStep::SourcePassword => {
+                if self.config.source_password.is_empty() {
+                    format!("{}Source Password: ", step_info)
+                } else {
+                    format!("{}Source Password [********]: ", step_info)
+                }
+            }
             WizardStep::TargetHost => format!(
                 "{}Target PostgreSQL Host [{}]: ",
                 step_info, self.config.target_host
@@ -234,9 +380,27 @@ impl WizardState {
                 "{}Target Port [{}]: ",
                 step_info, self.config.target_port
             ),
-            WizardStep::TargetDatabase => format!("{}Target Database: ", step_info),
-            WizardStep::TargetUser => format!("{}Target User: ", step_info),
-            WizardStep::TargetPassword => format!("{}Target Password: ", step_info),
+            WizardStep::TargetDatabase => {
+                if self.config.target_database.is_empty() {
+                    format!("{}Target Database: ", step_info)
+                } else {
+                    format!("{}Target Database [{}]: ", step_info, self.config.target_database)
+                }
+            }
+            WizardStep::TargetUser => {
+                if self.config.target_user.is_empty() {
+                    format!("{}Target User: ", step_info)
+                } else {
+                    format!("{}Target User [{}]: ", step_info, self.config.target_user)
+                }
+            }
+            WizardStep::TargetPassword => {
+                if self.config.target_password.is_empty() {
+                    format!("{}Target Password: ", step_info)
+                } else {
+                    format!("{}Target Password [********]: ", step_info)
+                }
+            }
             WizardStep::TargetMode => format!(
                 "{}Target Mode (drop_recreate/truncate/upsert) [{}]: ",
                 step_info, self.config.target_mode
@@ -276,21 +440,28 @@ impl WizardState {
                 self.transcript.push(format!("Source Port: {}", self.config.source_port));
             }
             WizardStep::SourceDatabase => {
-                if input.is_empty() {
+                if input.is_empty() && self.config.source_database.is_empty() {
                     return Err("Database name is required".to_string());
                 }
-                self.config.source_database = input.clone();
-                self.transcript.push(format!("Source Database: {}", input));
+                if !input.is_empty() {
+                    self.config.source_database = input;
+                }
+                self.transcript.push(format!("Source Database: {}", self.config.source_database));
             }
             WizardStep::SourceUser => {
-                if input.is_empty() {
+                if input.is_empty() && self.config.source_user.is_empty() {
                     return Err("Username is required".to_string());
                 }
-                self.config.source_user = input.clone();
-                self.transcript.push(format!("Source User: {}", input));
+                if !input.is_empty() {
+                    self.config.source_user = input;
+                }
+                self.transcript.push(format!("Source User: {}", self.config.source_user));
             }
             WizardStep::SourcePassword => {
-                self.config.source_password = input;
+                // Only update password if input is provided
+                if !input.is_empty() {
+                    self.config.source_password = input;
+                }
                 self.transcript.push("Source Password: ********".to_string());
             }
             WizardStep::TargetHost => {
@@ -308,33 +479,37 @@ impl WizardState {
                 self.transcript.push(format!("Target Port: {}", self.config.target_port));
             }
             WizardStep::TargetDatabase => {
-                if input.is_empty() {
+                if input.is_empty() && self.config.target_database.is_empty() {
                     return Err("Database name is required".to_string());
                 }
-                self.config.target_database = input.clone();
-                self.transcript.push(format!("Target Database: {}", input));
+                if !input.is_empty() {
+                    self.config.target_database = input;
+                }
+                self.transcript.push(format!("Target Database: {}", self.config.target_database));
             }
             WizardStep::TargetUser => {
-                if input.is_empty() {
+                if input.is_empty() && self.config.target_user.is_empty() {
                     return Err("Username is required".to_string());
                 }
-                self.config.target_user = input.clone();
-                self.transcript.push(format!("Target User: {}", input));
+                if !input.is_empty() {
+                    self.config.target_user = input;
+                }
+                self.transcript.push(format!("Target User: {}", self.config.target_user));
             }
             WizardStep::TargetPassword => {
-                self.config.target_password = input;
+                // Only update password if input is provided
+                if !input.is_empty() {
+                    self.config.target_password = input;
+                }
                 self.transcript.push("Target Password: ********".to_string());
             }
             WizardStep::TargetMode => {
-                if !input.is_empty() {
-                    let mode = input.to_lowercase().replace("-", "_").replace(" ", "_");
-                    if mode == "drop_recreate" || mode == "truncate" || mode == "upsert" {
-                        self.config.target_mode = mode;
-                    } else {
-                        return Err("Invalid mode. Use drop_recreate, truncate, or upsert".to_string());
-                    }
+                // Use selected option from enum selector
+                let options = self.step.get_options();
+                if let Some(option) = options.get(self.selected_option) {
+                    self.config.target_mode = option.value.to_string();
+                    self.transcript.push(format!("Target Mode: {} ({})", option.label, option.value));
                 }
-                self.transcript.push(format!("Target Mode: {}", self.config.target_mode));
             }
             WizardStep::Workers => {
                 if !input.is_empty() {
@@ -354,7 +529,8 @@ impl WizardState {
                 self.transcript.push(format!("Output: {}", self.output_path.display()));
             }
             WizardStep::Confirm => {
-                let confirmed = input.to_lowercase() == "y" || input.to_lowercase() == "yes";
+                // Use selected option from enum selector (0 = Yes, 1 = No)
+                let confirmed = self.selected_option == 0;
                 if confirmed {
                     // Save configuration
                     if let Err(e) = self.save() {
@@ -376,6 +552,8 @@ impl WizardState {
         // Advance to next step
         self.step = self.step.next();
         self.input.clear();
+        self.selected_option = 0;
+        self.init_selection_for_step();
         Ok(false)
     }
 

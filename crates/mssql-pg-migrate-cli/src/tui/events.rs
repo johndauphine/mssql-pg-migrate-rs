@@ -110,8 +110,11 @@ pub enum AppEvent {
     /// Submit wizard input (Enter).
     WizardSubmit,
 
-    /// Go back to previous step.
+    /// Go back to previous step (or select previous option).
     WizardBack,
+
+    /// Select next option in enum selection.
+    WizardDown,
 
     /// Cancel wizard.
     WizardCancel,
@@ -221,6 +224,7 @@ impl EventHandler {
                 KeyCode::Enter => Some(AppEvent::WizardSubmit),
                 KeyCode::Backspace => Some(AppEvent::WizardBackspace),
                 KeyCode::Up => Some(AppEvent::WizardBack),
+                KeyCode::Down => Some(AppEvent::WizardDown),
                 KeyCode::Char(c) => Some(AppEvent::WizardInput(c)),
                 _ => None,
             };
