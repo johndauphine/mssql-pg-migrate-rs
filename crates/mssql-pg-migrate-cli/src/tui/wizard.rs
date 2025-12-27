@@ -131,7 +131,7 @@ impl WizardConfig {
             target_database: String::new(),
             target_user: String::new(),
             target_password: String::new(),
-            target_mode: "Clone".to_string(),
+            target_mode: "drop_recreate".to_string(),
             workers: 4,
         }
     }
@@ -238,7 +238,7 @@ impl WizardState {
             WizardStep::TargetUser => format!("{}Target User: ", step_info),
             WizardStep::TargetPassword => format!("{}Target Password: ", step_info),
             WizardStep::TargetMode => format!(
-                "{}Target Mode (Clone/CreateNew/Upsert) [{}]: ",
+                "{}Target Mode (drop_recreate/truncate/upsert) [{}]: ",
                 step_info, self.config.target_mode
             ),
             WizardStep::Workers => format!(
@@ -327,17 +327,11 @@ impl WizardState {
             }
             WizardStep::TargetMode => {
                 if !input.is_empty() {
-                    let mode = input.to_lowercase();
-                    if mode == "clone" || mode == "createnew" || mode == "upsert" {
-                        self.config.target_mode = match mode.as_str() {
-                            "clone" => "Clone",
-                            "createnew" => "CreateNew",
-                            "upsert" => "Upsert",
-                            _ => "Clone",
-                        }
-                        .to_string();
+                    let mode = input.to_lowercase().replace("-", "_").replace(" ", "_");
+                    if mode == "drop_recreate" || mode == "truncate" || mode == "upsert" {
+                        self.config.target_mode = mode;
                     } else {
-                        return Err("Invalid mode. Use Clone, CreateNew, or Upsert".to_string());
+                        return Err("Invalid mode. Use drop_recreate, truncate, or upsert".to_string());
                     }
                 }
                 self.transcript.push(format!("Target Mode: {}", self.config.target_mode));

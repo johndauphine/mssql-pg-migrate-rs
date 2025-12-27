@@ -1358,8 +1358,10 @@ mod tests {
             tables_completed: 5,
             tables_total: 10,
             rows_transferred: 50000,
+            total_rows: 100000,
             rows_per_second: 10000,
             current_table: Some("dbo.Users".into()),
+            table_status: None,
         };
 
         let json = serde_json::to_string(&update).unwrap();
@@ -1376,8 +1378,10 @@ mod tests {
             tables_completed: 10,
             tables_total: 10,
             rows_transferred: 100000,
+            total_rows: 100000,
             rows_per_second: 5000,
             current_table: None,
+            table_status: None,
         };
 
         let json = serde_json::to_string(&update).unwrap();
@@ -1531,7 +1535,7 @@ mod tests {
     // ProgressTracker tests
     #[test]
     fn test_progress_tracker_new() {
-        let tracker = ProgressTracker::new(10, true, None);
+        let tracker = ProgressTracker::new(10, 0, true, None);
         assert_eq!(tracker.tables_total, 10);
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 0);
         assert_eq!(tracker.rows_transferred.load(Ordering::Relaxed), 0);
@@ -1540,7 +1544,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_complete_table() {
-        let tracker = ProgressTracker::new(5, false, None);
+        let tracker = ProgressTracker::new(5, 0, false, None);
 
         // Simulate transfer engine counting rows, then complete_table is called
         tracker.add_rows(1000);
@@ -1556,7 +1560,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_increment_table_count() {
-        let tracker = ProgressTracker::new(3, false, None);
+        let tracker = ProgressTracker::new(3, 0, false, None);
 
         tracker.increment_table_count();
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 1);
@@ -1568,7 +1572,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracker_rows_per_second() {
-        let tracker = ProgressTracker::new(1, false, None);
+        let tracker = ProgressTracker::new(1, 0, false, None);
 
         // Initially should be 0
         assert_eq!(tracker.get_rows_per_second(), 0);
@@ -1585,10 +1589,10 @@ mod tests {
     #[test]
     fn test_progress_tracker_disabled_emit() {
         // When progress_enabled is false, emit should not panic
-        let tracker = ProgressTracker::new(5, false, None);
+        let tracker = ProgressTracker::new(5, 0, false, None);
         tracker.complete_table(1000);
         // This should be a no-op and not panic
-        tracker.emit("transferring", Some("test_table".to_string()));
+        tracker.emit("transferring", Some("test_table".to_string()), None);
     }
 
     #[test]
@@ -1596,7 +1600,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(ProgressTracker::new(100, false, None));
+        let tracker = Arc::new(ProgressTracker::new(100, 0, false, None));
         let mut handles = vec![];
 
         // Spawn 10 threads, each completing 10 tables with 100 rows each
