@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use sysinfo::System;
-use tracing::info;
+use tracing::{info, warn};
 
 /// System resource information for auto-tuning.
 #[derive(Debug, Clone)]
@@ -632,9 +632,17 @@ impl MigrationConfig {
             // glob::Pattern matching is case-sensitive by default,
             // so we lowercase both for case-insensitive matching
             let pattern_lower = pattern_str.to_lowercase();
-            if let Ok(pattern) = Pattern::new(&pattern_lower) {
-                if pattern.matches(&table_lower) {
-                    return true;
+            match Pattern::new(&pattern_lower) {
+                Ok(pattern) => {
+                    if pattern.matches(&table_lower) {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Invalid glob pattern '{}': {}. Pattern will be skipped.",
+                        pattern_str, e
+                    );
                 }
             }
         }
