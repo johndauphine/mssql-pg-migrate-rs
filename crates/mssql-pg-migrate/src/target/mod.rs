@@ -1380,6 +1380,87 @@ impl PgPool {
     }
 }
 
+// Batch verification methods
+impl PgPool {
+    /// Execute a batch hash query and return (hash, row_count).
+    ///
+    /// Used for Tier 1/2 verification to compare aggregate checksums.
+    pub async fn execute_batch_hash(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<(i64, i64)> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "executing batch hash query"))?;
+
+        let row = client
+            .query_one(query, &[&min_pk, &max_pk])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let batch_hash: i64 = row.get(0);
+        let row_count: i64 = row.get(1);
+
+        Ok((batch_hash, row_count))
+    }
+
+    /// Fetch row hashes for a PK range (Tier 3 verification).
+    ///
+    /// Returns a map of PK -> MD5 hash for comparison with source.
+    pub async fn fetch_row_hashes_for_verify(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "fetching row hashes"))?;
+
+        let rows = client
+            .query(query, &[&min_pk, &max_pk])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        for row in rows {
+            let pk: i64 = row.get(0);
+            let hash: Option<String> = row.get(1);
+            if let Some(h) = hash {
+                hashes.insert(pk, h);
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Get PK boundaries (min, max, count) for a table.
+    pub async fn get_pk_bounds(&self, query: &str) -> Result<(i64, i64, i64)> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PK bounds"))?;
+
+        let row = client
+            .query_one(query, &[])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let min_pk: Option<i64> = row.get(0);
+        let max_pk: Option<i64> = row.get(1);
+        let row_count: i64 = row.get(2);
+
+        Ok((min_pk.unwrap_or(0), max_pk.unwrap_or(0), row_count))
+    }
+}
+
 impl PgPool {
     /// Insert rows using PostgreSQL COPY protocol for maximum performance.
     async fn insert_batch(

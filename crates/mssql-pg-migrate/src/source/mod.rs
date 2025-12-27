@@ -755,6 +755,91 @@ impl MssqlPool {
         client.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
+
+    /// Execute a batch hash query and return (hash, row_count).
+    ///
+    /// Used for Tier 1/2 verification to compare aggregate checksums.
+    pub async fn execute_batch_hash(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<(i64, i64)> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(min_pk);
+        q.bind(max_pk);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            let batch_hash: i32 = row.get::<i32, _>(0).unwrap_or(0);
+            let row_count: i32 = row.get::<i32, _>(1).unwrap_or(0);
+            Ok((batch_hash as i64, row_count as i64))
+        } else {
+            Ok((0, 0))
+        }
+    }
+
+    /// Fetch row hashes for a PK range (Tier 3 verification).
+    ///
+    /// Returns a map of PK -> MD5 hash for comparison with target.
+    pub async fn fetch_row_hashes(
+        &self,
+        query: &str,
+        min_pk: i64,
+        max_pk: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(min_pk);
+        q.bind(max_pk);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        for row in rows {
+            if let (Some(pk), Some(hash)) = (
+                row.get::<i64, _>(0).or_else(|| row.get::<i32, _>(0).map(|v| v as i64)),
+                row.get::<&str, _>(1),
+            ) {
+                hashes.insert(pk, hash.to_string());
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Get PK boundaries (min, max, count) for a table.
+    pub async fn get_pk_bounds(
+        &self,
+        query: &str,
+    ) -> Result<(i64, i64, i64)> {
+        let mut client = self.get_client().await?;
+
+        let result = client
+            .simple_query(query)
+            .await
+            .map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            let min_pk: i64 = row.get::<i64, _>(0)
+                .or_else(|| row.get::<i32, _>(0).map(|v| v as i64))
+                .unwrap_or(0);
+            let max_pk: i64 = row.get::<i64, _>(1)
+                .or_else(|| row.get::<i32, _>(1).map(|v| v as i64))
+                .unwrap_or(0);
+            let row_count: i64 = row.get::<i64, _>(2)
+                .or_else(|| row.get::<i32, _>(2).map(|v| v as i64))
+                .unwrap_or(0);
+            Ok((min_pk, max_pk, row_count))
+        } else {
+            Ok((0, 0, 0))
+        }
+    }
 }
 
 /// Convert a row value to SqlValue based on the column type.

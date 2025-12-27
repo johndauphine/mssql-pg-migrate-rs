@@ -394,6 +394,32 @@ impl Orchestrator {
         Ok(result)
     }
 
+    /// Get a reference to the source connection pool.
+    pub fn source_pool(&self) -> Arc<MssqlPool> {
+        Arc::clone(&self.source)
+    }
+
+    /// Get a reference to the target connection pool.
+    pub fn target_pool(&self) -> Arc<PgPool> {
+        Arc::clone(&self.target)
+    }
+
+    /// Extract schema from the source database.
+    pub async fn extract_schema(&self) -> Result<Vec<Table>> {
+        let tables = self.source.extract_schema(&self.config.source.schema).await?;
+
+        // Filter tables based on include/exclude patterns
+        let filtered: Vec<_> = tables
+            .into_iter()
+            .filter(|t| {
+                let table_names = vec![t.name.clone()];
+                !self.config.migration.filter_tables(&table_names).is_empty()
+            })
+            .collect();
+
+        Ok(filtered)
+    }
+
     /// Run the migration.
     /// If dry_run is true, only validates and shows what would happen without transferring data.
     pub async fn run(

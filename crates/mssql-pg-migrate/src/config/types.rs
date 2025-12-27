@@ -329,6 +329,57 @@ pub struct MigrationConfig {
     /// Used when use_hash_detection is enabled.
     #[serde(default = "default_row_hash_column")]
     pub row_hash_column: String,
+
+    /// Batch verification configuration for multi-tier sync validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_verify: Option<BatchVerifyConfig>,
+}
+
+/// Configuration for multi-tier batch verification.
+///
+/// Batch verification uses aggregate checksums to efficiently detect
+/// differences between source and target databases without transferring
+/// all row data. Uses a 4-tier drill-down approach:
+///
+/// 1. **Tier 1 (Coarse)**: Compare checksums of ~1M row ranges
+/// 2. **Tier 2 (Fine)**: For mismatches, compare ~10K row ranges
+/// 3. **Tier 3 (Row)**: Fetch individual row hashes for comparison
+/// 4. **Tier 4 (Sync)**: Transfer only changed rows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchVerifyConfig {
+    /// Tier 1 (coarse) batch size - rows per range (default: 1,000,000).
+    #[serde(default = "default_tier1_batch_size")]
+    pub tier1_batch_size: i64,
+
+    /// Tier 2 (fine) batch size - rows per range (default: 10,000).
+    #[serde(default = "default_tier2_batch_size")]
+    pub tier2_batch_size: i64,
+
+    /// Maximum ranges to verify in parallel per tier.
+    #[serde(default = "default_parallel_verify_ranges")]
+    pub parallel_verify_ranges: usize,
+}
+
+fn default_tier1_batch_size() -> i64 {
+    1_000_000
+}
+
+fn default_tier2_batch_size() -> i64 {
+    10_000
+}
+
+fn default_parallel_verify_ranges() -> usize {
+    4
+}
+
+impl Default for BatchVerifyConfig {
+    fn default() -> Self {
+        Self {
+            tier1_batch_size: default_tier1_batch_size(),
+            tier2_batch_size: default_tier2_batch_size(),
+            parallel_verify_ranges: default_parallel_verify_ranges(),
+        }
+    }
 }
 
 fn default_memory_budget_percent() -> u8 {
