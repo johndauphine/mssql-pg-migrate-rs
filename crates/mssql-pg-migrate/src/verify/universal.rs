@@ -86,6 +86,61 @@ impl UniversalVerifyEngine {
         source_schema: &str,
         target_schema: &str,
     ) -> Result<TableVerifyResult> {
+        // Use the internal method and discard the diff
+        let (result, _diff) = self
+            .verify_table_internal(table, source_schema, target_schema)
+            .await?;
+        Ok(result)
+    }
+
+    /// Verify and sync a single table.
+    ///
+    /// Performs verification and automatically syncs any differences found
+    /// (inserts and updates only - deletes are skipped for safety).
+    ///
+    /// Returns both the verification result and sync statistics.
+    pub async fn verify_and_sync_table(
+        &self,
+        table: &Table,
+        source_schema: &str,
+        target_schema: &str,
+    ) -> Result<(TableVerifyResult, SyncStats)> {
+        // Get both result and diff in a single pass
+        let (result, diff) = self
+            .verify_table_internal(table, source_schema, target_schema)
+            .await?;
+
+        // If there are differences, sync them
+        if result.rows_to_insert > 0 || result.rows_to_update > 0 {
+            info!(
+                "Syncing {} rows ({} inserts, {} updates) for {}.{}",
+                result.rows_to_insert + result.rows_to_update,
+                result.rows_to_insert,
+                result.rows_to_update,
+                source_schema,
+                table.name
+            );
+
+            let stats = self
+                .sync_differences_composite(table, source_schema, target_schema, &diff)
+                .await?;
+
+            Ok((result, stats))
+        } else {
+            Ok((result, SyncStats::default()))
+        }
+    }
+
+    /// Internal verification that returns both result and diff.
+    ///
+    /// This is the core verification logic used by both `verify_table` and
+    /// `verify_and_sync_table` to avoid duplicate work.
+    async fn verify_table_internal(
+        &self,
+        table: &Table,
+        source_schema: &str,
+        target_schema: &str,
+    ) -> Result<(TableVerifyResult, RowHashDiffComposite)> {
         let start = Instant::now();
         let table_name = format!("{}.{}", source_schema, table.name);
 
@@ -97,21 +152,24 @@ impl UniversalVerifyEngine {
                 "Table {} has no primary key, skipping verification",
                 table_name
             );
-            return Ok(TableVerifyResult {
-                table_name,
-                source_row_count: table.row_count,
-                target_row_count: 0,
-                tier1_ranges_checked: 0,
-                tier1_ranges_mismatched: 0,
-                tier2_ranges_checked: 0,
-                tier2_ranges_mismatched: 0,
-                rows_to_insert: 0,
-                rows_to_update: 0,
-                rows_to_delete: 0,
-                skipped: true,
-                skip_reason: Some("Table has no primary key".to_string()),
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
+            return Ok((
+                TableVerifyResult {
+                    table_name,
+                    source_row_count: table.row_count,
+                    target_row_count: 0,
+                    tier1_ranges_checked: 0,
+                    tier1_ranges_mismatched: 0,
+                    tier2_ranges_checked: 0,
+                    tier2_ranges_mismatched: 0,
+                    rows_to_insert: 0,
+                    rows_to_update: 0,
+                    rows_to_delete: 0,
+                    skipped: true,
+                    skip_reason: Some("Table has no primary key".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                },
+                RowHashDiffComposite::default(),
+            ));
         }
 
         let pk_columns = &table.primary_key;
@@ -137,21 +195,24 @@ impl UniversalVerifyEngine {
         let total_rows = source_count.max(target_count);
         if total_rows == 0 {
             info!("Table {} is empty in both databases", table_name);
-            return Ok(TableVerifyResult {
-                table_name,
-                source_row_count: source_count,
-                target_row_count: target_count,
-                tier1_ranges_checked: 0,
-                tier1_ranges_mismatched: 0,
-                tier2_ranges_checked: 0,
-                tier2_ranges_mismatched: 0,
-                rows_to_insert: 0,
-                rows_to_update: 0,
-                rows_to_delete: 0,
-                skipped: false,
-                skip_reason: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
+            return Ok((
+                TableVerifyResult {
+                    table_name,
+                    source_row_count: source_count,
+                    target_row_count: target_count,
+                    tier1_ranges_checked: 0,
+                    tier1_ranges_mismatched: 0,
+                    tier2_ranges_checked: 0,
+                    tier2_ranges_mismatched: 0,
+                    rows_to_insert: 0,
+                    rows_to_update: 0,
+                    rows_to_delete: 0,
+                    skipped: false,
+                    skip_reason: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                },
+                RowHashDiffComposite::default(),
+            ));
         }
 
         let num_partitions = ((total_rows + self.config.tier1_batch_size - 1)
@@ -190,21 +251,24 @@ impl UniversalVerifyEngine {
 
         if tier1_mismatches.is_empty() {
             info!("Table {} is fully synchronized", table_name);
-            return Ok(TableVerifyResult {
-                table_name,
-                source_row_count: source_count,
-                target_row_count: target_count,
-                tier1_ranges_checked: tier1_checked,
-                tier1_ranges_mismatched: 0,
-                tier2_ranges_checked: 0,
-                tier2_ranges_mismatched: 0,
-                rows_to_insert: 0,
-                rows_to_update: 0,
-                rows_to_delete: 0,
-                skipped: false,
-                skip_reason: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
+            return Ok((
+                TableVerifyResult {
+                    table_name,
+                    source_row_count: source_count,
+                    target_row_count: target_count,
+                    tier1_ranges_checked: tier1_checked,
+                    tier1_ranges_mismatched: 0,
+                    tier2_ranges_checked: 0,
+                    tier2_ranges_mismatched: 0,
+                    rows_to_insert: 0,
+                    rows_to_update: 0,
+                    rows_to_delete: 0,
+                    skipped: false,
+                    skip_reason: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                },
+                RowHashDiffComposite::default(),
+            ));
         }
 
         // Tier 2: Fine verification on mismatched ranges using ROW_NUMBER
@@ -251,144 +315,24 @@ impl UniversalVerifyEngine {
         let rows_to_update = total_diff.hash_mismatches.len() as i64;
         let rows_to_delete = total_diff.missing_in_source.len() as i64;
 
-        Ok(TableVerifyResult {
-            table_name,
-            source_row_count: source_count,
-            target_row_count: target_count,
-            tier1_ranges_checked: tier1_checked,
-            tier1_ranges_mismatched: tier1_mismatched,
-            tier2_ranges_checked: tier2_checked,
-            tier2_ranges_mismatched: tier2_mismatched,
-            rows_to_insert,
-            rows_to_update,
-            rows_to_delete,
-            skipped: false,
-            skip_reason: None,
-            duration_ms: start.elapsed().as_millis() as u64,
-        })
-    }
-
-    /// Verify and sync a single table.
-    ///
-    /// Performs verification and automatically syncs any differences found
-    /// (inserts and updates only - deletes are skipped for safety).
-    ///
-    /// Returns both the verification result and sync statistics.
-    pub async fn verify_and_sync_table(
-        &self,
-        table: &Table,
-        source_schema: &str,
-        target_schema: &str,
-    ) -> Result<(TableVerifyResult, SyncStats)> {
-        // First do the verification
-        let result = self.verify_table(table, source_schema, target_schema).await?;
-
-        // If there are differences, sync them
-        if result.rows_to_insert > 0 || result.rows_to_update > 0 {
-            info!(
-                "Syncing {} rows ({} inserts, {} updates) for {}.{}",
-                result.rows_to_insert + result.rows_to_update,
-                result.rows_to_insert,
-                result.rows_to_update,
-                source_schema,
-                table.name
-            );
-
-            // Re-run verification to get the diff (we need the actual PKs)
-            // This is a bit inefficient but keeps the verify_table API clean
-            let diff = self
-                .get_table_diff(table, source_schema, target_schema)
-                .await?;
-
-            let stats = self
-                .sync_differences_composite(table, source_schema, target_schema, &diff)
-                .await?;
-
-            Ok((result, stats))
-        } else {
-            Ok((result, SyncStats::default()))
-        }
-    }
-
-    /// Get the row-level differences for a table (used by verify_and_sync_table).
-    async fn get_table_diff(
-        &self,
-        table: &Table,
-        source_schema: &str,
-        target_schema: &str,
-    ) -> Result<RowHashDiffComposite> {
-        let pk_columns = &table.primary_key;
-
-        // Get row counts
-        let source_count_sql = mssql_total_row_count_query(source_schema, &table.name);
-        let target_count_sql = postgres_total_row_count_query(target_schema, &table.name);
-
-        let (source_count, target_count) = tokio::join!(
-            self.source.get_total_row_count(&source_count_sql),
-            self.target.get_total_row_count(&target_count_sql)
-        );
-
-        let source_count = source_count?;
-        let target_count = target_count?;
-
-        let total_rows = source_count.max(target_count);
-        if total_rows == 0 {
-            return Ok(RowHashDiffComposite::default());
-        }
-
-        let num_partitions = ((total_rows + self.config.tier1_batch_size - 1)
-            / self.config.tier1_batch_size)
-            .max(1);
-
-        // Get partitions
-        let source_ntile_sql =
-            mssql_ntile_partition_query(source_schema, &table.name, pk_columns, num_partitions);
-        let target_ntile_sql =
-            postgres_ntile_partition_query(target_schema, &table.name, pk_columns, num_partitions);
-
-        let (source_partitions, target_partitions) = tokio::join!(
-            self.source.execute_ntile_partition_query(&source_ntile_sql),
-            self.target.execute_ntile_partition_query(&target_ntile_sql)
-        );
-
-        let source_partitions = source_partitions?;
-        let target_partitions = target_partitions?;
-
-        let tier1_ranges = self.partitions_to_row_ranges(&source_partitions, &target_partitions);
-        let tier1_mismatches = self
-            .compare_partition_counts(&source_partitions, &target_partitions, &tier1_ranges)
-            .await;
-
-        if tier1_mismatches.is_empty() {
-            return Ok(RowHashDiffComposite::default());
-        }
-
-        // Tier 2
-        let mut tier2_ranges = Vec::new();
-        for range in &tier1_mismatches {
-            tier2_ranges.extend(range.subdivide(self.config.tier2_batch_size, VerifyTier::Fine));
-        }
-
-        let tier2_mismatches = self
-            .verify_tier_with_rownum(
-                table,
-                source_schema,
-                target_schema,
-                &tier2_ranges,
-                VerifyTier::Fine,
-            )
-            .await?;
-
-        // Tier 3 - get the actual diff
-        let mut total_diff = RowHashDiffComposite::default();
-        for range in &tier2_mismatches {
-            let diff = self
-                .compare_row_hashes_composite(table, source_schema, target_schema, range)
-                .await?;
-            total_diff.merge(diff);
-        }
-
-        Ok(total_diff)
+        Ok((
+            TableVerifyResult {
+                table_name,
+                source_row_count: source_count,
+                target_row_count: target_count,
+                tier1_ranges_checked: tier1_checked,
+                tier1_ranges_mismatched: tier1_mismatched,
+                tier2_ranges_checked: tier2_checked,
+                tier2_ranges_mismatched: tier2_mismatched,
+                rows_to_insert,
+                rows_to_update,
+                rows_to_delete,
+                skipped: false,
+                skip_reason: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            },
+            total_diff,
+        ))
     }
 
     /// Convert NTILE partition results to RowRanges.
