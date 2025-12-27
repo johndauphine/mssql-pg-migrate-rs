@@ -1,51 +1,36 @@
-//! Multi-tier batch verification for efficient data sync validation.
+//! Universal verification engine supporting any primary key type.
 //!
-//! This module implements a 4-tier drill-down approach to efficiently verify
-//! data synchronization between MSSQL and PostgreSQL:
-//!
-//! - **Tier 1 (Coarse)**: Compare row counts of ~1M row ranges
-//! - **Tier 2 (Fine)**: For mismatches, subdivide into ~10K row ranges
-//! - **Tier 3 (Row)**: Compare (PK, row_hash) pairs using SQL-side hashing
-//! - **Tier 4 (Sync)**: Transfer only changed rows
-//!
-//! MSSQL computes hashes server-side using HASHBYTES to minimize data transfer.
-//! PostgreSQL uses the existing row_hash column computed during migration.
-//!
-//! ## Engines
-//!
-//! - `VerifyEngine`: Original engine requiring single-column integer PKs
-//! - `UniversalVerifyEngine`: New engine supporting any PK type (int, uuid, string, composite)
-
-pub mod hash_query;
-pub mod normalize;
-pub mod types;
-pub mod universal;
-
-// Re-exports
-pub use types::{
-    // Legacy types (for backward compatibility)
-    BatchHashResult, PkRange, RowHashDiff, RowHashEntry, RowHashMap, SyncStats, TableVerifyResult,
-    VerifyProgressUpdate, VerifyResult, VerifyTier,
-    // New types for universal PK support
-    CompositePk, CompositeRowHashMap, PkValue, RowHashDiffComposite, RowRange,
-};
-pub use universal::UniversalVerifyEngine;
+//! This engine uses NTILE and ROW_NUMBER based queries instead of PK-range queries,
+//! enabling verification of tables with:
+//! - Integer PKs (existing behavior)
+//! - UUID/GUID PKs
+//! - String PKs (VARCHAR, NVARCHAR)
+//! - Composite PKs (multiple columns)
 
 use crate::config::BatchVerifyConfig;
 use crate::error::Result;
 use crate::source::{MssqlPool, Table};
 use crate::target::{calculate_row_hash, PgPool, SqlValue};
-use hash_query::{
-    mssql_count_query, mssql_pk_bounds_query, mssql_row_hashes_query,
-    postgres_count_query, postgres_pk_bounds_query, postgres_row_hashes_query,
+use crate::verify::hash_query::{
+    mssql_ntile_partition_query, mssql_row_count_with_rownum_query,
+    mssql_row_hashes_with_rownum_query, mssql_total_row_count_query,
+    postgres_ntile_partition_query, postgres_row_count_with_rownum_query,
+    postgres_row_hashes_with_rownum_query, postgres_total_row_count_query,
+};
+use crate::verify::{
+    CompositePk, RowHashDiffComposite, RowRange, SyncStats,
+    TableVerifyResult, VerifyProgressUpdate, VerifyTier,
 };
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Engine for multi-tier batch verification.
-pub struct VerifyEngine {
+/// Engine for multi-tier batch verification with universal PK support.
+///
+/// Unlike the original `VerifyEngine`, this supports any primary key type
+/// by using NTILE partitioning and ROW_NUMBER-based ranges.
+pub struct UniversalVerifyEngine {
     source: Arc<MssqlPool>,
     target: Arc<PgPool>,
     config: BatchVerifyConfig,
@@ -53,8 +38,8 @@ pub struct VerifyEngine {
     progress_tx: Option<mpsc::Sender<VerifyProgressUpdate>>,
 }
 
-impl VerifyEngine {
-    /// Create a new verification engine.
+impl UniversalVerifyEngine {
+    /// Create a new universal verification engine.
     pub fn new(
         source: Arc<MssqlPool>,
         target: Arc<PgPool>,
@@ -83,7 +68,7 @@ impl VerifyEngine {
         }
     }
 
-    /// Verify a single table using multi-tier approach.
+    /// Verify a single table using multi-tier approach with any PK type.
     pub async fn verify_table(
         &self,
         table: &Table,
@@ -94,12 +79,12 @@ impl VerifyEngine {
         let start = Instant::now();
         let table_name = format!("{}.{}", source_schema, table.name);
 
-        info!("Starting verification for table: {}", table_name);
+        info!("Starting universal verification for table: {}", table_name);
 
-        // Check if table has a single integer PK (required for range-based verification)
-        if !table.supports_keyset_pagination() {
+        // Check if table has a primary key (any type is OK)
+        if table.primary_key.is_empty() {
             warn!(
-                "Table {} does not have a single integer PK, skipping verification",
+                "Table {} has no primary key, skipping verification",
                 table_name
             );
             return Ok(TableVerifyResult {
@@ -115,49 +100,83 @@ impl VerifyEngine {
                 rows_to_delete: 0,
                 sync_performed: false,
                 skipped: true,
-                skip_reason: Some("Table does not have a single integer primary key".to_string()),
+                skip_reason: Some("Table has no primary key".to_string()),
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
 
-        let pk_column = &table.primary_key[0];
+        let pk_columns = &table.primary_key;
 
-        // Get PK bounds from both databases
-        let source_bounds_query = mssql_pk_bounds_query(source_schema, &table.name, pk_column);
-        let target_bounds_query = postgres_pk_bounds_query(target_schema, &table.name, pk_column);
+        // Get total row counts from both databases
+        let source_count_sql = mssql_total_row_count_query(source_schema, &table.name);
+        let target_count_sql = postgres_total_row_count_query(target_schema, &table.name);
 
-        let (source_min, source_max, source_count) =
-            self.source.get_pk_bounds(&source_bounds_query).await?;
-        let (target_min, target_max, target_count) =
-            self.target.get_pk_bounds(&target_bounds_query).await?;
-
-        info!(
-            "Table {} - Source: {} rows (PK {}..{}), Target: {} rows (PK {}..{})",
-            table_name, source_count, source_min, source_max, target_count, target_min, target_max
+        let (source_count, target_count) = tokio::join!(
+            self.source.get_total_row_count(&source_count_sql),
+            self.target.get_total_row_count(&target_count_sql)
         );
 
-        // Use the union of PK ranges for verification
-        let min_pk = source_min.min(target_min);
-        let max_pk = source_max.max(target_max) + 1; // +1 because max_pk is exclusive
+        let source_count = source_count?;
+        let target_count = target_count?;
 
-        // Tier 1: Coarse verification
-        let tier1_ranges = self.create_ranges(min_pk, max_pk, self.config.tier1_batch_size);
+        info!(
+            "Table {} - Source: {} rows, Target: {} rows",
+            table_name, source_count, target_count
+        );
+
+        // Calculate number of Tier 1 partitions
+        let total_rows = source_count.max(target_count);
+        if total_rows == 0 {
+            info!("Table {} is empty in both databases", table_name);
+            return Ok(TableVerifyResult {
+                table_name,
+                source_row_count: source_count,
+                target_row_count: target_count,
+                tier1_ranges_checked: 0,
+                tier1_ranges_mismatched: 0,
+                tier2_ranges_checked: 0,
+                tier2_ranges_mismatched: 0,
+                rows_to_insert: 0,
+                rows_to_update: 0,
+                rows_to_delete: 0,
+                sync_performed: false,
+                skipped: false,
+                skip_reason: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let num_partitions = ((total_rows + self.config.tier1_batch_size - 1)
+            / self.config.tier1_batch_size)
+            .max(1);
+
+        // Tier 1: Get NTILE partition counts from both databases
+        let source_ntile_sql =
+            mssql_ntile_partition_query(source_schema, &table.name, pk_columns, num_partitions);
+        let target_ntile_sql =
+            postgres_ntile_partition_query(target_schema, &table.name, pk_columns, num_partitions);
+
+        let (source_partitions, target_partitions) = tokio::join!(
+            self.source.execute_ntile_partition_query(&source_ntile_sql),
+            self.target.execute_ntile_partition_query(&target_ntile_sql)
+        );
+
+        let source_partitions = source_partitions?;
+        let target_partitions = target_partitions?;
+
+        // Convert partition results to RowRanges
+        let tier1_ranges = self.partitions_to_row_ranges(&source_partitions, &target_partitions);
+
+        // Compare Tier 1 partition counts
         let tier1_mismatches = self
-            .verify_tier(
-                table,
-                source_schema,
-                target_schema,
-                pk_column,
-                &tier1_ranges,
-                VerifyTier::Coarse,
-            )
-            .await?;
+            .compare_partition_counts(&source_partitions, &target_partitions, &tier1_ranges)
+            .await;
 
         let tier1_checked = tier1_ranges.len();
         let tier1_mismatched = tier1_mismatches.len();
 
         info!(
-            "Tier 1: {}/{} ranges mismatched",
+            "Tier 1: {}/{} partitions mismatched",
             tier1_mismatched, tier1_checked
         );
 
@@ -181,18 +200,17 @@ impl VerifyEngine {
             });
         }
 
-        // Tier 2: Fine verification on mismatched ranges
+        // Tier 2: Fine verification on mismatched ranges using ROW_NUMBER
         let mut tier2_ranges = Vec::new();
         for range in &tier1_mismatches {
             tier2_ranges.extend(range.subdivide(self.config.tier2_batch_size, VerifyTier::Fine));
         }
 
         let tier2_mismatches = self
-            .verify_tier(
+            .verify_tier_with_rownum(
                 table,
                 source_schema,
                 target_schema,
-                pk_column,
                 &tier2_ranges,
                 VerifyTier::Fine,
             )
@@ -206,11 +224,11 @@ impl VerifyEngine {
             tier2_mismatched, tier2_checked
         );
 
-        // Tier 3: Row-level hash comparison
-        let mut total_diff = RowHashDiff::default();
+        // Tier 3: Row-level hash comparison with composite PK support
+        let mut total_diff = RowHashDiffComposite::default();
         for range in &tier2_mismatches {
             let diff = self
-                .compare_row_hashes(table, source_schema, target_schema, pk_column, range)
+                .compare_row_hashes_composite(table, source_schema, target_schema, range)
                 .await?;
             total_diff.merge(diff);
         }
@@ -228,15 +246,12 @@ impl VerifyEngine {
 
         // Tier 4: Sync if requested
         let sync_performed = if auto_sync && total_diff.has_differences() {
-            info!("Tier 4: Syncing {} changed rows", total_diff.total_differences());
-            self.sync_differences(
-                table,
-                source_schema,
-                target_schema,
-                pk_column,
-                &total_diff,
-            )
-            .await?;
+            info!(
+                "Tier 4: Syncing {} changed rows",
+                total_diff.total_differences()
+            );
+            self.sync_differences_composite(table, source_schema, target_schema, &total_diff)
+                .await?;
             true
         } else {
             false
@@ -260,61 +275,108 @@ impl VerifyEngine {
         })
     }
 
-    /// Create PK ranges for verification.
-    fn create_ranges(&self, min_pk: i64, max_pk: i64, batch_size: i64) -> Vec<PkRange> {
-        let mut ranges = Vec::new();
-        let mut current = min_pk;
+    /// Convert NTILE partition results to RowRanges.
+    fn partitions_to_row_ranges(
+        &self,
+        source_partitions: &[(i64, i64)],
+        target_partitions: &[(i64, i64)],
+    ) -> Vec<RowRange> {
+        // Use the max of source/target partitions
+        let max_partitions = source_partitions.len().max(target_partitions.len());
 
-        while current < max_pk {
-            let next = (current + batch_size).min(max_pk);
-            ranges.push(PkRange::new(current, next, VerifyTier::Coarse));
-            current = next;
+        let mut ranges = Vec::with_capacity(max_partitions);
+        let mut current_row = 1i64;
+
+        for i in 0..max_partitions {
+            // Get row count for this partition from either source or target
+            let source_count = source_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
+            let target_count = target_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
+            let partition_rows = source_count.max(target_count);
+
+            if partition_rows > 0 {
+                ranges.push(RowRange::from_partition(
+                    (i + 1) as i64,
+                    current_row,
+                    current_row + partition_rows,
+                ));
+                current_row += partition_rows;
+            }
         }
 
         ranges
     }
 
-    /// Verify a tier and return mismatched ranges.
-    ///
-    /// Uses fast count queries for Tier 1/2. Only transfers count values,
-    /// not row data, for maximum efficiency.
-    async fn verify_tier(
+    /// Compare partition counts and return mismatched ranges.
+    async fn compare_partition_counts(
+        &self,
+        source_partitions: &[(i64, i64)],
+        target_partitions: &[(i64, i64)],
+        ranges: &[RowRange],
+    ) -> Vec<RowRange> {
+        let mut mismatches = Vec::new();
+
+        // Create maps for easy lookup
+        let source_map: std::collections::HashMap<i64, i64> =
+            source_partitions.iter().cloned().collect();
+        let target_map: std::collections::HashMap<i64, i64> =
+            target_partitions.iter().cloned().collect();
+
+        for range in ranges {
+            if let Some(partition_id) = range.partition_id {
+                let source_count = source_map.get(&partition_id).copied().unwrap_or(0);
+                let target_count = target_map.get(&partition_id).copied().unwrap_or(0);
+
+                if source_count != target_count {
+                    debug!(
+                        "Partition {}: count mismatch (src: {}, tgt: {})",
+                        partition_id, source_count, target_count
+                    );
+                    mismatches.push(range.clone());
+                }
+            }
+        }
+
+        mismatches
+    }
+
+    /// Verify a tier using ROW_NUMBER-based count queries.
+    async fn verify_tier_with_rownum(
         &self,
         table: &Table,
         source_schema: &str,
         target_schema: &str,
-        pk_column: &str,
-        ranges: &[PkRange],
+        ranges: &[RowRange],
         tier: VerifyTier,
-    ) -> Result<Vec<PkRange>> {
+    ) -> Result<Vec<RowRange>> {
         let mut mismatches = Vec::new();
 
+        let pk_columns = &table.primary_key;
+
         // Build count queries
-        let source_count_sql = mssql_count_query(source_schema, &table.name, pk_column);
-        let target_count_sql = postgres_count_query(target_schema, &table.name, pk_column);
+        let source_count_sql =
+            mssql_row_count_with_rownum_query(source_schema, &table.name, pk_columns);
+        let target_count_sql =
+            postgres_row_count_with_rownum_query(target_schema, &table.name, pk_columns);
 
         for (i, range) in ranges.iter().enumerate() {
-            // Execute count queries in parallel (very fast - just returns a number)
+            // Execute count queries in parallel
             let (source_result, target_result) = tokio::join!(
-                self.source.execute_count_query(&source_count_sql, range.min_pk, range.max_pk),
-                self.target.execute_count_query(&target_count_sql, range.min_pk, range.max_pk)
+                self.source
+                    .execute_count_query_with_rownum(&source_count_sql, range),
+                self.target
+                    .execute_count_query_with_rownum(&target_count_sql, range)
             );
 
             let source_count = source_result?;
             let target_count = target_result?;
 
-            // If counts differ, there's definitely a mismatch
             if source_count != target_count {
                 debug!(
                     "{} range {}..{}: count mismatch (src: {}, tgt: {})",
-                    tier, range.min_pk, range.max_pk, source_count, target_count
+                    tier, range.start_row, range.end_row, source_count, target_count
                 );
-                mismatches.push(PkRange::new(range.min_pk, range.max_pk, tier));
+                mismatches.push(range.clone());
             }
-            // If counts match but we're at Tier 2, we need to drill down to Tier 3
-            // to catch in-place modifications (same count, different data)
-            // For Tier 1, we accept the risk of missing same-count modifications
-            // and rely on Tier 2 to catch them with smaller ranges
 
             // Send progress update
             self.send_progress(VerifyProgressUpdate {
@@ -330,46 +392,46 @@ impl VerifyEngine {
         Ok(mismatches)
     }
 
-    /// Compare row hashes between source and target for a specific range.
-    ///
-    /// Uses SQL-side hashing on MSSQL (HASHBYTES) to minimize data transfer.
-    /// Fetches only (pk, row_hash) from PostgreSQL (uses existing row_hash column).
-    async fn compare_row_hashes(
+    /// Compare row hashes with composite PK support.
+    async fn compare_row_hashes_composite(
         &self,
         table: &Table,
         source_schema: &str,
         target_schema: &str,
-        pk_column: &str,
-        range: &PkRange,
-    ) -> Result<RowHashDiff> {
-        // Build queries for (pk, row_hash) pairs
-        let source_hash_sql = mssql_row_hashes_query(source_schema, table, pk_column);
-        let target_hash_sql = postgres_row_hashes_query(
+        range: &RowRange,
+    ) -> Result<RowHashDiffComposite> {
+        let pk_columns = &table.primary_key;
+        let pk_count = pk_columns.len();
+
+        // Build queries for (pk_cols..., row_hash) tuples
+        let source_hash_sql = mssql_row_hashes_with_rownum_query(source_schema, table);
+        let target_hash_sql = postgres_row_hashes_with_rownum_query(
             target_schema,
             &table.name,
-            pk_column,
+            pk_columns,
             &self.row_hash_column,
         );
 
         // Fetch hashes from both databases in parallel
-        // Only (pk, hash) pairs are transferred - not full row data
         let (source_result, target_result) = tokio::join!(
-            self.source.fetch_row_hashes(&source_hash_sql, range.min_pk, range.max_pk),
-            self.target.fetch_row_hashes_for_verify(&target_hash_sql, range.min_pk, range.max_pk)
+            self.source
+                .fetch_row_hashes_with_rownum(&source_hash_sql, range, pk_count),
+            self.target
+                .fetch_row_hashes_with_rownum(&target_hash_sql, range, pk_count)
         );
 
         let source_hashes = source_result?;
         let target_hashes = target_result?;
 
-        let mut diff = RowHashDiff::default();
+        let mut diff = RowHashDiffComposite::default();
 
         // Find rows in source but not in target (need INSERT)
         // Find rows with different hashes (need UPDATE)
         for (pk, source_hash) in &source_hashes {
             match target_hashes.get(pk) {
-                None => diff.missing_in_target.push(*pk),
+                None => diff.missing_in_target.push(pk.clone()),
                 Some(target_hash) if target_hash != source_hash => {
-                    diff.hash_mismatches.push(*pk);
+                    diff.hash_mismatches.push(pk.clone());
                 }
                 _ => {} // Hashes match, no action needed
             }
@@ -378,33 +440,29 @@ impl VerifyEngine {
         // Find rows in target but not in source (may need DELETE)
         for pk in target_hashes.keys() {
             if !source_hashes.contains_key(pk) {
-                diff.missing_in_source.push(*pk);
+                diff.missing_in_source.push(pk.clone());
             }
         }
 
         Ok(diff)
     }
 
-    /// Sync differences from source to target.
-    ///
-    /// - Inserts: Fetch rows from source and upsert to target
-    /// - Updates: Fetch rows from source and upsert to target
-    /// - Deletes: Delete rows from target that don't exist in source
-    async fn sync_differences(
+    /// Sync differences using composite PKs.
+    async fn sync_differences_composite(
         &self,
         table: &Table,
         source_schema: &str,
         target_schema: &str,
-        pk_column: &str,
-        diff: &RowHashDiff,
+        diff: &RowHashDiffComposite,
     ) -> Result<SyncStats> {
         use crate::target::TargetPool;
 
         let mut stats = SyncStats::default();
+        let pk_columns = &table.primary_key;
 
         // Combine inserts and updates - both need to fetch from source and upsert
-        let mut pks_to_upsert: Vec<i64> = diff.missing_in_target.clone();
-        pks_to_upsert.extend(diff.hash_mismatches.iter().copied());
+        let mut pks_to_upsert: Vec<CompositePk> = diff.missing_in_target.clone();
+        pks_to_upsert.extend(diff.hash_mismatches.iter().cloned());
 
         if !pks_to_upsert.is_empty() {
             info!(
@@ -416,20 +474,19 @@ impl VerifyEngine {
                 table.name
             );
 
-            // Fetch rows from source
+            // Fetch rows from source by composite PKs
             let rows = self
                 .source
-                .fetch_rows_by_pks(table, pk_column, &pks_to_upsert)
+                .fetch_rows_by_composite_pks(table, &pks_to_upsert)
                 .await?;
 
             if !rows.is_empty() {
                 // Build column list
                 let mut columns: Vec<String> =
                     table.columns.iter().map(|c| c.name.clone()).collect();
-                let pk_cols = vec![pk_column.to_string()];
 
                 // Find PK column indices for hash calculation
-                let pk_indices: Vec<usize> = pk_cols
+                let pk_indices: Vec<usize> = pk_columns
                     .iter()
                     .filter_map(|pk| columns.iter().position(|c| c == pk))
                     .collect();
@@ -453,7 +510,7 @@ impl VerifyEngine {
                         target_schema,
                         &table.name,
                         &columns,
-                        &pk_cols,
+                        pk_columns,
                         rows_with_hash,
                         0, // writer_id
                         Some(&self.row_hash_column),
@@ -481,16 +538,19 @@ impl VerifyEngine {
 
             let deleted = self
                 .target
-                .delete_rows_by_pks(
+                .delete_rows_by_composite_pks(
                     target_schema,
                     &table.name,
-                    pk_column,
+                    pk_columns,
                     &diff.missing_in_source,
                 )
                 .await?;
 
             stats.rows_deleted = deleted;
-            info!("Deleted {} rows from {}.{}", deleted, target_schema, table.name);
+            info!(
+                "Deleted {} rows from {}.{}",
+                deleted, target_schema, table.name
+            );
         }
 
         Ok(stats)

@@ -113,7 +113,7 @@ pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String]) -> String 
     let col_exprs: Vec<String> = columns
         .iter()
         .filter(|c| !pk_columns.contains(&c.name))
-        .map(|c| mssql_normalize_expr(c))
+        .map(mssql_normalize_expr)
         .collect();
 
     if col_exprs.is_empty() {

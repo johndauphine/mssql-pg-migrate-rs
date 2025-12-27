@@ -1,8 +1,9 @@
 //! PostgreSQL target database operations.
 
 use crate::error::{MigrateError, Result};
-use crate::source::{CheckConstraint, ForeignKey, Index, Table};
+use crate::source::{CheckConstraint, ForeignKey, Index, PkValue, Table};
 use crate::typemap::mssql_to_postgres;
+use crate::verify::{CompositePk, CompositeRowHashMap, RowRange};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
@@ -1644,6 +1645,213 @@ impl PgPool {
 
         Ok(result)
     }
+
+    // ========================================================================
+    // Universal PK Verification Methods (ROW_NUMBER-based)
+    // ========================================================================
+
+    /// Get total row count for a table.
+    ///
+    /// Used for Tier 1 initial partitioning.
+    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting total row count"))?;
+
+        let row = client
+            .query_one(query, &[])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let row_count: i64 = row.get(0);
+        Ok(row_count)
+    }
+
+    /// Execute NTILE partition query and return partition row counts.
+    ///
+    /// Returns a vector of (partition_id, row_count) tuples for Tier 1.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "executing NTILE partition query"))?;
+
+        let rows = client
+            .query(query, &[])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let mut partitions = Vec::new();
+        for row in rows {
+            let partition_id: i64 = row.get(0);
+            let row_count: i64 = row.get(1);
+            partitions.push((partition_id, row_count));
+        }
+
+        Ok(partitions)
+    }
+
+    /// Execute count query using ROW_NUMBER range (Tier 2 verification).
+    ///
+    /// Used for tables with any PK type (int, uuid, string, composite).
+    pub async fn execute_count_query_with_rownum(
+        &self,
+        query: &str,
+        range: &RowRange,
+    ) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "executing count query with rownum"))?;
+
+        let row = client
+            .query_one(query, &[&range.start_row, &range.end_row])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let row_count: i64 = row.get(0);
+        Ok(row_count)
+    }
+
+    /// Fetch row hashes using ROW_NUMBER range with composite PK support (Tier 3).
+    ///
+    /// Returns a map of CompositePk -> MD5 hash for comparison with source.
+    /// Supports any PK type including composite keys.
+    pub async fn fetch_row_hashes_with_rownum(
+        &self,
+        query: &str,
+        range: &RowRange,
+        pk_column_count: usize,
+    ) -> Result<CompositeRowHashMap> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "fetching row hashes with rownum"))?;
+
+        let rows = client
+            .query(query, &[&range.start_row, &range.end_row])
+            .await
+            .map_err(MigrateError::Target)?;
+
+        let mut hashes = std::collections::HashMap::new();
+        for row in rows {
+            // Extract PK columns (first pk_column_count columns)
+            let mut pk_values = Vec::with_capacity(pk_column_count);
+            for i in 0..pk_column_count {
+                let pk_value = extract_pk_value_from_pg(&row, i);
+                pk_values.push(pk_value);
+            }
+
+            // Last column is the row_hash
+            let hash_idx = pk_column_count;
+            let hash: Option<String> = row.get(hash_idx);
+
+            if let Some(h) = hash {
+                hashes.insert(CompositePk::new(pk_values), h);
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Delete rows by composite primary key values.
+    ///
+    /// Used for sync operations to remove rows that exist in target but not source.
+    pub async fn delete_rows_by_composite_pks(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_columns: &[String],
+        pks: &[CompositePk],
+    ) -> Result<i64> {
+        if pks.is_empty() {
+            return Ok(0);
+        }
+
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(
+                e,
+                format!(
+                    "getting connection for DELETE on {}.{}",
+                    schema, table
+                ),
+            )
+        })?;
+
+        let mut total_deleted = 0i64;
+
+        // Batch deletions to avoid query size limits
+        for chunk in pks.chunks(500) {
+            let where_clause = if pk_columns.len() == 1 {
+                // Single PK column - use IN clause
+                let pk_col = pg_quote_ident(&pk_columns[0]);
+                let pk_list = chunk
+                    .iter()
+                    .map(|pk| pk.values()[0].to_sql_literal())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} IN ({})", pk_col, pk_list)
+            } else {
+                // Composite PK - use OR of tuple comparisons
+                let conditions: Vec<String> = chunk
+                    .iter()
+                    .map(|pk| {
+                        let parts: Vec<String> = pk_columns
+                            .iter()
+                            .zip(pk.values())
+                            .map(|(col, val)| {
+                                format!("{} = {}", pg_quote_ident(col), val.to_sql_literal())
+                            })
+                            .collect();
+                        format!("({})", parts.join(" AND "))
+                    })
+                    .collect();
+                conditions.join(" OR ")
+            };
+
+            let query = format!(
+                "DELETE FROM {}.{} WHERE {}",
+                pg_quote_ident(schema),
+                pg_quote_ident(table),
+                where_clause
+            );
+
+            let rows_deleted = client
+                .execute(&query, &[])
+                .await
+                .map_err(MigrateError::Target)?;
+
+            total_deleted += rows_deleted as i64;
+        }
+
+        Ok(total_deleted)
+    }
+}
+
+/// Extract a PkValue from a PostgreSQL row at the given index.
+fn extract_pk_value_from_pg(row: &tokio_postgres::Row, idx: usize) -> PkValue {
+    // Try integer types first
+    if let Ok(v) = row.try_get::<_, i64>(idx) {
+        return PkValue::Int(v);
+    }
+    if let Ok(v) = row.try_get::<_, i32>(idx) {
+        return PkValue::Int(v as i64);
+    }
+    // Try UUID
+    if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
+        return PkValue::Uuid(v);
+    }
+    // Fallback to string
+    if let Ok(v) = row.try_get::<_, String>(idx) {
+        return PkValue::String(v);
+    }
+    // Default to empty string if nothing matched
+    PkValue::String(String::new())
 }
 
 impl PgPool {

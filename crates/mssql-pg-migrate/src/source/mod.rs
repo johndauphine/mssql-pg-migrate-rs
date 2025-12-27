@@ -7,9 +7,11 @@ pub use types::*;
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
 use crate::target::{SqlNullType, SqlValue};
+use crate::verify::{CompositePk, CompositeRowHashMap, RowRange};
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
+use std::collections::HashMap;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -926,6 +928,223 @@ impl MssqlPool {
 
         self.query_rows_fast(&query, &columns, &col_types).await
     }
+
+    // ========================================================================
+    // Universal PK Verification Methods (ROW_NUMBER-based)
+    // ========================================================================
+
+    /// Get total row count for a table.
+    ///
+    /// Used for Tier 1 initial partitioning.
+    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let result = client
+            .simple_query(query)
+            .await
+            .map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            let row_count: i64 = row
+                .get::<i64, _>(0)
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+            Ok(row_count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Execute NTILE partition query and return partition row counts.
+    ///
+    /// Returns a vector of (partition_id, row_count) tuples for Tier 1.
+    pub async fn execute_ntile_partition_query(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut client = self.get_client().await?;
+
+        let result = client
+            .simple_query(query)
+            .await
+            .map_err(MigrateError::Source)?;
+
+        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+
+        let mut partitions = Vec::new();
+        for row in rows {
+            let partition_id: i64 = row
+                .get::<i64, _>(0)
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+            let row_count: i64 = row
+                .get::<i64, _>(1)
+                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
+            partitions.push((partition_id, row_count));
+        }
+
+        Ok(partitions)
+    }
+
+    /// Execute count query using ROW_NUMBER range (Tier 2 verification).
+    ///
+    /// Used for tables with any PK type (int, uuid, string, composite).
+    pub async fn execute_count_query_with_rownum(
+        &self,
+        query: &str,
+        range: &RowRange,
+    ) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(range.start_row);
+        q.bind(range.end_row);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+
+        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            let row_count: i32 = row.get::<i32, _>(0).unwrap_or(0);
+            Ok(row_count as i64)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Fetch row hashes using ROW_NUMBER range with composite PK support (Tier 3).
+    ///
+    /// Returns a map of CompositePk -> MD5 hash for comparison with target.
+    /// Supports any PK type including composite keys.
+    pub async fn fetch_row_hashes_with_rownum(
+        &self,
+        query: &str,
+        range: &RowRange,
+        pk_column_count: usize,
+    ) -> Result<CompositeRowHashMap> {
+        let mut client = self.get_client().await?;
+
+        let mut q = Query::new(query);
+        q.bind(range.start_row);
+        q.bind(range.end_row);
+
+        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
+        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+
+        let mut hashes = HashMap::new();
+        for row in rows {
+            // Extract PK columns (first pk_column_count columns)
+            let mut pk_values = Vec::with_capacity(pk_column_count);
+            for i in 0..pk_column_count {
+                let pk_value = extract_pk_value(&row, i);
+                pk_values.push(pk_value);
+            }
+
+            // Last column is the row_hash
+            let hash_idx = pk_column_count;
+            let hash: Option<&str> = row.get(hash_idx);
+
+            if let Some(h) = hash {
+                hashes.insert(CompositePk::new(pk_values), h.to_string());
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Fetch specific rows by composite primary key values for sync operations.
+    ///
+    /// Returns rows with all columns for the specified composite PKs.
+    pub async fn fetch_rows_by_composite_pks(
+        &self,
+        table: &Table,
+        pks: &[CompositePk],
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        if pks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
+        let pk_columns = &table.primary_key;
+
+        // Build column list with proper quoting
+        let col_list = columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Build ORDER BY clause
+        let order_by = pk_columns
+            .iter()
+            .map(|c| format!("[{}]", c.replace(']', "]]")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut all_rows = Vec::new();
+
+        // Build WHERE clause for composite PKs - batch to avoid query size limits
+        for chunk in pks.chunks(500) {
+            let where_clause = if pk_columns.len() == 1 {
+                // Single PK column - use IN clause
+                let pk_col = pk_columns[0].replace(']', "]]");
+                let pk_list = chunk
+                    .iter()
+                    .map(|pk| pk.values()[0].to_mssql_literal())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("[{}] IN ({})", pk_col, pk_list)
+            } else {
+                // Composite PK - use OR of tuple comparisons
+                let conditions: Vec<String> = chunk
+                    .iter()
+                    .map(|pk| {
+                        let parts: Vec<String> = pk_columns
+                            .iter()
+                            .zip(pk.values())
+                            .map(|(col, val)| {
+                                format!("[{}] = {}", col.replace(']', "]]"), val.to_mssql_literal())
+                            })
+                            .collect();
+                        format!("({})", parts.join(" AND "))
+                    })
+                    .collect();
+                conditions.join(" OR ")
+            };
+
+            let query = format!(
+                "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE {} ORDER BY {}",
+                col_list,
+                table.schema.replace(']', "]]"),
+                table.name.replace(']', "]]"),
+                where_clause,
+                order_by
+            );
+
+            let rows = self.query_rows_fast(&query, &columns, &col_types).await?;
+            all_rows.extend(rows);
+        }
+
+        Ok(all_rows)
+    }
+}
+
+/// Extract a PkValue from a row at the given index.
+fn extract_pk_value(row: &Row, idx: usize) -> PkValue {
+    // Try integer types first
+    if let Some(v) = row.get::<i64, _>(idx) {
+        return PkValue::Int(v);
+    }
+    if let Some(v) = row.get::<i32, _>(idx) {
+        return PkValue::Int(v as i64);
+    }
+    // Try UUID
+    if let Some(v) = row.get::<Uuid, _>(idx) {
+        return PkValue::Uuid(v);
+    }
+    // Fallback to string
+    if let Some(v) = row.get::<&str, _>(idx) {
+        return PkValue::String(v.to_string());
+    }
+    // Default to empty string if nothing matched
+    PkValue::String(String::new())
 }
 
 /// Convert a row value to SqlValue based on the column type.
