@@ -52,8 +52,13 @@ migration:
   # Memory budget percentage for auto-tuning (default: 70)
   # memory_budget_percent: 70
 
-  # Optional: Filter specific tables (if omitted, all tables are migrated)
-  # tables:
+  # Optional: Filter specific tables (glob patterns supported)
+  # include_tables:
   #   - Users
   #   - Orders
   #   - Products
+
+  # Optional: Exclude specific tables (glob patterns supported)
+  # exclude_tables:
+  #   - TempTable*
+  #   - Log*

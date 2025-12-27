@@ -309,7 +309,22 @@ async fn run() -> Result<(), MigrateError> {
             // Extract schema from source
             let source_schema = &config.source.schema;
             let target_schema = &config.target.schema;
-            let tables = orchestrator.extract_schema().await?;
+            let mut tables = orchestrator.extract_schema().await?;
+
+            // Apply table filters (include_tables / exclude_tables)
+            if !config.migration.include_tables.is_empty()
+                || !config.migration.exclude_tables.is_empty()
+            {
+                let table_names: Vec<String> = tables.iter().map(|t| t.full_name()).collect();
+                let filtered_names = config.migration.filter_tables(&table_names);
+                let filtered_set: std::collections::HashSet<String> =
+                    filtered_names.into_iter().collect();
+                tables.retain(|t| filtered_set.contains(&t.full_name()));
+                info!(
+                    "Filtered to {} tables for verification",
+                    tables.len()
+                );
+            }
 
             // Create verify config
             let verify_config = BatchVerifyConfig {

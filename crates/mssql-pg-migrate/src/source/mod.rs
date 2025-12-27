@@ -1134,20 +1134,23 @@ impl MssqlPool {
 }
 
 /// Extract a PkValue from a row at the given index.
+///
+/// Uses `try_get()` to gracefully handle type mismatches - tiberius's `get()`
+/// can throw conversion errors instead of returning None when types don't match.
 fn extract_pk_value(row: &Row, idx: usize) -> PkValue {
-    // Try integer types first
-    if let Some(v) = row.get::<i64, _>(idx) {
+    // Try integer types first (use try_get to avoid conversion panics)
+    if let Ok(Some(v)) = row.try_get::<i64, _>(idx) {
         return PkValue::Int(v);
     }
-    if let Some(v) = row.get::<i32, _>(idx) {
+    if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
         return PkValue::Int(v as i64);
     }
     // Try UUID
-    if let Some(v) = row.get::<Uuid, _>(idx) {
+    if let Ok(Some(v)) = row.try_get::<Uuid, _>(idx) {
         return PkValue::Uuid(v);
     }
     // Fallback to string
-    if let Some(v) = row.get::<&str, _>(idx) {
+    if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
         return PkValue::String(v.to_string());
     }
     // Panic instead of silently returning empty string - this indicates a data type
