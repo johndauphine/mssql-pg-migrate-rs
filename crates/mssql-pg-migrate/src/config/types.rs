@@ -367,6 +367,12 @@ pub struct MigrationConfig {
     #[serde(default = "default_row_hash_column")]
     pub row_hash_column: String,
 
+    /// Include text-type columns in row hash computation (default: false for performance).
+    /// When false, skips text, ntext, varchar(max), nvarchar(max), and xml columns.
+    /// This speeds up hash computation but means changes to these columns won't be detected.
+    #[serde(default)]
+    pub hash_text_columns: bool,
+
     /// Batch verification configuration for multi-tier sync validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_verify: Option<BatchVerifyConfig>,
@@ -400,6 +406,7 @@ impl Default for MigrationConfig {
             memory_budget_percent: default_memory_budget_percent(),
             use_hash_detection: None,
             row_hash_column: default_row_hash_column(),
+            hash_text_columns: false,
             batch_verify: None,
         }
     }

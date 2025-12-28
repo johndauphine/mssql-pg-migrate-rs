@@ -10,7 +10,7 @@ use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
-use crate::verify::normalize::mssql_row_hash_expr;
+use crate::verify::normalize::{is_text_type, mssql_row_hash_expr};
 use futures::future::try_join_all;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +49,10 @@ pub struct TransferJob {
 
     /// Column name for storing row hashes (when hash detection is enabled).
     pub row_hash_column: String,
+
+    /// Whether to include text-type columns in hash computation.
+    /// When false, skips text, ntext, varchar(max), nvarchar(max), xml columns.
+    pub hash_text_columns: bool,
 }
 
 /// Statistics from a transfer job.
@@ -587,18 +591,40 @@ impl TransferEngine {
     }
 }
 
+/// Compute indices of text-type columns to skip in hash computation.
+///
+/// When `hash_text_columns` is false, returns indices of text/ntext/varchar(max) columns.
+/// When `hash_text_columns` is true, returns empty vec (skip nothing).
+fn compute_text_skip_indices(col_types: &[String], hash_text_columns: bool) -> Vec<usize> {
+    if hash_text_columns {
+        return Vec::new();
+    }
+    col_types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| is_text_type(t))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Compute MD5 hashes for rows and append hash as last column.
 /// Uses rayon for parallel processing of large chunks (>1000 rows).
 ///
 /// This is called by readers to pre-compute hashes before sending to dispatcher.
-fn compute_row_hashes(rows: Vec<Vec<SqlValue>>, pk_indices: &[usize]) -> Vec<Vec<SqlValue>> {
+///
+/// `skip_indices` contains column indices to skip (text columns when hash_text_columns is false).
+fn compute_row_hashes(
+    rows: Vec<Vec<SqlValue>>,
+    pk_indices: &[usize],
+    skip_indices: &[usize],
+) -> Vec<Vec<SqlValue>> {
     if pk_indices.is_empty() {
         return rows;
     }
 
     // Process a single row: compute hash and append
     let add_hash = |mut row: Vec<SqlValue>| -> Vec<SqlValue> {
-        let hash = calculate_row_hash(&row, pk_indices);
+        let hash = calculate_row_hash(&row, pk_indices, skip_indices);
         row.push(SqlValue::String(hash));
         row
     };
@@ -779,10 +805,11 @@ async fn read_table_chunks_parallel(
             (range_min, true)
         };
 
+        let hash_text_columns = job.hash_text_columns;
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx, use_hash, pk_indices,
+                is_resume, tx, use_hash, pk_indices, hash_text_columns,
             )
             .await
         });
@@ -833,6 +860,7 @@ async fn read_chunk_range(
     tx: mpsc::Sender<RowChunk>,
     use_hash: bool,
     pk_indices: Vec<usize>,
+    hash_text_columns: bool,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -845,6 +873,9 @@ async fn read_chunk_range(
     // Determine if we should use SQL-side hashing (MSSQL only)
     // This avoids datetime precision mismatches between Rust and SQL hash computation
     let use_sql_hash = use_hash && source.db_type() == "mssql";
+
+    // Compute indices of text columns to skip in Rust-side hash computation
+    let skip_indices = compute_text_skip_indices(&col_types, hash_text_columns);
 
     loop {
         let read_start = Instant::now();
@@ -859,6 +890,7 @@ async fn read_chunk_range(
             chunk_size,
             is_first_chunk,
             use_sql_hash,
+            hash_text_columns,
         )
         .await?;
 
@@ -881,7 +913,7 @@ async fn read_chunk_range(
             // Hash already included as last column by SQL query
             rows
         } else if use_hash {
-            compute_row_hashes(rows, &pk_indices)
+            compute_row_hashes(rows, &pk_indices, &skip_indices)
         } else {
             rows
         };
@@ -960,13 +992,16 @@ async fn read_table_chunks(
     // This avoids datetime precision mismatches between Rust and SQL hash computation
     let use_sql_hash = use_hash && use_keyset && source.db_type() == "mssql";
 
+    // Compute indices of text columns to skip in Rust-side hash computation
+    let skip_indices = compute_text_skip_indices(&col_types, job.hash_text_columns);
+
     loop {
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
                 &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
-                use_sql_hash,
+                use_sql_hash, job.hash_text_columns,
             )
             .await?
         } else {
@@ -1001,7 +1036,7 @@ async fn read_table_chunks(
             // Hash already included as last column by SQL query
             rows
         } else if use_hash {
-            compute_row_hashes(rows, &pk_indices)
+            compute_row_hashes(rows, &pk_indices, &skip_indices)
         } else {
             rows
         };
@@ -1069,6 +1104,7 @@ async fn read_chunk_keyset_fast(
     chunk_size: usize,
     first_chunk: bool,
     use_sql_hash: bool,
+    hash_text_columns: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let is_postgres = source.db_type() == "postgres";
@@ -1084,7 +1120,7 @@ async fn read_chunk_keyset_fast(
     // For MSSQL with SQL-side hashing, add the hash expression as the last column
     // This computes the same MD5 hash that verification uses, avoiding precision mismatches
     if use_sql_hash && is_mssql {
-        let hash_expr = mssql_row_hash_expr(&table.columns, &table.primary_key);
+        let hash_expr = mssql_row_hash_expr(&table.columns, &table.primary_key, hash_text_columns);
         col_list.push_str(&format!(", {} AS row_hash", hash_expr));
     }
 

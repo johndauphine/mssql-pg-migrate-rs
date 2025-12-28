@@ -599,10 +599,11 @@ impl UniversalVerifyEngine {
                     .collect();
 
                 // Compute row hashes and add hash column
+                // Verification includes all columns (empty skip_indices) to match stored row_hash
                 let rows_with_hash: Vec<Vec<SqlValue>> = rows
                     .into_iter()
                     .map(|mut row| {
-                        let hash = calculate_row_hash(&row, &pk_indices);
+                        let hash = calculate_row_hash(&row, &pk_indices, &[]);
                         row.push(SqlValue::String(hash));
                         row
                     })

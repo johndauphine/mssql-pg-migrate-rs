@@ -189,14 +189,17 @@ pub enum SqlNullType {
 /// - Floats use fixed precision to ensure hash stability
 /// - All types are converted to their string representation
 ///
+/// `skip_indices` contains additional column indices to skip (e.g., text columns).
+///
 /// Returns a 32-character lowercase hex string.
-pub fn calculate_row_hash(row: &[SqlValue], pk_indices: &[usize]) -> String {
+pub fn calculate_row_hash(row: &[SqlValue], pk_indices: &[usize], skip_indices: &[usize]) -> String {
     let mut hasher = Md5::new();
     let mut first = true;
 
     for (idx, value) in row.iter().enumerate() {
         // Skip primary key columns - they identify the row, not the content
-        if pk_indices.contains(&idx) {
+        // Also skip text columns if hash_text_columns is false
+        if pk_indices.contains(&idx) || skip_indices.contains(&idx) {
             continue;
         }
 
@@ -2774,7 +2777,7 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash = calculate_row_hash(&row, &pk_indices);
+        let hash = calculate_row_hash(&row, &pk_indices, &[]);
 
         // Hash should be 32 hex characters
         assert_eq!(hash.len(), 32);
@@ -2794,8 +2797,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         assert_eq!(hash1, hash2);
     }
@@ -2813,8 +2816,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         assert_ne!(hash1, hash2);
     }
@@ -2832,8 +2835,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         // Same data (NULL) should produce same hash
         assert_eq!(hash1, hash2);
@@ -2852,8 +2855,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         assert_ne!(hash1, hash2);
     }
@@ -2868,7 +2871,7 @@ mod tests {
         ];
         let pk_indices = vec![0, 1];
 
-        let hash = calculate_row_hash(&row, &pk_indices);
+        let hash = calculate_row_hash(&row, &pk_indices, &[]);
 
         assert_eq!(hash.len(), 32);
     }
@@ -2893,7 +2896,7 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash = calculate_row_hash(&row, &pk_indices);
+        let hash = calculate_row_hash(&row, &pk_indices, &[]);
 
         assert_eq!(hash.len(), 32);
     }
@@ -2911,8 +2914,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         // Same float value should produce same hash
         assert_eq!(hash1, hash2);
@@ -2933,8 +2936,8 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row1, &pk_indices);
-        let hash2 = calculate_row_hash(&row2, &pk_indices);
+        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
 
         assert_ne!(hash1, hash2);
     }
@@ -2949,9 +2952,9 @@ mod tests {
         ];
         let pk_indices = vec![0];
 
-        let hash1 = calculate_row_hash(&row, &pk_indices);
-        let hash2 = calculate_row_hash(&row, &pk_indices);
-        let hash3 = calculate_row_hash(&row, &pk_indices);
+        let hash1 = calculate_row_hash(&row, &pk_indices, &[]);
+        let hash2 = calculate_row_hash(&row, &pk_indices, &[]);
+        let hash3 = calculate_row_hash(&row, &pk_indices, &[]);
 
         assert_eq!(hash1, hash2);
         assert_eq!(hash2, hash3);
