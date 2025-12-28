@@ -245,12 +245,15 @@ impl TransferEngine {
 
         // Hash detection setup: check if enabled and applicable
         // Now supports both single and composite primary keys
-        let use_hash = job.use_hash_detection
-            && matches!(job.target_mode, TargetMode::Upsert)
-            && !job.table.primary_key.is_empty();
+        // Enable for ALL modes (not just Upsert) so row_hash is populated for future upsert runs
+        // Compute and write row_hash for all modes if enabled
+        // This allows future upsert runs to use hash-based change detection
+        let use_hash = job.use_hash_detection && !job.table.primary_key.is_empty();
 
-        // Fetch existing hashes from target if hash detection is enabled
-        let existing_hashes: HashMap<String, String> = if use_hash {
+        // Only fetch existing hashes for Upsert mode (for change filtering)
+        // For drop_recreate/truncate, the target table is empty so skip fetching
+        let fetch_hashes = use_hash && matches!(job.target_mode, TargetMode::Upsert);
+        let existing_hashes: HashMap<String, String> = if fetch_hashes {
             match self
                 .target
                 .fetch_row_hashes(

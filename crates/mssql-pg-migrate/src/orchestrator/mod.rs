@@ -672,6 +672,10 @@ impl Orchestrator {
         // Create schema if needed
         self.target.create_schema(target_schema).await?;
 
+        // Check if hash detection is enabled (for all modes)
+        let use_hash_detection = self.config.migration.use_hash_detection();
+        let row_hash_column = self.config.migration.get_row_hash_column();
+
         match self.config.migration.target_mode {
             TargetMode::DropRecreate => {
                 // Drop and recreate all tables
@@ -680,8 +684,12 @@ impl Orchestrator {
                     info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
                     self.target.drop_table(target_schema, &table.name).await?;
 
-                    // Use UNLOGGED for faster inserts if configured (tables stay UNLOGGED)
-                    if self.config.migration.use_unlogged_tables {
+                    // Create table with row_hash column if hash detection is enabled
+                    if use_hash_detection {
+                        self.target
+                            .create_table_with_hash(table, target_schema, row_hash_column)
+                            .await?;
+                    } else if self.config.migration.use_unlogged_tables {
                         self.target
                             .create_table_unlogged(table, target_schema)
                             .await?;
@@ -700,6 +708,12 @@ impl Orchestrator {
                         self.target
                             .truncate_table(target_schema, &table.name)
                             .await?;
+                        // Ensure row_hash column exists if hash detection is enabled
+                        if use_hash_detection {
+                            self.target
+                                .ensure_row_hash_column(target_schema, &table.name, row_hash_column)
+                                .await?;
+                        }
                         // Set to UNLOGGED for faster writes if configured
                         if self.config.migration.use_unlogged_tables {
                             self.target
@@ -707,7 +721,12 @@ impl Orchestrator {
                                 .await?;
                         }
                     } else {
-                        if self.config.migration.use_unlogged_tables {
+                        // Create table with row_hash column if hash detection is enabled
+                        if use_hash_detection {
+                            self.target
+                                .create_table_with_hash(table, target_schema, row_hash_column)
+                                .await?;
+                        } else if self.config.migration.use_unlogged_tables {
                             self.target
                                 .create_table_unlogged(table, target_schema)
                                 .await?;
@@ -725,9 +744,6 @@ impl Orchestrator {
             }
             TargetMode::Upsert => {
                 // For upsert, ensure tables exist and drop non-PK indexes for performance
-                let use_hash_detection = self.config.migration.use_hash_detection();
-                let row_hash_column = self.config.migration.get_row_hash_column();
-
                 if use_hash_detection {
                     info!(
                         "Hash-based change detection enabled (column: {})",
