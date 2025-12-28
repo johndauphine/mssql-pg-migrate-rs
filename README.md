@@ -23,6 +23,10 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
+- **Batch hash verification** - Multi-tier verification detects differences efficiently
+- **Incremental sync** - Upsert mode uses batch hashing to sync only changed rows
+- **Interactive TUI** - Terminal UI for guided migration with real-time progress
+- **Configuration wizard** - Interactive `init` command creates config files
 - **Automatic type mapping** - MSSQL to PostgreSQL type conversion
 - **Keyset pagination** - Efficient chunked reads using `WHERE pk > last_pk`
 - **Resume capability** - JSON state file for process restartability
@@ -58,20 +62,53 @@ cargo build --release
 
 ## Usage
 
+### Create configuration
+
+```bash
+# Interactive wizard
+mssql-pg-migrate init
+
+# With advanced options
+mssql-pg-migrate init --advanced
+
+# Specify output file
+mssql-pg-migrate init -o my-config.yaml
+```
+
 ### Run migration
 
 ```bash
 # Basic migration
 mssql-pg-migrate -c config.yaml run
 
+# Dry run (validate without transferring)
+mssql-pg-migrate -c config.yaml run --dry-run
+
 # With state file for resume
-mssql-pg-migrate -c config.yaml run --state-file /tmp/migration.state
+mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state run
 
 # Resume interrupted migration
-mssql-pg-migrate -c config.yaml run --state-file /tmp/migration.state --resume
+mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state resume
 
 # JSON output for Airflow
-mssql-pg-migrate -c config.yaml run --output-json
+mssql-pg-migrate -c config.yaml --output-json run
+```
+
+### Verify data consistency
+
+```bash
+# Multi-tier batch hash verification (read-only)
+mssql-pg-migrate -c config.yaml verify
+
+# With custom batch sizes
+mssql-pg-migrate -c config.yaml verify --tier1-size 500000 --tier2-size 5000
+```
+
+### Interactive TUI mode
+
+```bash
+# Launch terminal UI (requires tui feature)
+mssql-pg-migrate -c config.yaml tui
 ```
 
 ### Validate row counts
@@ -130,9 +167,19 @@ This allows optimal performance across different hardware without manual configu
 
 | Mode | Behavior |
 |------|----------|
-| `drop_recreate` | Drop target tables, create fresh, bulk insert |
+| `drop_recreate` | Drop target tables, create fresh, bulk insert (fastest for full refresh) |
 | `truncate` | Truncate existing tables, create if missing, bulk insert |
-| `upsert` | INSERT new rows, UPDATE changed rows (ON CONFLICT) |
+| `upsert` | Uses batch hashing to detect changes, syncs only modified rows (ideal for incremental sync) |
+
+### Upsert Mode Details
+
+Upsert mode uses multi-tier batch hashing to efficiently detect differences:
+
+1. **Tier 1**: NTILE partitioning compares ~1M row batches
+2. **Tier 2**: Drills into mismatched partitions with ~10K row ranges
+3. **Tier 3**: Row-level hash comparison identifies specific inserts/updates
+
+Only changed rows are transferred - no deletes are performed for safety.
 
 ## Type Mapping
 
