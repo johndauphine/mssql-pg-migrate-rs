@@ -131,6 +131,42 @@ impl MssqlTargetPool {
         format!("[{}]", name.replace(']', "]]"))
     }
 
+    /// Check if a table has an identity column.
+    ///
+    /// Uses parameterized query against sys catalog tables for SQL injection safety.
+    /// This check is performed per-chunk to ensure correctness; future optimization
+    /// could cache this at the table level during schema extraction.
+    async fn has_identity_column(
+        conn: &mut tiberius::Client<Compat<TcpStream>>,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        let query = r#"SELECT COUNT(*)
+               FROM sys.columns c
+               JOIN sys.tables t ON c.object_id = t.object_id
+               JOIN sys.schemas s ON t.schema_id = s.schema_id
+               WHERE s.name = @P1 AND t.name = @P2 AND c.is_identity = 1"#;
+        debug!("Identity check query for {}.{}", schema, table);
+        let result = conn.query(query, &[&schema, &table]).await?;
+        if let Some(row) = result.into_first_result().await?.into_iter().next() {
+            let count: i32 = row.get(0).unwrap_or(0);
+            debug!(
+                "Identity check result for {}.{}: count={}, has_identity={}",
+                schema,
+                table,
+                count,
+                count > 0
+            );
+            Ok(count > 0)
+        } else {
+            debug!(
+                "Identity check result for {}.{}: no rows returned",
+                schema, table
+            );
+            Ok(false)
+        }
+    }
+
     /// Check if a data type is an MSSQL native type.
     ///
     /// Note: "timestamp" is NOT included because PostgreSQL also has a "timestamp" type.
@@ -211,7 +247,9 @@ impl MssqlTargetPool {
                 if max_length == -1 {
                     format!("{}(max)", data_type)
                 } else if max_length > 0 {
-                    // nvarchar stores 2 bytes per char, so divide by 2
+                    // nvarchar/nchar store 2 bytes per character in MSSQL, so max_length
+                    // (in bytes) divided by 2 gives the character count. Integer division
+                    // is intentional: a 5-byte limit can only hold 2 complete characters.
                     let len = if lower.starts_with('n') && max_length > 0 {
                         max_length / 2
                     } else {
@@ -827,22 +865,8 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let total_rows = rows.len() as u64;
 
-        // Check for identity column using parameterized query on the SAME connection
-        let identity_query = r#"SELECT COUNT(*)
-               FROM sys.columns c
-               JOIN sys.tables t ON c.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = @P1 AND t.name = @P2 AND c.is_identity = 1"#;
-        debug!("Identity check query for {}.{}", schema, table);
-        let result = conn.query(identity_query, &[&schema, &table]).await?;
-        let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
-            let count: i32 = row.get(0).unwrap_or(0);
-            debug!("Identity check result for {}.{}: count={}, has_identity={}", schema, table, count, count > 0);
-            count > 0
-        } else {
-            debug!("Identity check result for {}.{}: no rows returned", schema, table);
-            false
-        };
+        // Check for identity column
+        let has_identity = Self::has_identity_column(&mut conn, schema, table).await?;
 
         // Build column list
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
@@ -903,19 +927,8 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let total_rows = rows.len() as u64;
 
-        // Check for identity column using parameterized query on the SAME connection
-        let identity_query = r#"SELECT COUNT(*)
-               FROM sys.columns c
-               JOIN sys.tables t ON c.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = @P1 AND t.name = @P2 AND c.is_identity = 1"#;
-        let result = conn.query(identity_query, &[&schema, &table]).await?;
-        let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
-            let count: i32 = row.get(0).unwrap_or(0);
-            count > 0
-        } else {
-            false
-        };
+        // Check for identity column
+        let has_identity = Self::has_identity_column(&mut conn, schema, table).await?;
 
         // Build column list
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();

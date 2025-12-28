@@ -56,7 +56,8 @@ fn test_version_flag() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("mssql-pg-migrate"));
+        // Verify both program name and semver version format (e.g., "mssql-pg-migrate 0.7.1")
+        .stdout(predicate::str::is_match(r"mssql-pg-migrate \d+\.\d+\.\d+").unwrap());
 }
 
 // =============================================================================
