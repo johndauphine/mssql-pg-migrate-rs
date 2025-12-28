@@ -88,7 +88,8 @@ pub fn mssql_ntile_partition_query_with_hash(
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
 
     // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT, then CHECKSUM_AGG
     // CHECKSUM_AGG on INT performs direct XOR (no additional hash applied)
@@ -196,7 +197,8 @@ pub fn postgres_ntile_partition_query_computed(
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
 
     // BIT_XOR aggregate on computed MD5 hashes (first 8 hex chars = 32-bit)
     format!(
@@ -268,7 +270,8 @@ pub fn mssql_row_count_with_rownum_query_with_hash(
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
 
     // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT
     // Matches PostgreSQL's BIT_XOR on the same 32-bit value
@@ -357,7 +360,8 @@ pub fn postgres_row_count_with_rownum_query_computed(
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
 
     // BIT_XOR aggregate on computed hashes (first 8 hex chars = 32-bit)
     format!(
@@ -416,7 +420,8 @@ pub fn mssql_row_hashes_with_rownum_query(
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
     let pk_select = mssql_pk_select(pk_columns);
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
 
     format!(
         r#"WITH numbered AS (
@@ -485,7 +490,8 @@ pub fn postgres_row_hashes_with_rownum_query_computed(
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let pk_select = postgres_pk_select(pk_columns);
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+    // Verification always includes all columns to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
 
     format!(
         r#"WITH numbered AS (

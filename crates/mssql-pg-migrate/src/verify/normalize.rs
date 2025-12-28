@@ -18,6 +18,18 @@
 
 use crate::source::Column;
 
+/// Check if a column is a text type that should be skipped when hash_text_columns is false.
+///
+/// Returns true for: text, ntext, varchar(max), nvarchar(max), xml
+pub fn is_text_type(data_type: &str) -> bool {
+    let dt = data_type.to_lowercase();
+    matches!(dt.as_str(), "text" | "ntext" | "xml")
+        || dt == "varchar(-1)"
+        || dt == "nvarchar(-1)"
+        || dt == "varchar(max)"
+        || dt == "nvarchar(max)"
+}
+
 /// Generate MSSQL expression for a normalized column value.
 ///
 /// The expression converts the column to a string representation that
@@ -108,11 +120,16 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
 /// Generate the MSSQL expression to compute a row hash matching Rust's calculate_row_hash.
 ///
 /// Returns a HASHBYTES('MD5', ...) expression that produces the same hash as Rust.
-pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String]) -> String {
+///
+/// If `include_text` is false, skips text-type columns (text, ntext, varchar(max), etc.)
+/// for better performance.
+pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String], include_text: bool) -> String {
     // Build concatenated expression with '|' separator, excluding PK columns
+    // and optionally excluding text columns
     let col_exprs: Vec<String> = columns
         .iter()
         .filter(|c| !pk_columns.contains(&c.name))
+        .filter(|c| include_text || !is_text_type(&c.data_type))
         .map(mssql_normalize_expr)
         .collect();
 
@@ -132,8 +149,8 @@ pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String]) -> String 
 ///
 /// This produces an aggregate hash for a range of rows that can be compared
 /// to the XOR of row_hash values on the PostgreSQL side.
-pub fn mssql_batch_hash_expr(columns: &[Column], pk_columns: &[String]) -> String {
-    let row_hash_expr = mssql_row_hash_expr(columns, pk_columns);
+pub fn mssql_batch_hash_expr(columns: &[Column], pk_columns: &[String], include_text: bool) -> String {
+    let row_hash_expr = mssql_row_hash_expr(columns, pk_columns, include_text);
 
     // For aggregate hash, we need to XOR all row hashes
     // MSSQL doesn't have XOR aggregate, so we use CHECKSUM_AGG on the hash bytes
@@ -198,7 +215,7 @@ mod tests {
         ];
         let pk_cols = vec!["id".to_string()];
 
-        let expr = mssql_row_hash_expr(&columns, &pk_cols);
+        let expr = mssql_row_hash_expr(&columns, &pk_cols, true);
 
         // Should exclude id (PK), include name and value
         assert!(expr.contains("HASHBYTES"));
@@ -207,5 +224,49 @@ mod tests {
         assert!(expr.contains("[value]"));
         assert!(!expr.contains("[id]")); // PK should be excluded
         assert!(expr.contains("'|'")); // Pipe separator
+    }
+
+    #[test]
+    fn test_is_text_type() {
+        // Text types that should be skipped
+        assert!(is_text_type("text"));
+        assert!(is_text_type("ntext"));
+        assert!(is_text_type("TEXT")); // case insensitive
+        assert!(is_text_type("varchar(-1)"));
+        assert!(is_text_type("nvarchar(-1)"));
+        assert!(is_text_type("varchar(max)"));
+        assert!(is_text_type("nvarchar(max)"));
+        assert!(is_text_type("xml"));
+
+        // Non-text types that should be included
+        assert!(!is_text_type("varchar"));
+        assert!(!is_text_type("varchar(100)"));
+        assert!(!is_text_type("nvarchar(50)"));
+        assert!(!is_text_type("int"));
+        assert!(!is_text_type("datetime"));
+        assert!(!is_text_type("varbinary(max)")); // binary, not text
+    }
+
+    #[test]
+    fn test_mssql_row_hash_expr_skip_text() {
+        let columns = vec![
+            make_column("id", "int"),
+            make_column("name", "varchar(100)"),
+            make_column("body", "nvarchar(max)"),
+            make_column("notes", "text"),
+        ];
+        let pk_cols = vec!["id".to_string()];
+
+        // With include_text = true, should include all non-PK columns
+        let expr_with_text = mssql_row_hash_expr(&columns, &pk_cols, true);
+        assert!(expr_with_text.contains("[name]"));
+        assert!(expr_with_text.contains("[body]"));
+        assert!(expr_with_text.contains("[notes]"));
+
+        // With include_text = false, should skip text columns
+        let expr_without_text = mssql_row_hash_expr(&columns, &pk_cols, false);
+        assert!(expr_without_text.contains("[name]"));
+        assert!(!expr_without_text.contains("[body]"));
+        assert!(!expr_without_text.contains("[notes]"));
     }
 }

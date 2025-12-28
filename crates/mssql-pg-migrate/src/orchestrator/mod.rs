@@ -981,6 +981,7 @@ impl Orchestrator {
                                 target_schema: self.config.target.schema.clone(),
                                 use_hash_detection: self.config.migration.use_hash_detection(),
                                 row_hash_column: self.config.migration.get_row_hash_column().to_string(),
+                                hash_text_columns: self.config.migration.hash_text_columns,
                             };
 
                             let engine_clone = engine.clone();
@@ -1027,6 +1028,7 @@ impl Orchestrator {
                 target_schema: self.config.target.schema.clone(),
                 use_hash_detection: self.config.migration.use_hash_detection(),
                 row_hash_column: self.config.migration.get_row_hash_column().to_string(),
+                hash_text_columns: self.config.migration.hash_text_columns,
             };
 
             let engine_clone = engine.clone();
