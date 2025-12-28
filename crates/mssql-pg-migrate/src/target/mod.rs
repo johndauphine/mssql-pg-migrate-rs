@@ -1,4 +1,12 @@
-//! PostgreSQL target database operations.
+//! Target database operations.
+//!
+//! This module provides target database implementations:
+//! - `PgPool` - PostgreSQL target
+//! - `MssqlTargetPool` - MSSQL target
+
+mod mssql;
+
+pub use mssql::MssqlTargetPool;
 
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, PkValue, Table};

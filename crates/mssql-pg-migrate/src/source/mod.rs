@@ -1,7 +1,14 @@
-//! MSSQL source database operations.
+//! Source database operations.
+//!
+//! This module provides database-agnostic source operations via the `SourcePool` trait.
+//! Implementations are provided for:
+//! - MSSQL: `MssqlPool` (the default source)
+//! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
+mod postgres;
 mod types;
 
+pub use postgres::PgSourcePool;
 pub use types::*;
 
 use crate::config::SourceConfig;

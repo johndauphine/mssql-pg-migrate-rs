@@ -1,5 +1,9 @@
 //! Migration orchestrator - main workflow coordinator.
 
+mod pools;
+
+pub use pools::{SourcePoolImpl, TargetPoolImpl};
+
 use crate::config::{BatchVerifyConfig, Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::{MssqlPool, SourcePool, Table};

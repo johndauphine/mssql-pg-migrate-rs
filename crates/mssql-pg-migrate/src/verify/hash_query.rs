@@ -10,6 +10,7 @@
 
 use crate::source::Table;
 use super::normalize::mssql_row_hash_expr;
+use super::normalize_pg::pg_row_hash_expr;
 
 // ============================================================================
 // Helper functions for building SQL clauses
@@ -229,6 +230,37 @@ ORDER BY row_num"#,
     )
 }
 
+/// Generate PostgreSQL query to fetch (pk_cols..., row_hash) using ROW_NUMBER range.
+///
+/// Computes row hashes server-side using MD5 (for when PostgreSQL is the source).
+/// Works with any PK type including composite keys.
+pub fn postgres_row_hashes_with_rownum_query_computed(
+    schema: &str,
+    table: &Table,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let pk_select = postgres_pk_select(pk_columns);
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+
+    format!(
+        r#"WITH numbered AS (
+    SELECT {pk_select}, {row_hash_expr} AS row_hash,
+           ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num
+    FROM "{schema}"."{table_name}"
+)
+SELECT {pk_select}, row_hash
+FROM numbered
+WHERE row_num >= $1 AND row_num < $2
+ORDER BY row_num"#,
+        pk_select = pk_select,
+        row_hash_expr = row_hash_expr,
+        pk_order_by = pk_order_by,
+        schema = schema.replace('"', "\"\""),
+        table_name = table.name.replace('"', "\"\""),
+    )
+}
+
 // ============================================================================
 // Total row count queries
 // ============================================================================
@@ -360,6 +392,19 @@ mod tests {
         let query = postgres_row_hashes_with_rownum_query("public", "users", &pk_columns, "row_hash");
 
         assert!(query.contains("\"row_hash\""));
+        assert!(query.contains("$1"));
+        assert!(query.contains("$2"));
+        assert!(query.contains("ROW_NUMBER()"));
+    }
+
+    #[test]
+    fn test_postgres_row_hashes_with_rownum_query_computed() {
+        let table = make_test_table();
+        let query = postgres_row_hashes_with_rownum_query_computed("public", &table);
+
+        assert!(query.contains("md5"));
+        assert!(query.contains("\"name\""));
+        assert!(query.contains("\"created_at\""));
         assert!(query.contains("$1"));
         assert!(query.contains("$2"));
         assert!(query.contains("ROW_NUMBER()"));

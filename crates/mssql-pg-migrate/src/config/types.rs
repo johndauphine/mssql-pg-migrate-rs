@@ -5,6 +5,43 @@ use std::fmt;
 use sysinfo::System;
 use tracing::{info, warn};
 
+/// Database type for bidirectional migration support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseType {
+    /// Microsoft SQL Server
+    Mssql,
+    /// PostgreSQL
+    Postgres,
+}
+
+impl DatabaseType {
+    /// Parse database type from string (case-insensitive).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "mssql" | "sqlserver" | "sql_server" => Some(Self::Mssql),
+            "postgres" | "postgresql" | "pg" => Some(Self::Postgres),
+            _ => None,
+        }
+    }
+
+    /// Get the default port for this database type.
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Self::Mssql => 1433,
+            Self::Postgres => 5432,
+        }
+    }
+
+    /// Get the default schema for this database type.
+    pub fn default_schema(&self) -> &'static str {
+        match self {
+            Self::Mssql => "dbo",
+            Self::Postgres => "public",
+        }
+    }
+}
+
 /// System resource information for auto-tuning.
 #[derive(Debug, Clone)]
 pub struct SystemResources {
