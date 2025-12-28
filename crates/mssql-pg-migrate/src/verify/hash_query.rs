@@ -13,10 +13,15 @@
 //! To detect updates (not just inserts/deletes), Tier 1 and Tier 2 include
 //! an XOR aggregate of row hashes:
 //!
-//! - **MSSQL**: `CHECKSUM_AGG(CHECKSUM(SUBSTRING(hash, 1, 8)))` where hash is
-//!   the first 8 bytes of the MD5 hash converted to BIGINT
+//! - **MSSQL**: `CHECKSUM_AGG(CHECKSUM(CONVERT(VARBINARY(8), row_hash, 2)))`
+//!   where `row_hash` is the MD5 hash as hex string converted to varbinary
 //! - **PostgreSQL**: `BIT_XOR(('x' || LEFT(row_hash, 16))::bit(64)::bigint)`
 //!   on the stored row_hash column
+//!
+//! **Note**: MSSQL CHECKSUM returns 32-bit while PostgreSQL uses 64-bit hashes.
+//! This means partition hashes will differ between source and target even for
+//! identical data. The system handles this correctly by drilling down to Tier 3
+//! for row-level comparison when hashes mismatch.
 //!
 //! When partition hashes differ, the partition is marked for Tier 2/3 drill-down
 //! even if row counts match (indicating updates rather than inserts/deletes).
