@@ -13,15 +13,13 @@
 //! To detect updates (not just inserts/deletes), Tier 1 and Tier 2 include
 //! an XOR aggregate of row hashes:
 //!
-//! - **MSSQL**: `CHECKSUM_AGG(CHECKSUM(CONVERT(VARBINARY(8), row_hash, 2)))`
-//!   where `row_hash` is the MD5 hash as hex string converted to varbinary
-//! - **PostgreSQL**: `BIT_XOR(('x' || LEFT(row_hash, 16))::bit(64)::bigint)`
-//!   on the stored row_hash column
+//! - **MSSQL**: Takes first 8 hex chars (4 bytes) of MD5, converts to INT,
+//!   then uses `CHECKSUM_AGG` which XORs 32-bit integers
+//! - **PostgreSQL**: Takes first 8 hex chars, converts to 32-bit integer,
+//!   then uses `BIT_XOR` aggregate
 //!
-//! **Note**: MSSQL CHECKSUM returns 32-bit while PostgreSQL uses 64-bit hashes.
-//! This means partition hashes will differ between source and target even for
-//! identical data. The system handles this correctly by drilling down to Tier 3
-//! for row-level comparison when hashes mismatch.
+//! Both produce identical results for identical data, enabling efficient
+//! detection of unchanged partitions at Tier 1/2 without full row scans.
 //!
 //! When partition hashes differ, the partition is marked for Tier 2/3 drill-down
 //! even if row counts match (indicating updates rather than inserts/deletes).
@@ -92,8 +90,9 @@ pub fn mssql_ntile_partition_query_with_hash(
     let pk_order_by = mssql_pk_order_by(pk_columns);
     let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
 
-    // XOR aggregate: convert first 16 hex chars of MD5 to bigint, then CHECKSUM_AGG
-    // CHECKSUM_AGG performs XOR of checksums
+    // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT, then CHECKSUM_AGG
+    // CHECKSUM_AGG on INT performs direct XOR (no additional hash applied)
+    // This matches PostgreSQL's BIT_XOR on the same 32-bit value
     format!(
         r#"WITH partitioned AS (
     SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id,
@@ -103,7 +102,7 @@ pub fn mssql_ntile_partition_query_with_hash(
 SELECT
     partition_id,
     CAST(COUNT(*) AS BIGINT) AS row_count,
-    CAST(ISNULL(CHECKSUM_AGG(CHECKSUM(CONVERT(VARBINARY(8), row_hash, 2))), 0) AS BIGINT) AS partition_hash
+    CAST(ISNULL(CHECKSUM_AGG(CONVERT(INT, CONVERT(VARBINARY(4), LEFT(row_hash, 8), 2))), 0) AS BIGINT) AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -161,7 +160,8 @@ pub fn postgres_ntile_partition_query_with_hash(
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let row_hash_col = row_hash_column.replace('"', "\"\"");
 
-    // BIT_XOR aggregate: convert first 16 hex chars of row_hash to bigint
+    // BIT_XOR aggregate: convert first 8 hex chars (4 bytes) to 32-bit integer
+    // This matches MSSQL's CHECKSUM_AGG on the same 32-bit value
     // COALESCE handles NULL row_hash (returns 0, triggering mismatch)
     format!(
         r#"WITH partitioned AS (
@@ -172,7 +172,7 @@ pub fn postgres_ntile_partition_query_with_hash(
 SELECT
     partition_id,
     COUNT(*)::BIGINT AS row_count,
-    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 16), '0000000000000000'))::bit(64)::bigint), 0)::BIGINT AS partition_hash
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -197,7 +197,7 @@ pub fn postgres_ntile_partition_query_computed(
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
 
-    // BIT_XOR aggregate on computed MD5 hashes
+    // BIT_XOR aggregate on computed MD5 hashes (first 8 hex chars = 32-bit)
     format!(
         r#"WITH partitioned AS (
     SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id,
@@ -207,7 +207,7 @@ pub fn postgres_ntile_partition_query_computed(
 SELECT
     partition_id,
     COUNT(*)::BIGINT AS row_count,
-    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 16), '0000000000000000'))::bit(64)::bigint), 0)::BIGINT AS partition_hash
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -264,6 +264,8 @@ pub fn mssql_row_count_with_rownum_query_with_hash(
     let pk_order_by = mssql_pk_order_by(pk_columns);
     let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
 
+    // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT
+    // Matches PostgreSQL's BIT_XOR on the same 32-bit value
     format!(
         r#"WITH numbered AS (
     SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
@@ -272,7 +274,7 @@ pub fn mssql_row_count_with_rownum_query_with_hash(
 )
 SELECT
     COUNT(*) AS row_count,
-    CAST(ISNULL(CHECKSUM_AGG(CHECKSUM(CONVERT(VARBINARY(8), row_hash, 2))), 0) AS BIGINT) AS range_hash
+    CAST(ISNULL(CHECKSUM_AGG(CONVERT(INT, CONVERT(VARBINARY(4), LEFT(row_hash, 8), 2))), 0) AS BIGINT) AS range_hash
 FROM numbered
 WHERE row_num >= @P1 AND row_num < @P2"#,
         pk_order_by = pk_order_by,
@@ -319,6 +321,8 @@ pub fn postgres_row_count_with_rownum_query_with_hash(
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let row_hash_col = row_hash_column.replace('"', "\"\"");
 
+    // BIT_XOR aggregate: convert first 8 hex chars to 32-bit integer
+    // Matches MSSQL's CHECKSUM_AGG on the same 32-bit value
     format!(
         r#"WITH numbered AS (
     SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
@@ -327,7 +331,7 @@ pub fn postgres_row_count_with_rownum_query_with_hash(
 )
 SELECT
     COUNT(*) AS row_count,
-    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 16), '0000000000000000'))::bit(64)::bigint), 0)::BIGINT AS range_hash
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS range_hash
 FROM numbered
 WHERE row_num >= $1 AND row_num < $2"#,
         pk_order_by = pk_order_by,
@@ -349,6 +353,7 @@ pub fn postgres_row_count_with_rownum_query_computed(
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
 
+    // BIT_XOR aggregate on computed hashes (first 8 hex chars = 32-bit)
     format!(
         r#"WITH numbered AS (
     SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
@@ -357,7 +362,7 @@ pub fn postgres_row_count_with_rownum_query_computed(
 )
 SELECT
     COUNT(*) AS row_count,
-    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 16), '0000000000000000'))::bit(64)::bigint), 0)::BIGINT AS range_hash
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS range_hash
 FROM numbered
 WHERE row_num >= $1 AND row_num < $2"#,
         pk_order_by = pk_order_by,
