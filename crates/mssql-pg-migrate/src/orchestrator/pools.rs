@@ -208,6 +208,14 @@ impl SourcePoolImpl {
         }
     }
 
+    /// Get the maximum value of a primary key column.
+    pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        match self {
+            Self::Mssql(p) => p.get_max_pk(schema, table, pk_col).await,
+            Self::Postgres(p) => p.get_max_pk(schema, table, pk_col).await,
+        }
+    }
+
     /// Get the underlying MSSQL pool (for transfer engine compatibility).
     /// Returns None if not MSSQL.
     pub fn as_mssql(&self) -> Option<Arc<MssqlPool>> {
@@ -284,6 +292,32 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_table_unlogged(table, target_schema).await,
             Self::Postgres(p) => p.create_table_unlogged(table, target_schema).await,
+        }
+    }
+
+    /// Create a table with row hash column for change detection.
+    pub async fn create_table_with_hash(
+        &self,
+        table: &Table,
+        target_schema: &str,
+        row_hash_column: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Mssql(p) => p.create_table_with_hash(table, target_schema, row_hash_column).await,
+            Self::Postgres(p) => p.create_table_with_hash(table, target_schema, row_hash_column).await,
+        }
+    }
+
+    /// Ensure the row hash column exists on the table.
+    pub async fn ensure_row_hash_column(
+        &self,
+        schema: &str,
+        table: &str,
+        row_hash_column: &str,
+    ) -> Result<bool> {
+        match self {
+            Self::Mssql(p) => p.ensure_row_hash_column(schema, table, row_hash_column).await,
+            Self::Postgres(p) => p.ensure_row_hash_column(schema, table, row_hash_column).await,
         }
     }
 
@@ -458,6 +492,63 @@ impl TargetPoolImpl {
                 p.upsert_chunk_with_hash(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
                     .await
             }
+        }
+    }
+
+    /// Fetch row hashes for hash-based change detection.
+    pub async fn fetch_row_hashes(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_cols: &[String],
+        row_hash_col: &str,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        match self {
+            Self::Mssql(p) => p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk).await,
+            Self::Postgres(p) => p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk).await,
+        }
+    }
+
+    /// Get total row count from a query (for verification).
+    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
+        match self {
+            Self::Mssql(p) => p.get_total_row_count(query).await,
+            Self::Postgres(p) => p.get_total_row_count(query).await,
+        }
+    }
+
+    /// Execute NTILE partition query (for verification).
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+        match self {
+            Self::Mssql(p) => p.execute_ntile_partition_query(query).await,
+            Self::Postgres(p) => p.execute_ntile_partition_query(query).await,
+        }
+    }
+
+    /// Execute count query with ROW_NUMBER range (for verification).
+    pub async fn execute_count_query_with_rownum(
+        &self,
+        query: &str,
+        range: &crate::verify::RowRange,
+    ) -> Result<i64> {
+        match self {
+            Self::Mssql(p) => p.execute_count_query_with_rownum(query, range).await,
+            Self::Postgres(p) => p.execute_count_query_with_rownum(query, range).await,
+        }
+    }
+
+    /// Fetch row hashes with ROW_NUMBER range (for verification).
+    pub async fn fetch_row_hashes_with_rownum(
+        &self,
+        query: &str,
+        range: &crate::verify::RowRange,
+        pk_column_count: usize,
+    ) -> Result<crate::verify::CompositeRowHashMap> {
+        match self {
+            Self::Mssql(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
+            Self::Postgres(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
         }
     }
 

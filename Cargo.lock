@@ -2265,6 +2265,7 @@ dependencies = [
  "once_cell",
  "pin-project-lite",
  "pretty-hex",
+ "rust_decimal",
  "rustls-native-certs",
  "rustls-pemfile",
  "thiserror 1.0.69",

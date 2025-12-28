@@ -17,8 +17,9 @@
 
 use crate::config::BatchVerifyConfig;
 use crate::error::Result;
-use crate::source::{MssqlPool, Table};
-use crate::target::{calculate_row_hash, PgPool, SqlValue};
+use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
+use crate::source::Table;
+use crate::target::{calculate_row_hash, SqlValue};
 use crate::verify::hash_query::{
     mssql_ntile_partition_query, mssql_row_count_with_rownum_query,
     mssql_row_hashes_with_rownum_query, mssql_total_row_count_query,
@@ -29,7 +30,6 @@ use crate::verify::{
     CompositePk, RowHashDiffComposite, RowRange, SyncStats,
     TableVerifyResult, VerifyProgressUpdate, VerifyTier,
 };
-use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -39,8 +39,8 @@ use tracing::{debug, info, warn};
 /// Unlike the original `VerifyEngine`, this supports any primary key type
 /// by using NTILE partitioning and ROW_NUMBER-based ranges.
 pub struct UniversalVerifyEngine {
-    source: Arc<MssqlPool>,
-    target: Arc<PgPool>,
+    source: SourcePoolImpl,
+    target: TargetPoolImpl,
     config: BatchVerifyConfig,
     row_hash_column: String,
     progress_tx: Option<mpsc::Sender<VerifyProgressUpdate>>,
@@ -49,8 +49,8 @@ pub struct UniversalVerifyEngine {
 impl UniversalVerifyEngine {
     /// Create a new universal verification engine.
     pub fn new(
-        source: Arc<MssqlPool>,
-        target: Arc<PgPool>,
+        source: SourcePoolImpl,
+        target: TargetPoolImpl,
         config: BatchVerifyConfig,
         row_hash_column: String,
     ) -> Self {
@@ -525,8 +525,6 @@ impl UniversalVerifyEngine {
         target_schema: &str,
         diff: &RowHashDiffComposite,
     ) -> Result<SyncStats> {
-        use crate::target::TargetPool;
-
         let mut stats = SyncStats::default();
         let pk_columns = &table.primary_key;
 

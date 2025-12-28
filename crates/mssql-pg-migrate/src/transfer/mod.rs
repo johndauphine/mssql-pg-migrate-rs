@@ -7,8 +7,9 @@
 
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
-use crate::source::{MssqlPool, Table};
-use crate::target::{calculate_row_hash, PgPool, SqlValue, TargetPool};
+use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
+use crate::source::Table;
+use crate::target::{calculate_row_hash, SqlValue};
 use futures::future::try_join_all;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -186,8 +187,8 @@ impl Default for TransferConfig {
 
 /// Transfer engine for moving data between databases.
 pub struct TransferEngine {
-    source: Arc<MssqlPool>,
-    target: Arc<PgPool>,
+    source: SourcePoolImpl,
+    target: TargetPoolImpl,
     config: TransferConfig,
     rows_transferred: AtomicI64,
     /// Optional shared counter for real-time progress reporting.
@@ -196,7 +197,7 @@ pub struct TransferEngine {
 
 impl TransferEngine {
     /// Create a new transfer engine.
-    pub fn new(source: Arc<MssqlPool>, target: Arc<PgPool>, config: TransferConfig) -> Self {
+    pub fn new(source: SourcePoolImpl, target: TargetPoolImpl, config: TransferConfig) -> Self {
         Self {
             source,
             target,
@@ -702,7 +703,7 @@ fn split_pk_range(min_pk: i64, max_pk: i64, num_readers: usize) -> Vec<(Option<i
 
 /// Read table data using parallel readers with PK range splitting.
 async fn read_table_chunks_parallel(
-    source: Arc<MssqlPool>,
+    source: SourcePoolImpl,
     job: TransferJob,
     columns: Vec<String>,
     col_types: Vec<String>,
@@ -816,7 +817,7 @@ async fn read_table_chunks_parallel(
 /// When `use_hash` is true, computes MD5 hashes for each row using rayon parallelism
 /// and appends the hash to each row before sending to the channel.
 async fn read_chunk_range(
-    source: Arc<MssqlPool>,
+    source: SourcePoolImpl,
     table: Table,
     columns: Vec<String>,
     col_types: Vec<String>,
@@ -918,7 +919,7 @@ async fn read_chunk_range(
 
 /// Read table data in chunks using single reader (for OFFSET pagination or when parallelism disabled).
 async fn read_table_chunks(
-    source: Arc<MssqlPool>,
+    source: SourcePoolImpl,
     job: TransferJob,
     columns: Vec<String>,
     col_types: Vec<String>,
@@ -1033,7 +1034,7 @@ async fn read_table_chunks(
 /// boundary that should be included, not a previously-read row to skip.
 /// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
 async fn read_chunk_keyset_fast(
-    source: &MssqlPool,
+    source: &SourcePoolImpl,
     table: &Table,
     columns: &[String],
     col_types: &[String],
@@ -1043,30 +1044,38 @@ async fn read_chunk_keyset_fast(
     first_chunk: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
+    let is_postgres = source.db_type() == "postgres";
 
-    // Build column list
+    // Build column list with appropriate quoting
     let col_list = columns
         .iter()
-        .map(|c| quote_mssql_ident(c))
+        .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut query = format!(
-        "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
-        chunk_size,
-        col_list,
+    let pk_quoted = if is_postgres { quote_pg_ident(pk_col) } else { quote_mssql_ident(pk_col) };
+    let table_ref = if is_postgres {
+        qualify_pg_table(&table.schema, &table.name)
+    } else {
         qualify_mssql_table(&table.schema, &table.name)
-    );
+    };
+
+    // Build query with database-specific syntax
+    let mut query = if is_postgres {
+        format!("SELECT {} FROM {}", col_list, table_ref)
+    } else {
+        format!("SELECT TOP {} {} FROM {} WITH (NOLOCK)", chunk_size, col_list, table_ref)
+    };
 
     let mut conditions = Vec::new();
     if let Some(pk) = last_pk {
         // For first chunk of a range, use >= to include the starting boundary
         // For subsequent chunks (or resume), use > to skip the last-read row
         let op = if first_chunk { ">=" } else { ">" };
-        conditions.push(format!("{} {} {}", quote_mssql_ident(pk_col), op, pk));
+        conditions.push(format!("{} {} {}", pk_quoted, op, pk));
     }
     if let Some(pk) = max_pk {
-        conditions.push(format!("{} <= {}", quote_mssql_ident(pk_col), pk));
+        conditions.push(format!("{} <= {}", pk_quoted, pk));
     }
 
     if !conditions.is_empty() {
@@ -1074,7 +1083,12 @@ async fn read_chunk_keyset_fast(
         query.push_str(&conditions.join(" AND "));
     }
 
-    query.push_str(&format!(" ORDER BY {}", quote_mssql_ident(pk_col)));
+    query.push_str(&format!(" ORDER BY {}", pk_quoted));
+
+    // PostgreSQL uses LIMIT instead of TOP
+    if is_postgres {
+        query.push_str(&format!(" LIMIT {}", chunk_size));
+    }
 
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
 
@@ -1098,23 +1112,31 @@ async fn read_chunk_keyset_fast(
 
 /// Read a chunk using OFFSET pagination (for composite PKs).
 async fn read_chunk_offset(
-    source: &MssqlPool,
+    source: &SourcePoolImpl,
     table: &Table,
     columns: &[String],
     col_types: &[String],
     offset: usize,
     chunk_size: usize,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
+    let is_postgres = source.db_type() == "postgres";
+
     let col_list = columns
         .iter()
-        .map(|c| quote_mssql_ident(c))
+        .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
         .collect::<Vec<_>>()
         .join(", ");
+
+    let table_ref = if is_postgres {
+        qualify_pg_table(&table.schema, &table.name)
+    } else {
+        qualify_mssql_table(&table.schema, &table.name)
+    };
 
     // Create ORDER BY from primary key columns
     let order_by = if table.primary_key.is_empty() {
         if !columns.is_empty() {
-            quote_mssql_ident(&columns[0])
+            if is_postgres { quote_pg_ident(&columns[0]) } else { quote_mssql_ident(&columns[0]) }
         } else {
             return Err(MigrateError::Transfer {
                 table: table.full_name(),
@@ -1125,22 +1147,35 @@ async fn read_chunk_offset(
         table
             .primary_key
             .iter()
-            .map(|c| quote_mssql_ident(c))
+            .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
             .collect::<Vec<_>>()
             .join(", ")
     };
 
-    let query = format!(
-        "SELECT {} FROM {} WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-        col_list,
-        qualify_mssql_table(&table.schema, &table.name),
-        order_by,
-        offset,
-        chunk_size
-    );
+    let query = if is_postgres {
+        format!(
+            "SELECT {} FROM {} ORDER BY {} LIMIT {} OFFSET {}",
+            col_list, table_ref, order_by, chunk_size, offset
+        )
+    } else {
+        format!(
+            "SELECT {} FROM {} WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+            col_list, table_ref, order_by, offset, chunk_size
+        )
+    };
 
     let rows = source.query_rows_fast(&query, columns, col_types).await?;
     Ok((rows, None))
+}
+
+/// Quote a PostgreSQL identifier.
+fn quote_pg_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Qualify a PostgreSQL table name with schema and proper quoting.
+fn qualify_pg_table(schema: &str, table: &str) -> String {
+    format!("{}.{}", quote_pg_ident(schema), quote_pg_ident(table))
 }
 
 /// Check if the primary key is a sortable integer type.

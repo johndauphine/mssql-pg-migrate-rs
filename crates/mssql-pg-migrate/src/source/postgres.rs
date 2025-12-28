@@ -265,6 +265,28 @@ impl PgSourcePool {
         Ok(row.get::<_, i64>(0))
     }
 
+    /// Get the maximum value of a primary key column.
+    pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(e, "getting connection for get_max_pk")
+        })?;
+
+        // Quote identifiers for PostgreSQL
+        fn quote_ident(name: &str) -> String {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
+
+        let query = format!(
+            "SELECT COALESCE(MAX({})::bigint, 0) FROM {}.{}",
+            quote_ident(pk_col),
+            quote_ident(schema),
+            quote_ident(table)
+        );
+
+        let row = client.query_one(&query, &[]).await?;
+        Ok(row.get::<_, i64>(0))
+    }
+
     /// Execute NTILE partition query.
     pub async fn execute_ntile_partition_query(
         &self,

@@ -131,6 +131,111 @@ impl MssqlTargetPool {
         format!("[{}]", name.replace(']', "]]"))
     }
 
+    /// Check if a data type is an MSSQL native type.
+    fn is_mssql_type(data_type: &str) -> bool {
+        let lower = data_type.to_lowercase();
+        matches!(
+            lower.as_str(),
+            "bigint" | "int" | "smallint" | "tinyint" | "bit"
+            | "decimal" | "numeric" | "money" | "smallmoney"
+            | "float" | "real"
+            | "datetime" | "datetime2" | "smalldatetime" | "date" | "time" | "datetimeoffset"
+            | "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext"
+            | "binary" | "varbinary" | "image"
+            | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
+            | "geography" | "geometry" | "hierarchyid"
+        )
+    }
+
+    /// Format an MSSQL type with proper length/precision.
+    fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+        let lower = data_type.to_lowercase();
+        match lower.as_str() {
+            // Fixed-length types
+            "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney"
+            | "real" | "datetime" | "smalldatetime" | "date" | "text" | "ntext" | "image"
+            | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
+            | "geography" | "geometry" | "hierarchyid" => data_type.to_string(),
+
+            // Float can have optional precision
+            "float" => {
+                if precision > 0 {
+                    format!("float({})", precision)
+                } else {
+                    "float".to_string()
+                }
+            }
+
+            // Decimal/numeric with precision and scale
+            "decimal" | "numeric" => {
+                if precision > 0 {
+                    format!("{}({}, {})", data_type, precision, scale)
+                } else {
+                    format!("{}(18, 0)", data_type)
+                }
+            }
+
+            // datetime2 with optional precision
+            "datetime2" => {
+                if scale > 0 {
+                    format!("datetime2({})", scale)
+                } else {
+                    "datetime2".to_string()
+                }
+            }
+
+            // time with optional precision
+            "time" => {
+                if scale > 0 {
+                    format!("time({})", scale)
+                } else {
+                    "time".to_string()
+                }
+            }
+
+            // datetimeoffset with optional precision
+            "datetimeoffset" => {
+                if scale > 0 {
+                    format!("datetimeoffset({})", scale)
+                } else {
+                    "datetimeoffset".to_string()
+                }
+            }
+
+            // Variable length character types
+            "char" | "varchar" | "nchar" | "nvarchar" => {
+                if max_length == -1 {
+                    format!("{}(max)", data_type)
+                } else if max_length > 0 {
+                    // nvarchar stores 2 bytes per char, so divide by 2
+                    let len = if lower.starts_with('n') && max_length > 0 {
+                        max_length / 2
+                    } else {
+                        max_length
+                    };
+                    format!("{}({})", data_type, len)
+                } else {
+                    // Default length
+                    format!("{}(255)", data_type)
+                }
+            }
+
+            // Variable length binary types
+            "binary" | "varbinary" => {
+                if max_length == -1 {
+                    format!("{}(max)", data_type)
+                } else if max_length > 0 {
+                    format!("{}({})", data_type, max_length)
+                } else {
+                    format!("{}(255)", data_type)
+                }
+            }
+
+            // Unknown type - return as-is
+            _ => data_type.to_string(),
+        }
+    }
+
     /// Format a SqlValue for MSSQL INSERT statement.
     fn format_value(value: &SqlValue) -> String {
         match value {
@@ -164,25 +269,265 @@ impl MssqlTargetPool {
         }
     }
 
-    /// Check if a table has an identity column.
-    async fn has_identity_column(&self, schema: &str, table: &str) -> Result<bool> {
+    /// Fetch row hashes for hash-based change detection.
+    /// Returns a HashMap of serialized PK -> row hash.
+    pub async fn fetch_row_hashes(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_cols: &[String],
+        row_hash_col: &str,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        use std::collections::HashMap;
+
         let mut conn = self.get_conn().await?;
-        let query = format!(
-            r#"SELECT COUNT(*)
-               FROM sys.columns c
-               JOIN sys.tables t ON c.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
+
+        // Build PK column select list
+        let pk_select: Vec<String> = pk_cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let pk_select_str = pk_select.join(", ");
+
+        // Build query
+        let mut query = format!(
+            "SELECT {}, {} FROM {}.{}",
+            pk_select_str,
+            Self::quote_ident(row_hash_col),
+            Self::quote_ident(schema),
+            Self::quote_ident(table)
         );
 
+        // Add WHERE clause for single-column integer PK range
+        if pk_cols.len() == 1 {
+            let pk_col = Self::quote_ident(&pk_cols[0]);
+            let mut conditions = Vec::new();
+
+            if let Some(min) = min_pk {
+                conditions.push(format!("{} >= {}", pk_col, min));
+            }
+            if let Some(max) = max_pk {
+                conditions.push(format!("{} <= {}", pk_col, max));
+            }
+
+            if !conditions.is_empty() {
+                query.push_str(" WHERE ");
+                query.push_str(&conditions.join(" AND "));
+            }
+        }
+
         let result = conn.simple_query(&query).await?;
+        let mut hashes = HashMap::new();
+
+        for row in result.into_first_result().await? {
+            // Build PK key from PK columns
+            let pk_key: String = pk_cols
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let val: Option<&str> = row.try_get(i).ok().flatten();
+                    val.unwrap_or("NULL").to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+
+            // Get hash value (last column)
+            let hash_idx = pk_cols.len();
+            let hash: Option<&str> = row.try_get(hash_idx).ok().flatten();
+            if let Some(h) = hash {
+                hashes.insert(pk_key, h.to_string());
+            }
+        }
+
+        Ok(hashes)
+    }
+
+    /// Create a table with row hash column for change detection.
+    pub async fn create_table_with_hash(
+        &self,
+        table: &Table,
+        target_schema: &str,
+        row_hash_column: &str,
+    ) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+
+        // Generate column definitions
+        let mut col_defs: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| {
+                // Detect if source type is already MSSQL (by checking for MSSQL-specific types)
+                let target_type = if Self::is_mssql_type(&c.data_type) {
+                    // Source is MSSQL - format the type with proper length/precision
+                    Self::format_mssql_type(&c.data_type, c.max_length, c.precision, c.scale)
+                } else {
+                    // Source is PostgreSQL - use the type mapper
+                    let mapping = postgres_to_mssql(
+                        &c.data_type,
+                        c.max_length,
+                        c.precision,
+                        c.scale,
+                    );
+                    if mapping.is_lossy {
+                        if let Some(warning) = &mapping.warning {
+                            warn!("Column {}.{}: {}", table.name, c.name, warning);
+                        }
+                    }
+                    mapping.target_type
+                };
+
+                let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
+                let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
+
+                format!(
+                    "{} {}{}  {}",
+                    Self::quote_ident(&c.name),
+                    target_type,
+                    identity_clause,
+                    null_clause
+                )
+            })
+            .collect();
+
+        // Add row hash column for change detection
+        col_defs.push(format!("{} NVARCHAR(32) NULL", Self::quote_ident(row_hash_column)));
+
+        let ddl = format!(
+            "CREATE TABLE {}.{} (\n    {}\n)",
+            Self::quote_ident(target_schema),
+            Self::quote_ident(&table.name),
+            col_defs.join(",\n    ")
+        );
+
+        conn.execute(&ddl, &[]).await?;
+        debug!("Created table with hash column: {}.{}", target_schema, table.name);
+        Ok(())
+    }
+
+    /// Ensure the row hash column exists on the table.
+    pub async fn ensure_row_hash_column(
+        &self,
+        schema: &str,
+        table: &str,
+        row_hash_column: &str,
+    ) -> Result<bool> {
+        let mut conn = self.get_conn().await?;
+
+        // Check if column exists
+        let check_query = format!(
+            r#"SELECT COUNT(*) FROM sys.columns c
+               JOIN sys.tables t ON c.object_id = t.object_id
+               JOIN sys.schemas s ON t.schema_id = s.schema_id
+               WHERE s.name = '{}' AND t.name = '{}' AND c.name = '{}'"#,
+            schema.replace('\'', "''"),
+            table.replace('\'', "''"),
+            row_hash_column.replace('\'', "''")
+        );
+
+        let result = conn.simple_query(&check_query).await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
-            return Ok(count > 0);
+            if count > 0 {
+                return Ok(false); // Column already exists
+            }
         }
-        Ok(false)
+
+        // Add the column
+        let alter_query = format!(
+            "ALTER TABLE {}.{} ADD {} NVARCHAR(32) NULL",
+            Self::quote_ident(schema),
+            Self::quote_ident(table),
+            Self::quote_ident(row_hash_column)
+        );
+        conn.execute(&alter_query, &[]).await?;
+        debug!("Added {} column to {}.{}", row_hash_column, schema, table);
+
+        Ok(true)
+    }
+
+    /// Get total row count from a query.
+    /// Used by verification engine.
+    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
+        let mut conn = self.get_conn().await?;
+        let result = conn.simple_query(query).await?;
+        if let Some(row) = result.into_first_result().await?.into_iter().next() {
+            let count: i64 = row.get(0).unwrap_or(0);
+            return Ok(count);
+        }
+        Ok(0)
+    }
+
+    /// Execute NTILE partition query for verification.
+    /// Returns (row_count, combined_hash) tuples.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+        let mut conn = self.get_conn().await?;
+        let result = conn.simple_query(query).await?;
+        let mut partitions = Vec::new();
+
+        for row in result.into_first_result().await? {
+            let row_count: i64 = row.get(0).unwrap_or(0);
+            let combined_hash: i64 = row.get(1).unwrap_or(0);
+            partitions.push((row_count, combined_hash));
+        }
+
+        Ok(partitions)
+    }
+
+    /// Execute count query with ROW_NUMBER range.
+    pub async fn execute_count_query_with_rownum(
+        &self,
+        query: &str,
+        range: &crate::verify::RowRange,
+    ) -> Result<i64> {
+        let mut conn = self.get_conn().await?;
+        // Build query with range substitution
+        let final_query = query
+            .replace("$1", &range.start_row.to_string())
+            .replace("$2", &range.end_row.to_string());
+
+        let result = conn.simple_query(&final_query).await?;
+        if let Some(row) = result.into_first_result().await?.into_iter().next() {
+            let count: i64 = row.get(0).unwrap_or(0);
+            return Ok(count);
+        }
+        Ok(0)
+    }
+
+    /// Fetch row hashes with ROW_NUMBER range for verification.
+    pub async fn fetch_row_hashes_with_rownum(
+        &self,
+        query: &str,
+        range: &crate::verify::RowRange,
+        pk_column_count: usize,
+    ) -> Result<crate::verify::CompositeRowHashMap> {
+        use crate::source::PkValue;
+        use crate::verify::{CompositePk, CompositeRowHashMap};
+
+        let mut conn = self.get_conn().await?;
+        // Build query with range substitution
+        let final_query = query
+            .replace("$1", &range.start_row.to_string())
+            .replace("$2", &range.end_row.to_string());
+
+        let result = conn.simple_query(&final_query).await?;
+        let mut hashes = CompositeRowHashMap::new();
+
+        for row in result.into_first_result().await? {
+            // Extract PK columns
+            let mut pk_values = Vec::with_capacity(pk_column_count);
+            for i in 0..pk_column_count {
+                let val: Option<&str> = row.try_get(i).ok().flatten();
+                pk_values.push(PkValue::String(val.unwrap_or("NULL").to_string()));
+            }
+            let pk = CompositePk(pk_values);
+
+            // Hash is the last column
+            let hash: Option<&str> = row.try_get(pk_column_count).ok().flatten();
+            if let Some(h) = hash {
+                hashes.insert(pk, h.to_string());
+            }
+        }
+
+        Ok(hashes)
     }
 }
 
@@ -208,18 +553,25 @@ impl TargetPool for MssqlTargetPool {
             .columns
             .iter()
             .map(|c| {
-                let mapping = postgres_to_mssql(
-                    &c.data_type,
-                    c.max_length,
-                    c.precision,
-                    c.scale,
-                );
-
-                if mapping.is_lossy {
-                    if let Some(warning) = &mapping.warning {
-                        warn!("Column {}.{}: {}", table.name, c.name, warning);
+                // Detect if source type is already MSSQL (by checking for MSSQL-specific types)
+                let target_type = if Self::is_mssql_type(&c.data_type) {
+                    // Source is MSSQL - format the type with proper length/precision
+                    Self::format_mssql_type(&c.data_type, c.max_length, c.precision, c.scale)
+                } else {
+                    // Source is PostgreSQL - use the type mapper
+                    let mapping = postgres_to_mssql(
+                        &c.data_type,
+                        c.max_length,
+                        c.precision,
+                        c.scale,
+                    );
+                    if mapping.is_lossy {
+                        if let Some(warning) = &mapping.warning {
+                            warn!("Column {}.{}: {}", table.name, c.name, warning);
+                        }
                     }
-                }
+                    mapping.target_type
+                };
 
                 let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
                 let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
@@ -227,7 +579,7 @@ impl TargetPool for MssqlTargetPool {
                 format!(
                     "{} {}{}  {}",
                     Self::quote_ident(&c.name),
-                    mapping.target_type,
+                    target_type,
                     identity_clause,
                     null_clause
                 )
@@ -483,24 +835,36 @@ impl TargetPool for MssqlTargetPool {
         }
 
         let mut conn = self.get_conn().await?;
-        let has_identity = self.has_identity_column(schema, table).await?;
         let total_rows = rows.len() as u64;
 
-        // Enable IDENTITY_INSERT if needed
-        if has_identity {
-            let enable_identity = format!(
-                "SET IDENTITY_INSERT {}.{} ON",
-                Self::quote_ident(schema),
-                Self::quote_ident(table)
-            );
-            conn.execute(&enable_identity, &[]).await?;
-        }
+        // Check for identity column using the SAME connection
+        let identity_query = format!(
+            r#"SELECT COUNT(*)
+               FROM sys.columns c
+               JOIN sys.tables t ON c.object_id = t.object_id
+               JOIN sys.schemas s ON t.schema_id = s.schema_id
+               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
+            schema.replace('\'', "''"),
+            table.replace('\'', "''")
+        );
+        debug!("Identity check query for {}.{}: {}", schema, table, identity_query);
+        let result = conn.simple_query(&identity_query).await?;
+        let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
+            let count: i32 = row.get(0).unwrap_or(0);
+            debug!("Identity check result for {}.{}: count={}, has_identity={}", schema, table, count, count > 0);
+            count > 0
+        } else {
+            debug!("Identity check result for {}.{}: no rows returned", schema, table);
+            false
+        };
 
         // Build column list
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
 
-        // Insert in batches
+        let qualified_table = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
+
+        // Insert in batches, combining IDENTITY_INSERT with INSERT in single batch
         for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
             let values: Vec<String> = chunk
                 .iter()
@@ -510,25 +874,27 @@ impl TargetPool for MssqlTargetPool {
                 })
                 .collect();
 
-            let insert_sql = format!(
-                "INSERT INTO {}.{} ({}) VALUES {}",
-                Self::quote_ident(schema),
-                Self::quote_ident(table),
-                col_str,
-                values.join(", ")
-            );
+            // Build the SQL - if has_identity, wrap in IDENTITY_INSERT ON/OFF
+            let batch_sql = if has_identity {
+                format!(
+                    "SET IDENTITY_INSERT {} ON; INSERT INTO {} ({}) VALUES {}; SET IDENTITY_INSERT {} OFF;",
+                    qualified_table,
+                    qualified_table,
+                    col_str,
+                    values.join(", "),
+                    qualified_table
+                )
+            } else {
+                format!(
+                    "INSERT INTO {} ({}) VALUES {}",
+                    qualified_table,
+                    col_str,
+                    values.join(", ")
+                )
+            };
 
-            conn.execute(&insert_sql, &[]).await?;
-        }
-
-        // Disable IDENTITY_INSERT if we enabled it
-        if has_identity {
-            let disable_identity = format!(
-                "SET IDENTITY_INSERT {}.{} OFF",
-                Self::quote_ident(schema),
-                Self::quote_ident(table)
-            );
-            conn.execute(&disable_identity, &[]).await?;
+            debug!("Executing batch: {}...", &batch_sql[..std::cmp::min(200, batch_sql.len())]);
+            conn.simple_query(&batch_sql).await?.into_results().await?;
         }
 
         Ok(total_rows)
@@ -549,22 +915,31 @@ impl TargetPool for MssqlTargetPool {
         }
 
         let mut conn = self.get_conn().await?;
-        let has_identity = self.has_identity_column(schema, table).await?;
         let total_rows = rows.len() as u64;
 
-        // Enable IDENTITY_INSERT if needed
-        if has_identity {
-            let enable_identity = format!(
-                "SET IDENTITY_INSERT {}.{} ON",
-                Self::quote_ident(schema),
-                Self::quote_ident(table)
-            );
-            conn.execute(&enable_identity, &[]).await?;
-        }
+        // Check for identity column using the SAME connection
+        let identity_query = format!(
+            r#"SELECT COUNT(*)
+               FROM sys.columns c
+               JOIN sys.tables t ON c.object_id = t.object_id
+               JOIN sys.schemas s ON t.schema_id = s.schema_id
+               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
+            schema.replace('\'', "''"),
+            table.replace('\'', "''")
+        );
+        let result = conn.simple_query(&identity_query).await?;
+        let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
+            let count: i32 = row.get(0).unwrap_or(0);
+            count > 0
+        } else {
+            false
+        };
 
         // Build column list
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
+
+        let qualified_table = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
 
         // Process in batches
         for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
@@ -607,32 +982,34 @@ impl TargetPool for MssqlTargetPool {
             };
 
             let merge_sql = format!(
-                r#"MERGE INTO {schema}.{table} AS target
-                   USING (VALUES {values}) AS source ({cols})
-                   ON {join_condition}
-                   WHEN MATCHED{update_condition} THEN UPDATE SET {update_set}
-                   WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({source_cols});"#,
-                schema = Self::quote_ident(schema),
-                table = Self::quote_ident(table),
-                values = values.join(", "),
-                cols = col_str,
-                join_condition = join_condition.join(" AND "),
-                update_condition = update_condition,
-                update_set = update_cols.join(", "),
-                source_cols = source_cols.join(", ")
+                r#"MERGE INTO {} AS target
+                   USING (VALUES {}) AS source ({})
+                   ON {}
+                   WHEN MATCHED{} THEN UPDATE SET {}
+                   WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});"#,
+                qualified_table,
+                values.join(", "),
+                col_str,
+                join_condition.join(" AND "),
+                update_condition,
+                update_cols.join(", "),
+                col_str,
+                source_cols.join(", ")
             );
 
-            conn.execute(&merge_sql, &[]).await?;
-        }
+            // Combine IDENTITY_INSERT with MERGE in single batch
+            let batch_sql = if has_identity {
+                format!(
+                    "SET IDENTITY_INSERT {} ON; {} SET IDENTITY_INSERT {} OFF;",
+                    qualified_table,
+                    merge_sql,
+                    qualified_table
+                )
+            } else {
+                merge_sql
+            };
 
-        // Disable IDENTITY_INSERT if we enabled it
-        if has_identity {
-            let disable_identity = format!(
-                "SET IDENTITY_INSERT {}.{} OFF",
-                Self::quote_ident(schema),
-                Self::quote_ident(table)
-            );
-            conn.execute(&disable_identity, &[]).await?;
+            conn.simple_query(&batch_sql).await?.into_results().await?;
         }
 
         Ok(total_rows)
