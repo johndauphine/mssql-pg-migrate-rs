@@ -26,7 +26,8 @@ pub fn is_text_type(data_type: &str) -> bool {
     matches!(dt.as_str(), "text" | "ntext" | "xml")
         || dt == "varchar(-1)"
         || dt == "nvarchar(-1)"
-        || dt.contains("(max)")
+        || dt == "varchar(max)"
+        || dt == "nvarchar(max)"
 }
 
 /// Generate MSSQL expression for a normalized column value.
@@ -243,6 +244,7 @@ mod tests {
         assert!(!is_text_type("nvarchar(50)"));
         assert!(!is_text_type("int"));
         assert!(!is_text_type("datetime"));
+        assert!(!is_text_type("varbinary(max)")); // binary, not text
     }
 
     #[test]

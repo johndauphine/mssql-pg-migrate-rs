@@ -1392,4 +1392,43 @@ mod tests {
         tracker.add_range(None, Some(100));
         assert_eq!(tracker.safe_resume_point(), Some(100));
     }
+
+    #[test]
+    fn test_compute_text_skip_indices_hash_text_true() {
+        // When hash_text_columns is true, no columns should be skipped
+        let col_types = vec![
+            "int".to_string(),
+            "text".to_string(),
+            "varchar(100)".to_string(),
+            "nvarchar(max)".to_string(),
+        ];
+        let result = compute_text_skip_indices(&col_types, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_text_skip_indices_hash_text_false() {
+        // When hash_text_columns is false, text columns should be skipped
+        let col_types = vec![
+            "int".to_string(),          // index 0 - not text
+            "text".to_string(),          // index 1 - text
+            "varchar(100)".to_string(),  // index 2 - not text
+            "nvarchar(max)".to_string(), // index 3 - text
+            "xml".to_string(),           // index 4 - text
+        ];
+        let result = compute_text_skip_indices(&col_types, false);
+        assert_eq!(result, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_compute_text_skip_indices_no_text_columns() {
+        // When there are no text columns, should return empty
+        let col_types = vec![
+            "int".to_string(),
+            "varchar(100)".to_string(),
+            "datetime".to_string(),
+        ];
+        let result = compute_text_skip_indices(&col_types, false);
+        assert!(result.is_empty());
+    }
 }

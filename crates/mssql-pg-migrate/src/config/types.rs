@@ -368,8 +368,9 @@ pub struct MigrationConfig {
     pub row_hash_column: String,
 
     /// Include text-type columns in row hash computation (default: false for performance).
-    /// When false, skips text, ntext, varchar(max), nvarchar(max), and xml columns.
-    /// This speeds up hash computation but means changes to these columns won't be detected.
+    /// When false, skips text, ntext, varchar(max), nvarchar(max), and xml columns on MSSQL;
+    /// skips text and xml columns on PostgreSQL. This speeds up hash computation but means
+    /// changes to these columns won't be detected.
     #[serde(default)]
     pub hash_text_columns: bool,
 

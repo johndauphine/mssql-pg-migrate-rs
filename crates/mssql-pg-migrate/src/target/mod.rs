@@ -3070,4 +3070,69 @@ mod tests {
         // Should NOT reference row_hash since it's not in cols
         assert!(!sql.contains("row_hash"));
     }
+
+    #[test]
+    fn test_calculate_row_hash_skip_indices() {
+        // Test that skip_indices excludes columns from hash computation
+        let row = vec![
+            SqlValue::I32(1),                              // index 0 - PK
+            SqlValue::String("name".to_string()),          // index 1 - normal
+            SqlValue::String("large text body".to_string()), // index 2 - text to skip
+            SqlValue::I32(42),                             // index 3 - normal
+        ];
+        let pk_indices = vec![0];
+
+        // Hash without skipping any columns
+        let hash_all = calculate_row_hash(&row, &pk_indices, &[]);
+
+        // Hash skipping index 2 (text column)
+        let hash_skip_text = calculate_row_hash(&row, &pk_indices, &[2]);
+
+        // Hashes should be different
+        assert_ne!(hash_all, hash_skip_text);
+
+        // Hash with different text content but same skip should be same
+        let row2 = vec![
+            SqlValue::I32(1),
+            SqlValue::String("name".to_string()),
+            SqlValue::String("completely different text".to_string()), // different text
+            SqlValue::I32(42),
+        ];
+        let hash_skip_text2 = calculate_row_hash(&row2, &pk_indices, &[2]);
+        assert_eq!(hash_skip_text, hash_skip_text2); // Same because text is skipped
+    }
+
+    #[test]
+    fn test_calculate_row_hash_skip_multiple_indices() {
+        // Test skipping multiple columns
+        let row = vec![
+            SqlValue::I32(1),                         // index 0 - PK
+            SqlValue::String("text1".to_string()),    // index 1 - skip
+            SqlValue::String("keep".to_string()),     // index 2 - keep
+            SqlValue::String("text2".to_string()),    // index 3 - skip
+        ];
+        let pk_indices = vec![0];
+
+        let hash = calculate_row_hash(&row, &pk_indices, &[1, 3]);
+
+        // Change skipped columns - hash should stay the same
+        let row2 = vec![
+            SqlValue::I32(1),
+            SqlValue::String("different".to_string()), // changed but skipped
+            SqlValue::String("keep".to_string()),
+            SqlValue::String("also changed".to_string()), // changed but skipped
+        ];
+        let hash2 = calculate_row_hash(&row2, &pk_indices, &[1, 3]);
+        assert_eq!(hash, hash2);
+
+        // Change non-skipped column - hash should change
+        let row3 = vec![
+            SqlValue::I32(1),
+            SqlValue::String("text1".to_string()),
+            SqlValue::String("modified".to_string()), // changed and NOT skipped
+            SqlValue::String("text2".to_string()),
+        ];
+        let hash3 = calculate_row_hash(&row3, &pk_indices, &[1, 3]);
+        assert_ne!(hash, hash3);
+    }
 }
