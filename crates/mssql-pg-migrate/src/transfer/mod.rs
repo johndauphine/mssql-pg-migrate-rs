@@ -10,6 +10,7 @@ use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
+use crate::verify::normalize::mssql_row_hash_expr;
 use futures::future::try_join_all;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -841,6 +842,10 @@ async fn read_chunk_range(
     // First chunk uses >= for fresh ranges, > for resume
     let mut is_first_chunk = !is_resume;
 
+    // Determine if we should use SQL-side hashing (MSSQL only)
+    // This avoids datetime precision mismatches between Rust and SQL hash computation
+    let use_sql_hash = use_hash && source.db_type() == "mssql";
+
     loop {
         let read_start = Instant::now();
 
@@ -853,6 +858,7 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            use_sql_hash,
         )
         .await?;
 
@@ -869,8 +875,12 @@ async fn read_chunk_range(
         total_rows += row_count as i64;
         chunk_num += 1;
 
-        // Compute hashes in parallel if hash detection is enabled
-        let rows_with_hash = if use_hash {
+        // For MSSQL, hash is already computed in SQL and appended to each row.
+        // For PostgreSQL or when hash detection is disabled, compute in Rust if needed.
+        let rows_with_hash = if use_sql_hash {
+            // Hash already included as last column by SQL query
+            rows
+        } else if use_hash {
             compute_row_hashes(rows, &pk_indices)
         } else {
             rows
@@ -946,12 +956,17 @@ async fn read_table_chunks(
     // First chunk uses >= for fresh ranges, > for resume
     let mut is_first_chunk = !is_resume;
 
+    // Determine if we should use SQL-side hashing (MSSQL with keyset pagination only)
+    // This avoids datetime precision mismatches between Rust and SQL hash computation
+    let use_sql_hash = use_hash && use_keyset && source.db_type() == "mssql";
+
     loop {
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
                 &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
+                use_sql_hash,
             )
             .await?
         } else {
@@ -980,8 +995,12 @@ async fn read_table_chunks(
         total_rows += row_count as i64;
         chunk_num += 1;
 
-        // Compute hashes in parallel if hash detection is enabled
-        let rows_with_hash = if use_hash {
+        // For MSSQL with keyset pagination, hash is already computed in SQL.
+        // For PostgreSQL or offset pagination, compute in Rust if needed.
+        let rows_with_hash = if use_sql_hash {
+            // Hash already included as last column by SQL query
+            rows
+        } else if use_hash {
             compute_row_hashes(rows, &pk_indices)
         } else {
             rows
@@ -1036,6 +1055,10 @@ async fn read_table_chunks(
 /// This is needed because for the first chunk of a range, `last_pk` represents the starting
 /// boundary that should be included, not a previously-read row to skip.
 /// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
+///
+/// When `use_sql_hash` is true and source is MSSQL, computes the MD5 row hash in SQL
+/// and appends it as the last column. This ensures hash consistency between transfer
+/// and verification (avoids datetime precision issues with Rust-side hashing).
 async fn read_chunk_keyset_fast(
     source: &SourcePoolImpl,
     table: &Table,
@@ -1045,16 +1068,36 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    use_sql_hash: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let is_postgres = source.db_type() == "postgres";
+    let is_mssql = source.db_type() == "mssql";
 
     // Build column list with appropriate quoting
-    let col_list = columns
+    let mut col_list = columns
         .iter()
         .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
         .collect::<Vec<_>>()
         .join(", ");
+
+    // For MSSQL with SQL-side hashing, add the hash expression as the last column
+    // This computes the same MD5 hash that verification uses, avoiding precision mismatches
+    if use_sql_hash && is_mssql {
+        let hash_expr = mssql_row_hash_expr(&table.columns, &table.primary_key);
+        col_list.push_str(&format!(", {} AS row_hash", hash_expr));
+    }
+
+    // Build extended column/type lists for query_rows_fast when hash is included
+    let (query_columns, query_col_types): (Vec<String>, Vec<String>) = if use_sql_hash && is_mssql {
+        let mut cols: Vec<String> = columns.to_vec();
+        let mut types: Vec<String> = col_types.to_vec();
+        cols.push("row_hash".to_string());
+        types.push("varchar".to_string());
+        (cols, types)
+    } else {
+        (columns.to_vec(), col_types.to_vec())
+    };
 
     let pk_quoted = if is_postgres { quote_pg_ident(pk_col) } else { quote_mssql_ident(pk_col) };
     let table_ref = if is_postgres {
@@ -1093,7 +1136,7 @@ async fn read_chunk_keyset_fast(
         query.push_str(&format!(" LIMIT {}", chunk_size));
     }
 
-    let rows = source.query_rows_fast(&query, columns, col_types).await?;
+    let rows = source.query_rows_fast(&query, &query_columns, &query_col_types).await?;
 
     // Get the last PK value from the result
     let pk_idx = columns.iter().position(|c| c == pk_col);

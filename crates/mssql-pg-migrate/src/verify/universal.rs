@@ -21,10 +21,14 @@ use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
 use crate::verify::hash_query::{
-    mssql_ntile_partition_query_with_hash, mssql_row_count_with_rownum_query_with_hash,
-    mssql_row_hashes_with_rownum_query, mssql_total_row_count_query,
-    postgres_ntile_partition_query_with_hash, postgres_row_count_with_rownum_query_with_hash,
-    postgres_row_hashes_with_rownum_query, postgres_total_row_count_query,
+    mssql_ntile_partition_query_with_hash,
+    mssql_row_count_with_rownum_query_with_hash,
+    mssql_row_hashes_with_rownum_query,
+    mssql_total_row_count_query,
+    postgres_ntile_partition_query_with_hash,
+    postgres_row_count_with_rownum_query_with_hash,
+    postgres_row_hashes_with_rownum_query,
+    postgres_total_row_count_query,
 };
 use crate::verify::{
     CompositePk, RowHashDiffComposite, RowRange, SyncStats,
@@ -220,8 +224,7 @@ impl UniversalVerifyEngine {
             .max(1);
 
         // Tier 1: Get NTILE partition counts and hashes from both databases
-        let source_ntile_sql =
-            mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions);
+        let source_ntile_sql = mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions);
         let target_ntile_sql = postgres_ntile_partition_query_with_hash(
             target_schema,
             &table.name,

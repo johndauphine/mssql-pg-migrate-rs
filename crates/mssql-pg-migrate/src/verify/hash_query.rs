@@ -114,9 +114,9 @@ ORDER BY partition_id"#,
     )
 }
 
-/// Generate MSSQL query to partition table using NTILE for Tier 1 (count only).
+/// Generate MSSQL query for count-only partition verification.
 ///
-/// Returns partition_id and row_count for each partition.
+/// Returns partition_id, row_count, and dummy partition_hash (always 0).
 /// Use `mssql_ntile_partition_query_with_hash` for update detection.
 pub fn mssql_ntile_partition_query(
     schema: &str,
@@ -132,7 +132,8 @@ pub fn mssql_ntile_partition_query(
 )
 SELECT
     partition_id,
-    CAST(COUNT(*) AS BIGINT) AS row_count
+    CAST(COUNT(*) AS BIGINT) AS row_count,
+    CAST(0 AS BIGINT) AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -224,6 +225,10 @@ ORDER BY partition_id"#,
 /// Returns partition_id and row_count for each partition. NTILE divides into
 /// approximately equal partitions (some may have one more row than others).
 /// Use `postgres_ntile_partition_query_with_hash` for update detection.
+/// Generate PostgreSQL query for count-only partition verification.
+///
+/// Returns partition_id, row_count, and dummy partition_hash (always 0).
+/// Used in fast_verify mode where hash comparison is skipped.
 pub fn postgres_ntile_partition_query(
     schema: &str,
     table_name: &str,
@@ -238,7 +243,8 @@ pub fn postgres_ntile_partition_query(
 )
 SELECT
     partition_id,
-    COUNT(*)::BIGINT AS row_count
+    COUNT(*)::BIGINT AS row_count,
+    0::BIGINT AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,

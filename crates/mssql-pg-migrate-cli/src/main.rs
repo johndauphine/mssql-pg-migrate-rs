@@ -306,11 +306,12 @@ async fn run() -> Result<(), MigrateError> {
             let target_schema = &config.target.schema;
             let tables = orchestrator.extract_schema().await?;
 
-            // Create verify config
+            // Create verify config from migration config or defaults
+            let batch_config = config.migration.batch_verify.as_ref();
             let verify_config = BatchVerifyConfig {
                 tier1_batch_size: tier1_size,
                 tier2_batch_size: tier2_size,
-                parallel_verify_ranges: 4,
+                parallel_verify_ranges: batch_config.map_or(4, |c| c.parallel_verify_ranges),
             };
 
             // Get connection pools from orchestrator
