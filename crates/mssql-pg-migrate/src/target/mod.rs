@@ -1,4 +1,12 @@
-//! PostgreSQL target database operations.
+//! Target database operations.
+//!
+//! This module provides target database implementations:
+//! - `PgPool` - PostgreSQL target
+//! - `MssqlTargetPool` - MSSQL target
+
+mod mssql;
+
+pub use mssql::MssqlTargetPool;
 
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, PkValue, Table};
@@ -492,8 +500,12 @@ impl PgPool {
         let mut ddl = format!("CREATE {}TABLE {}.{} (\n", unlogged_str, schema, table_name);
 
         for (i, col) in table.columns.iter().enumerate() {
-            let pg_type =
-                mssql_to_postgres(&col.data_type, col.max_length, col.precision, col.scale);
+            // Check if source type is already a PostgreSQL type (PG→PG migration)
+            let pg_type = if Self::is_postgres_type(&col.data_type) {
+                Self::format_postgres_type(&col.data_type, col.max_length, col.precision, col.scale)
+            } else {
+                mssql_to_postgres(&col.data_type, col.max_length, col.precision, col.scale)
+            };
 
             let nullable = if col.is_nullable { "" } else { " NOT NULL" };
 
@@ -549,6 +561,129 @@ impl PgPool {
     /// See [`Self::quote_ident`] for details on identifier escaping.
     fn qualify_table(schema: &str, table: &str) -> String {
         format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
+    }
+
+    /// Check if a data type is a PostgreSQL native type.
+    fn is_postgres_type(data_type: &str) -> bool {
+        let lower = data_type.to_lowercase();
+        matches!(
+            lower.as_str(),
+            "boolean" | "bool"
+            | "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8"
+            | "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
+            | "real" | "float4" | "double precision" | "float8"
+            | "numeric" | "decimal"
+            | "char" | "character" | "bpchar" | "varchar" | "character varying" | "text" | "name"
+            | "bytea"
+            | "date" | "time" | "time without time zone" | "time with time zone" | "timetz"
+            | "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
+            | "interval"
+            | "uuid"
+            | "json" | "jsonb"
+            | "xml"
+            | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+            | "inet" | "cidr" | "macaddr" | "macaddr8"
+            | "tsvector" | "tsquery"
+            | "bit" | "bit varying" | "varbit"
+            | "money"
+            | "oid"
+        )
+    }
+
+    /// Format a PostgreSQL type with proper length/precision for DDL.
+    fn format_postgres_type(data_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+        let lower = data_type.to_lowercase();
+        match lower.as_str() {
+            // Fixed-size types - return as-is
+            "boolean" | "bool" | "smallint" | "int2" | "integer" | "int" | "int4"
+            | "bigint" | "int8" | "real" | "float4" | "double precision" | "float8"
+            | "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
+            | "text" | "bytea" | "date" | "uuid" | "json" | "jsonb" | "xml" | "money"
+            | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+            | "inet" | "cidr" | "macaddr" | "macaddr8" | "tsvector" | "tsquery" | "oid"
+            | "name" => data_type.to_string(),
+
+            // Numeric with precision and scale
+            "numeric" | "decimal" => {
+                if precision > 0 {
+                    format!("numeric({},{})", precision, scale)
+                } else {
+                    "numeric".to_string()
+                }
+            }
+
+            // Character types with length
+            "char" | "character" | "bpchar" => {
+                if max_length > 0 {
+                    format!("char({})", max_length)
+                } else {
+                    "char".to_string()
+                }
+            }
+            "varchar" | "character varying" => {
+                if max_length > 0 {
+                    format!("varchar({})", max_length)
+                } else {
+                    "text".to_string() // varchar without length → text
+                }
+            }
+
+            // Bit types with length
+            "bit" => {
+                if max_length > 1 {
+                    format!("bit({})", max_length)
+                } else {
+                    "bit".to_string()
+                }
+            }
+            "bit varying" | "varbit" => {
+                if max_length > 0 {
+                    format!("bit varying({})", max_length)
+                } else {
+                    "bit varying".to_string()
+                }
+            }
+
+            // Time types with precision
+            "time" | "time without time zone" => {
+                if precision > 0 {
+                    format!("time({})", precision)
+                } else {
+                    "time".to_string()
+                }
+            }
+            "time with time zone" | "timetz" => {
+                if precision > 0 {
+                    format!("time({}) with time zone", precision)
+                } else {
+                    "time with time zone".to_string()
+                }
+            }
+            "timestamp" | "timestamp without time zone" => {
+                if precision > 0 {
+                    format!("timestamp({})", precision)
+                } else {
+                    "timestamp".to_string()
+                }
+            }
+            "timestamp with time zone" | "timestamptz" => {
+                if precision > 0 {
+                    format!("timestamp({}) with time zone", precision)
+                } else {
+                    "timestamp with time zone".to_string()
+                }
+            }
+            "interval" => {
+                if precision > 0 {
+                    format!("interval({})", precision)
+                } else {
+                    "interval".to_string()
+                }
+            }
+
+            // Default - return as-is
+            _ => data_type.to_string(),
+        }
     }
 
     /// Map SQL Server referential action to PostgreSQL.
@@ -2281,12 +2416,13 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue) {
             buf.extend_from_slice(u.as_bytes());
         }
         SqlValue::Decimal(d) => {
-            // PostgreSQL NUMERIC binary format is complex, fallback to text representation
-            // which PostgreSQL will parse. This is still faster than text COPY for other types.
-            let s = d.to_string();
-            let bytes = s.as_bytes();
-            buf.put_i32(bytes.len() as i32);
-            buf.extend_from_slice(bytes);
+            // PostgreSQL NUMERIC binary format:
+            // - int16 ndigits: count of base-10000 digits
+            // - int16 weight: position of first digit (exponent in base-10000)
+            // - int16 sign: 0x0000 = positive, 0x4000 = negative
+            // - int16 dscale: display scale (digits after decimal point)
+            // - int16[] digits: base-10000 digits, most significant first
+            write_binary_numeric(buf, d);
         }
         SqlValue::DateTime(dt) => {
             // PostgreSQL timestamp is microseconds since 2000-01-01 00:00:00
@@ -2319,6 +2455,168 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue) {
             buf.put_i32(8);
             buf.put_i64(micros);
         }
+    }
+}
+
+/// Write a rust_decimal::Decimal in PostgreSQL NUMERIC binary format.
+///
+/// PostgreSQL NUMERIC binary format:
+/// - int16 ndigits: count of base-10000 digits
+/// - int16 weight: position of first digit (exponent in base-10000)
+/// - int16 sign: 0x0000 = positive, 0x4000 = negative
+/// - int16 dscale: display scale (digits after decimal point)
+/// - int16[] digits: base-10000 digits, most significant first
+fn write_binary_numeric(buf: &mut BytesMut, d: &rust_decimal::Decimal) {
+    const NUMERIC_POS: i16 = 0x0000;
+    const NUMERIC_NEG: i16 = 0x4000;
+
+    // Handle zero specially
+    if d.is_zero() {
+        // Zero: ndigits=0, weight=0, sign=positive, dscale=scale
+        let dscale = d.scale() as i16;
+        buf.put_i32(8); // length: 4 * int16
+        buf.put_i16(0); // ndigits
+        buf.put_i16(0); // weight
+        buf.put_i16(NUMERIC_POS); // sign
+        buf.put_i16(dscale); // dscale
+        return;
+    }
+
+    let sign = if d.is_sign_negative() {
+        NUMERIC_NEG
+    } else {
+        NUMERIC_POS
+    };
+    let dscale = d.scale() as i16;
+    let abs_d = d.abs();
+
+    // Convert to string and parse into digits
+    // This is simpler than working with the mantissa directly
+    let s = abs_d.to_string();
+
+    // Parse integer and fractional parts
+    let (int_part, frac_part) = if let Some(dot_pos) = s.find('.') {
+        let int_str = &s[..dot_pos];
+        let frac_str = &s[dot_pos + 1..];
+        (int_str.to_string(), frac_str.to_string())
+    } else {
+        (s.clone(), String::new())
+    };
+
+    // Combine all digits into a single string (no decimal point)
+    let all_digits: String = format!("{}{}", int_part, frac_part);
+    let all_digits: Vec<u8> = all_digits
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .map(|c| c as u8 - b'0')
+        .collect();
+
+    if all_digits.is_empty() {
+        // Fallback for edge cases - treat as zero
+        buf.put_i32(8);
+        buf.put_i16(0);
+        buf.put_i16(0);
+        buf.put_i16(sign);
+        buf.put_i16(dscale);
+        return;
+    }
+
+    // Calculate weight: number of base-10000 digit groups before decimal point minus 1
+    let int_len = int_part.trim_start_matches('0').len();
+    let weight = if int_len == 0 {
+        // Number is < 1, weight is negative
+        // Count leading zeros in fractional part
+        let leading_zeros = frac_part.chars().take_while(|&c| c == '0').count();
+        -1 - (leading_zeros / 4) as i16
+    } else {
+        ((int_len - 1) / 4) as i16
+    };
+
+    // Pad the digit string so it aligns with base-10000 boundaries
+    // For integer part: pad on the left so length is multiple of 4
+    // For fractional part: pad on the right so length is multiple of 4
+    let int_pad = if int_len == 0 {
+        0
+    } else {
+        (4 - (int_len % 4)) % 4
+    };
+
+    let frac_len = frac_part.len();
+    let frac_pad = (4 - (frac_len % 4)) % 4;
+
+    // Build padded digit string
+    let mut padded = String::new();
+    if int_len > 0 {
+        for _ in 0..int_pad {
+            padded.push('0');
+        }
+        padded.push_str(int_part.trim_start_matches('0'));
+    }
+    padded.push_str(&frac_part);
+    for _ in 0..frac_pad {
+        padded.push('0');
+    }
+
+    // If number is < 1, we need to handle leading zeros in fractional part
+    if int_len == 0 && !frac_part.is_empty() {
+        // Strip leading zeros and re-pad
+        let stripped = frac_part.trim_start_matches('0');
+        if stripped.is_empty() {
+            // All zeros - this is zero
+            buf.put_i32(8);
+            buf.put_i16(0);
+            buf.put_i16(0);
+            buf.put_i16(sign);
+            buf.put_i16(dscale);
+            return;
+        }
+        let leading_zeros = frac_part.len() - frac_part.trim_start_matches('0').len();
+        let remaining_zeros = leading_zeros % 4;
+
+        padded.clear();
+        for _ in 0..((4 - remaining_zeros) % 4) {
+            padded.push('0');
+        }
+        padded.push_str(stripped);
+        let frac_pad = (4 - (padded.len() % 4)) % 4;
+        for _ in 0..frac_pad {
+            padded.push('0');
+        }
+    }
+
+    // Convert to base-10000 digits
+    let mut digits: Vec<i16> = Vec::new();
+    for chunk in padded.as_bytes().chunks(4) {
+        let mut val: i16 = 0;
+        for &b in chunk {
+            val = val * 10 + (b - b'0') as i16;
+        }
+        digits.push(val);
+    }
+
+    // Remove trailing zero groups (they're implicit)
+    while digits.len() > 1 && digits.last() == Some(&0) {
+        digits.pop();
+    }
+
+    // Remove leading zero groups and adjust weight
+    let mut weight = weight;
+    while !digits.is_empty() && digits[0] == 0 {
+        digits.remove(0);
+        weight -= 1;
+    }
+
+    let ndigits = digits.len() as i16;
+
+    // Calculate total length: 4 header i16s + ndigits * 2 bytes
+    let len = 8 + (ndigits as i32) * 2;
+    buf.put_i32(len);
+    buf.put_i16(ndigits);
+    buf.put_i16(weight);
+    buf.put_i16(sign);
+    buf.put_i16(dscale);
+    for digit in digits {
+        buf.put_i16(digit);
     }
 }
 

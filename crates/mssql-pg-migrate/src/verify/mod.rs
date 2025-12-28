@@ -16,6 +16,7 @@
 
 pub mod hash_query;
 pub mod normalize;
+pub mod normalize_pg;
 pub mod types;
 pub mod universal;
 

@@ -1,10 +1,13 @@
 //! Migration orchestrator - main workflow coordinator.
 
+mod pools;
+
+pub use pools::{SourcePoolImpl, TargetPoolImpl};
+
 use crate::config::{BatchVerifyConfig, Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
-use crate::source::{MssqlPool, SourcePool, Table};
+use crate::source::Table;
 use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
-use crate::target::{PgPool, TargetPool};
 use crate::transfer::{TransferConfig, TransferEngine, TransferJob};
 use crate::verify::UniversalVerifyEngine;
 use chrono::{DateTime, Utc};
@@ -25,8 +28,8 @@ pub struct Orchestrator {
     config: Config,
     state_file: Option<PathBuf>,
     state: Option<MigrationState>,
-    source: Arc<MssqlPool>,
-    target: Arc<PgPool>,
+    source: SourcePoolImpl,
+    target: TargetPoolImpl,
     progress_enabled: bool,
     progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
 }
@@ -275,27 +278,20 @@ impl ProgressTracker {
 impl Orchestrator {
     /// Create a new orchestrator.
     pub async fn new(config: Config) -> Result<Self> {
-        // Create source pool with configurable size
-        let mssql_pool_size = config.migration.get_max_mssql_connections() as u32;
-        let source =
-            MssqlPool::with_max_connections(config.source.clone(), mssql_pool_size).await?;
+        // Create source pool based on configured type
+        let source = SourcePoolImpl::from_config(&config).await?;
+        info!("Connected to {} source database", source.db_type());
 
-        // Create target pool
-        let max_conns = config.migration.get_max_pg_connections();
-        let target = PgPool::new(
-            &config.target,
-            max_conns,
-            config.migration.get_copy_buffer_rows(),
-            config.migration.use_binary_copy,
-        )
-        .await?;
+        // Create target pool based on configured type
+        let target = TargetPoolImpl::from_config(&config).await?;
+        info!("Connected to {} target database", target.db_type());
 
         Ok(Self {
             config,
             state_file: None,
             state: None,
-            source: Arc::new(source),
-            target: Arc::new(target),
+            source,
+            target,
             progress_enabled: false,
             progress_tx: None,
         })
@@ -396,13 +392,13 @@ impl Orchestrator {
     }
 
     /// Get a reference to the source connection pool.
-    pub fn source_pool(&self) -> Arc<MssqlPool> {
-        Arc::clone(&self.source)
+    pub fn source_pool(&self) -> SourcePoolImpl {
+        self.source.clone()
     }
 
     /// Get a reference to the target connection pool.
-    pub fn target_pool(&self) -> Arc<PgPool> {
-        Arc::clone(&self.target)
+    pub fn target_pool(&self) -> TargetPoolImpl {
+        self.target.clone()
     }
 
     /// Extract schema from the source database.
@@ -1354,8 +1350,8 @@ impl Orchestrator {
         };
 
         let engine = UniversalVerifyEngine::new(
-            Arc::clone(&self.source),
-            Arc::clone(&self.target),
+            self.source.clone(),
+            self.target.clone(),
             verify_config,
             self.config.migration.get_row_hash_column().to_string(),
         );

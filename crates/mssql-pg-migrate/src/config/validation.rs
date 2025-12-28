@@ -15,9 +15,10 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.source.user.is_empty() {
         return Err(MigrateError::Config("source.user is required".into()));
     }
-    if config.source.r#type != "mssql" {
+    let source_type = config.source.r#type.to_lowercase();
+    if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
         return Err(MigrateError::Config(format!(
-            "source.type must be 'mssql', got '{}'",
+            "source.type must be 'mssql' or 'postgres', got '{}'",
             config.source.r#type
         )));
     }
@@ -32,20 +33,22 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.target.user.is_empty() {
         return Err(MigrateError::Config("target.user is required".into()));
     }
-    if config.target.r#type != "postgres" {
+    let target_type = config.target.r#type.to_lowercase();
+    if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
         return Err(MigrateError::Config(format!(
-            "target.type must be 'postgres', got '{}'",
+            "target.type must be 'mssql' or 'postgres', got '{}'",
             config.target.r#type
         )));
     }
 
-    // Cannot migrate to the same database
+    // Cannot migrate to the same database AND schema (but same database with different schemas is allowed)
     if config.source.host == config.target.host
         && config.source.port as u16 == config.target.port
         && config.source.database == config.target.database
+        && config.source.schema == config.target.schema
     {
         return Err(MigrateError::Config(
-            "source and target cannot be the same database".into(),
+            "source and target cannot be the same database and schema".into(),
         ));
     }
 
@@ -164,15 +167,33 @@ mod tests {
     #[test]
     fn test_wrong_source_type() {
         let mut config = valid_config();
-        config.source.r#type = "postgres".to_string();
+        config.source.r#type = "oracle".to_string();
         assert!(validate(&config).is_err());
     }
 
     #[test]
     fn test_wrong_target_type() {
         let mut config = valid_config();
-        config.target.r#type = "mssql".to_string();
+        config.target.r#type = "mysql".to_string();
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_postgres_as_source_accepted() {
+        let mut config = valid_config();
+        config.source.r#type = "postgres".to_string();
+        // Need different host/port/db to avoid "same database" error
+        config.source.port = 5432;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_mssql_as_target_accepted() {
+        let mut config = valid_config();
+        config.target.r#type = "mssql".to_string();
+        // Need different host/port/db to avoid "same database" error
+        config.target.port = 1434;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

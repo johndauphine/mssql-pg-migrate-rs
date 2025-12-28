@@ -1,7 +1,14 @@
-//! MSSQL source database operations.
+//! Source database operations.
+//!
+//! This module provides database-agnostic source operations via the `SourcePool` trait.
+//! Implementations are provided for:
+//! - MSSQL: `MssqlPool` (the default source)
+//! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
+mod postgres;
 mod types;
 
+pub use postgres::PgSourcePool;
 pub use types::*;
 
 use crate::config::SourceConfig;
@@ -1219,13 +1226,11 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
             .map(|v| SqlValue::Bytes(v.to_vec()))
             .unwrap_or(SqlValue::Null(SqlNullType::Bytes)),
         "decimal" | "numeric" | "money" | "smallmoney" => {
-            // For decimal/numeric, try to get as string and parse
-            // This is more reliable than trying to convert tiberius Numeric directly
-            row.get::<&str, _>(idx)
-                .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+            // Use rust_decimal directly with tiberius's rust_decimal feature
+            row.get::<rust_decimal::Decimal, _>(idx)
                 .map(SqlValue::Decimal)
                 .or_else(|| {
-                    // Fallback: try as f64
+                    // Fallback: try as f64 for money/smallmoney
                     row.get::<f64, _>(idx).map(|f| {
                         rust_decimal::Decimal::try_from(f)
                             .map(SqlValue::Decimal)

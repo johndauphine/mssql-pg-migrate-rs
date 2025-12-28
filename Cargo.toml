@@ -15,7 +15,9 @@ authors = ["John Dauphine <jdauphine@gmail.com>"]
 tokio = { version = "1.40", features = ["full"] }
 
 # MSSQL driver (pure Rust with rustls)
-tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls"] }
+# Note: The "tds73" feature enables TDS 7.3 protocol, which requires SQL Server 2008 or later
+# (including Azure SQL). Earlier SQL Server versions are not supported with this configuration.
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls", "rust_decimal", "tds73"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # PostgreSQL driver
