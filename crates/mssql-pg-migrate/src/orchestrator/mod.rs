@@ -1372,6 +1372,7 @@ impl Orchestrator {
             self.target.clone(),
             verify_config,
             self.config.migration.get_row_hash_column().to_string(),
+            self.config.migration.hash_text_columns,
         );
 
         let mut total_synced = 0i64;

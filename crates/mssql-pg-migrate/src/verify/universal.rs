@@ -47,6 +47,7 @@ pub struct UniversalVerifyEngine {
     target: TargetPoolImpl,
     config: BatchVerifyConfig,
     row_hash_column: String,
+    hash_text_columns: bool,
     progress_tx: Option<mpsc::Sender<VerifyProgressUpdate>>,
 }
 
@@ -57,12 +58,14 @@ impl UniversalVerifyEngine {
         target: TargetPoolImpl,
         config: BatchVerifyConfig,
         row_hash_column: String,
+        hash_text_columns: bool,
     ) -> Self {
         Self {
             source,
             target,
             config,
             row_hash_column,
+            hash_text_columns,
             progress_tx: None,
         }
     }
@@ -224,7 +227,7 @@ impl UniversalVerifyEngine {
             .max(1);
 
         // Tier 1: Get NTILE partition counts and hashes from both databases
-        let source_ntile_sql = mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions);
+        let source_ntile_sql = mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions, self.hash_text_columns);
         let target_ntile_sql = postgres_ntile_partition_query_with_hash(
             target_schema,
             &table.name,
@@ -452,7 +455,7 @@ impl UniversalVerifyEngine {
         let pk_columns = &table.primary_key;
 
         // Build count+hash queries
-        let source_count_sql = mssql_row_count_with_rownum_query_with_hash(source_schema, table);
+        let source_count_sql = mssql_row_count_with_rownum_query_with_hash(source_schema, table, self.hash_text_columns);
         let target_count_sql = postgres_row_count_with_rownum_query_with_hash(
             target_schema,
             &table.name,
@@ -513,7 +516,7 @@ impl UniversalVerifyEngine {
         let pk_count = pk_columns.len();
 
         // Build queries for (pk_cols..., row_hash) tuples
-        let source_hash_sql = mssql_row_hashes_with_rownum_query(source_schema, table);
+        let source_hash_sql = mssql_row_hashes_with_rownum_query(source_schema, table, self.hash_text_columns);
         let target_hash_sql = postgres_row_hashes_with_rownum_query(
             target_schema,
             &table.name,
