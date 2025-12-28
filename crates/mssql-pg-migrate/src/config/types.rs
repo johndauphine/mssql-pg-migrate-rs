@@ -217,7 +217,7 @@ impl fmt::Debug for TargetConfig {
 /// Migration behavior configuration.
 /// All performance-related fields use Option<T> to distinguish between
 /// "not set" (use auto-tuned default) and "explicitly set" (use provided value).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationConfig {
     /// Number of parallel workers. Auto-tuned based on CPU cores if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,6 +333,39 @@ pub struct MigrationConfig {
     /// Batch verification configuration for multi-tier sync validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_verify: Option<BatchVerifyConfig>,
+}
+
+impl Default for MigrationConfig {
+    fn default() -> Self {
+        Self {
+            workers: None,
+            chunk_size: None,
+            max_partitions: None,
+            large_table_threshold: None,
+            include_tables: Vec::new(),
+            exclude_tables: Vec::new(),
+            target_mode: TargetMode::default(),
+            read_ahead_buffers: None,
+            write_ahead_writers: None,
+            parallel_readers: None,
+            create_indexes: false,
+            create_foreign_keys: false,
+            create_check_constraints: false,
+            max_mssql_connections: None,
+            max_pg_connections: None,
+            min_rows_per_partition: None,
+            finalizer_concurrency: None,
+            copy_buffer_rows: None,
+            use_binary_copy: default_true(),
+            use_unlogged_tables: false,
+            upsert_batch_size: None,
+            upsert_parallel_tasks: None,
+            memory_budget_percent: default_memory_budget_percent(),
+            use_hash_detection: None,
+            row_hash_column: default_row_hash_column(),
+            batch_verify: None,
+        }
+    }
 }
 
 /// Configuration for multi-tier batch verification.
