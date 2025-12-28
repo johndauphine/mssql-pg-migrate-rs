@@ -132,6 +132,10 @@ impl MssqlTargetPool {
     }
 
     /// Check if a data type is an MSSQL native type.
+    ///
+    /// Note: "timestamp" is NOT included because PostgreSQL also has a "timestamp" type.
+    /// MSSQL's "timestamp" is actually a rowversion (auto-generated binary), not a datetime.
+    /// We use "rowversion" explicitly for MSSQL's auto-generated version column.
     fn is_mssql_type(data_type: &str) -> bool {
         let lower = data_type.to_lowercase();
         matches!(
@@ -142,7 +146,7 @@ impl MssqlTargetPool {
             | "datetime" | "datetime2" | "smalldatetime" | "date" | "time" | "datetimeoffset"
             | "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext"
             | "binary" | "varbinary" | "image"
-            | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
+            | "uniqueidentifier" | "xml" | "sql_variant" | "rowversion"
             | "geography" | "geometry" | "hierarchyid"
         )
     }
