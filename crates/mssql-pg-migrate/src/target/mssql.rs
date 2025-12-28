@@ -494,39 +494,57 @@ impl MssqlTargetPool {
     }
 
     /// Execute NTILE partition query for verification.
-    /// Returns (row_count, combined_hash) tuples.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+    ///
+    /// Returns (partition_id, row_count, partition_hash) tuples for Tier 1.
+    /// The partition_hash enables detection of updates even when row counts match.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
         let mut conn = self.get_conn().await?;
         let result = conn.simple_query(query).await?;
         let mut partitions = Vec::new();
 
         for row in result.into_first_result().await? {
-            let row_count: i64 = row.get(0).unwrap_or(0);
-            let combined_hash: i64 = row.get(1).unwrap_or(0);
-            partitions.push((row_count, combined_hash));
+            let partition_id: i64 = row
+                .get::<i64, _>(0)
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+            let row_count: i64 = row
+                .get::<i64, _>(1)
+                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
+            // partition_hash is column 2 (optional - default to 0 if not present)
+            let partition_hash: i64 = row
+                .get::<i64, _>(2)
+                .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
+            partitions.push((partition_id, row_count, partition_hash));
         }
 
         Ok(partitions)
     }
 
     /// Execute count query with ROW_NUMBER range.
+    ///
+    /// Returns (row_count, range_hash) for update detection.
     pub async fn execute_count_query_with_rownum(
         &self,
         query: &str,
         range: &crate::verify::RowRange,
-    ) -> Result<i64> {
+    ) -> Result<(i64, i64)> {
         let mut conn = self.get_conn().await?;
-        // Build query with range substitution
+        // Build query with range substitution (MSSQL uses @P1, @P2 placeholders)
         let final_query = query
-            .replace("$1", &range.start_row.to_string())
-            .replace("$2", &range.end_row.to_string());
+            .replace("@P1", &range.start_row.to_string())
+            .replace("@P2", &range.end_row.to_string());
 
         let result = conn.simple_query(&final_query).await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
-            let count: i64 = row.get(0).unwrap_or(0);
-            return Ok(count);
+            let row_count: i64 = row
+                .get::<i64, _>(0)
+                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+            // range_hash is column 1 (optional - default to 0 if not present)
+            let range_hash: i64 = row
+                .get::<i64, _>(1)
+                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
+            return Ok((row_count, range_hash));
         }
-        Ok(0)
+        Ok((0, 0))
     }
 
     /// Fetch row hashes with ROW_NUMBER range for verification.

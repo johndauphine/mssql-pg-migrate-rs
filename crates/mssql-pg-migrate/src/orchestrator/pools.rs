@@ -124,33 +124,28 @@ impl SourcePoolImpl {
         }
     }
 
-    /// Execute NTILE partition query.
-    /// Returns (partition_id, row_count) tuples.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+    /// Execute NTILE partition query with hash.
+    ///
+    /// Returns (partition_id, row_count, partition_hash) tuples for Tier 1.
+    /// The partition_hash enables detection of updates even when row counts match.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
         match self {
             Self::Mssql(p) => p.execute_ntile_partition_query(query).await,
-            Self::Postgres(p) => {
-                // PostgreSQL returns (partition_id, row_count, partition_hash) but we only need first two
-                let results = p.execute_ntile_partition_query(query).await?;
-                Ok(results.into_iter().map(|(id, count, _hash)| (id, count)).collect())
-            }
+            Self::Postgres(p) => p.execute_ntile_partition_query(query).await,
         }
     }
 
-    /// Execute count query with rownum range.
-    /// Returns row count.
+    /// Execute count query with rownum range and hash.
+    ///
+    /// Returns (row_count, range_hash) for Tier 2 update detection.
     pub async fn execute_count_query_with_rownum(
         &self,
         query: &str,
         range: &RowRange,
-    ) -> Result<i64> {
+    ) -> Result<(i64, i64)> {
         match self {
             Self::Mssql(p) => p.execute_count_query_with_rownum(query, range).await,
-            Self::Postgres(p) => {
-                // PostgreSQL returns (row_count, range_hash) but we only need row_count
-                let (count, _hash) = p.execute_count_query_with_rownum(query, range).await?;
-                Ok(count)
-            }
+            Self::Postgres(p) => p.execute_count_query_with_rownum(query, range).await,
         }
     }
 
@@ -519,20 +514,25 @@ impl TargetPoolImpl {
         }
     }
 
-    /// Execute NTILE partition query (for verification).
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+    /// Execute NTILE partition query with hash (for verification).
+    ///
+    /// Returns (partition_id, row_count, partition_hash) tuples for Tier 1.
+    /// The partition_hash enables detection of updates even when row counts match.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
         match self {
             Self::Mssql(p) => p.execute_ntile_partition_query(query).await,
             Self::Postgres(p) => p.execute_ntile_partition_query(query).await,
         }
     }
 
-    /// Execute count query with ROW_NUMBER range (for verification).
+    /// Execute count query with ROW_NUMBER range and hash (for verification).
+    ///
+    /// Returns (row_count, range_hash) for Tier 2 update detection.
     pub async fn execute_count_query_with_rownum(
         &self,
         query: &str,
         range: &crate::verify::RowRange,
-    ) -> Result<i64> {
+    ) -> Result<(i64, i64)> {
         match self {
             Self::Mssql(p) => p.execute_count_query_with_rownum(query, range).await,
             Self::Postgres(p) => p.execute_count_query_with_rownum(query, range).await,

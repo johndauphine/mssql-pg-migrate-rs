@@ -961,13 +961,14 @@ impl MssqlPool {
         }
     }
 
-    /// Execute NTILE partition query and return partition row counts.
+    /// Execute NTILE partition query and return partition data with hash.
     ///
-    /// Returns a vector of (partition_id, row_count) tuples for Tier 1.
+    /// Returns a vector of (partition_id, row_count, partition_hash) tuples for Tier 1.
+    /// The partition_hash enables detection of updates even when row counts match.
     pub async fn execute_ntile_partition_query(
         &self,
         query: &str,
-    ) -> Result<Vec<(i64, i64)>> {
+    ) -> Result<Vec<(i64, i64, i64)>> {
         let mut client = self.get_client().await?;
 
         let result = client
@@ -979,13 +980,28 @@ impl MssqlPool {
 
         let mut partitions = Vec::new();
         for row in rows {
+            // Use try_get to handle type variations gracefully
+            // NTILE returns bigint, COUNT returns int, CHECKSUM_AGG returns int
             let partition_id: i64 = row
-                .get::<i64, _>(0)
-                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+                .try_get::<i64, _>(0)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(0).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
             let row_count: i64 = row
-                .get::<i64, _>(1)
-                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
-            partitions.push((partition_id, row_count));
+                .try_get::<i64, _>(1)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(1).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            // partition_hash is column 2 - CHECKSUM_AGG returns int (i32)
+            let partition_hash: i64 = row
+                .try_get::<i64, _>(2)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(2).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            partitions.push((partition_id, row_count, partition_hash));
         }
 
         Ok(partitions)
@@ -993,12 +1009,13 @@ impl MssqlPool {
 
     /// Execute count query using ROW_NUMBER range (Tier 2 verification).
     ///
+    /// Returns (row_count, range_hash) for update detection.
     /// Used for tables with any PK type (int, uuid, string, composite).
     pub async fn execute_count_query_with_rownum(
         &self,
         query: &str,
         range: &RowRange,
-    ) -> Result<i64> {
+    ) -> Result<(i64, i64)> {
         let mut client = self.get_client().await?;
 
         let mut q = Query::new(query);
@@ -1008,10 +1025,24 @@ impl MssqlPool {
         let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
 
         if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
-            let row_count: i32 = row.get::<i32, _>(0).unwrap_or(0);
-            Ok(row_count as i64)
+            // Use try_get to handle type variations gracefully
+            // COUNT(*) returns int (i32) in MSSQL
+            let row_count: i64 = row
+                .try_get::<i64, _>(0)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(0).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            // range_hash is column 1 - CHECKSUM_AGG returns int (i32)
+            let range_hash: i64 = row
+                .try_get::<i64, _>(1)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(1).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            Ok((row_count, range_hash))
         } else {
-            Ok(0)
+            Ok((0, 0))
         }
     }
 

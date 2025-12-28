@@ -1,12 +1,28 @@
 //! SQL query generation for batch verification.
 //!
 //! This module generates queries for efficient multi-tier verification:
-//! - Tier 1: NTILE partitioning for quick mismatch detection
+//! - Tier 1: NTILE partitioning for quick mismatch detection (count + hash)
 //! - Tier 2: ROW_NUMBER ranges for drilling down into mismatched partitions
 //! - Tier 3: Row hash queries for detailed comparison
 //!
 //! MSSQL computes hashes server-side using HASHBYTES to match Rust's format.
 //! PostgreSQL uses the existing row_hash column computed during migration.
+//!
+//! ## Partition Hash Algorithm
+//!
+//! To detect updates (not just inserts/deletes), Tier 1 and Tier 2 include
+//! an XOR aggregate of row hashes:
+//!
+//! - **MSSQL**: Takes first 8 hex chars (4 bytes) of MD5, converts to INT,
+//!   then uses `CHECKSUM_AGG` which XORs 32-bit integers
+//! - **PostgreSQL**: Takes first 8 hex chars, converts to 32-bit integer,
+//!   then uses `BIT_XOR` aggregate
+//!
+//! Both produce identical results for identical data, enabling efficient
+//! detection of unchanged partitions at Tier 1/2 without full row scans.
+//!
+//! When partition hashes differ, the partition is marked for Tier 2/3 drill-down
+//! even if row counts match (indicating updates rather than inserts/deletes).
 
 use crate::source::Table;
 use super::normalize::mssql_row_hash_expr;
@@ -58,10 +74,50 @@ pub fn postgres_pk_select(pk_columns: &[String]) -> String {
 
 /// Generate MSSQL query to partition table using NTILE for Tier 1.
 ///
-/// Returns partition_id and row_count for each partition.
+/// Returns partition_id, row_count, and partition_hash for each partition.
+/// The partition_hash is an XOR aggregate of row hashes, enabling detection
+/// of updates (not just inserts/deletes) when row counts match.
+///
 /// This is a one-time query to divide the table into N approximately equal partitions
 /// (some partitions may contain at most one more row than others when row count
 /// doesn't divide evenly).
+pub fn mssql_ntile_partition_query_with_hash(
+    schema: &str,
+    table: &Table,
+    num_partitions: i64,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = mssql_pk_order_by(pk_columns);
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+
+    // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT, then CHECKSUM_AGG
+    // CHECKSUM_AGG on INT performs direct XOR (no additional hash applied)
+    // This matches PostgreSQL's BIT_XOR on the same 32-bit value
+    format!(
+        r#"WITH partitioned AS (
+    SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id,
+           {row_hash_expr} AS row_hash
+    FROM [{schema}].[{table_name}] WITH (NOLOCK)
+)
+SELECT
+    partition_id,
+    CAST(COUNT(*) AS BIGINT) AS row_count,
+    CAST(ISNULL(CHECKSUM_AGG(CONVERT(INT, CONVERT(VARBINARY(4), LEFT(row_hash, 8), 2))), 0) AS BIGINT) AS partition_hash
+FROM partitioned
+GROUP BY partition_id
+ORDER BY partition_id"#,
+        num_partitions = num_partitions,
+        pk_order_by = pk_order_by,
+        row_hash_expr = row_hash_expr,
+        schema = schema.replace(']', "]]"),
+        table_name = table.name.replace(']', "]]"),
+    )
+}
+
+/// Generate MSSQL query for count-only partition verification.
+///
+/// Returns partition_id, row_count, and dummy partition_hash (always 0).
+/// Use `mssql_ntile_partition_query_with_hash` for update detection.
 pub fn mssql_ntile_partition_query(
     schema: &str,
     table_name: &str,
@@ -76,7 +132,8 @@ pub fn mssql_ntile_partition_query(
 )
 SELECT
     partition_id,
-    CAST(COUNT(*) AS BIGINT) AS row_count
+    CAST(COUNT(*) AS BIGINT) AS row_count,
+    CAST(0 AS BIGINT) AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -89,8 +146,89 @@ ORDER BY partition_id"#,
 
 /// Generate PostgreSQL query to partition table using NTILE for Tier 1.
 ///
+/// Returns partition_id, row_count, and partition_hash for each partition.
+/// Uses BIT_XOR aggregate on the stored row_hash column for update detection.
+///
+/// The row_hash column should contain MD5 hashes computed during migration
+/// using the same algorithm as MSSQL, ensuring hash compatibility.
+pub fn postgres_ntile_partition_query_with_hash(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+    num_partitions: i64,
+    row_hash_column: &str,
+) -> String {
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let row_hash_col = row_hash_column.replace('"', "\"\"");
+
+    // BIT_XOR aggregate: convert first 8 hex chars (4 bytes) to 32-bit integer
+    // This matches MSSQL's CHECKSUM_AGG on the same 32-bit value
+    // COALESCE handles NULL row_hash (returns 0, triggering mismatch)
+    format!(
+        r#"WITH partitioned AS (
+    SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id,
+           "{row_hash_col}" AS row_hash
+    FROM "{schema}"."{table_name}"
+)
+SELECT
+    partition_id,
+    COUNT(*)::BIGINT AS row_count,
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS partition_hash
+FROM partitioned
+GROUP BY partition_id
+ORDER BY partition_id"#,
+        num_partitions = num_partitions,
+        pk_order_by = pk_order_by,
+        row_hash_col = row_hash_col,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
+/// Generate PostgreSQL query to partition table using NTILE for Tier 1.
+///
+/// Returns partition_id, row_count, and partition_hash for each partition.
+/// Computes row hashes on-the-fly for PostgreSQL as SOURCE (no stored row_hash).
+pub fn postgres_ntile_partition_query_computed(
+    schema: &str,
+    table: &Table,
+    num_partitions: i64,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+
+    // BIT_XOR aggregate on computed MD5 hashes (first 8 hex chars = 32-bit)
+    format!(
+        r#"WITH partitioned AS (
+    SELECT NTILE({num_partitions}) OVER (ORDER BY {pk_order_by}) AS partition_id,
+           {row_hash_expr} AS row_hash
+    FROM "{schema}"."{table_name}"
+)
+SELECT
+    partition_id,
+    COUNT(*)::BIGINT AS row_count,
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS partition_hash
+FROM partitioned
+GROUP BY partition_id
+ORDER BY partition_id"#,
+        num_partitions = num_partitions,
+        pk_order_by = pk_order_by,
+        row_hash_expr = row_hash_expr,
+        schema = schema.replace('"', "\"\""),
+        table_name = table.name.replace('"', "\"\""),
+    )
+}
+
+/// Generate PostgreSQL query to partition table using NTILE for Tier 1 (count only).
+///
 /// Returns partition_id and row_count for each partition. NTILE divides into
 /// approximately equal partitions (some may have one more row than others).
+/// Use `postgres_ntile_partition_query_with_hash` for update detection.
+/// Generate PostgreSQL query for count-only partition verification.
+///
+/// Returns partition_id, row_count, and dummy partition_hash (always 0).
+/// Used in fast_verify mode where hash comparison is skipped.
 pub fn postgres_ntile_partition_query(
     schema: &str,
     table_name: &str,
@@ -105,7 +243,8 @@ pub fn postgres_ntile_partition_query(
 )
 SELECT
     partition_id,
-    COUNT(*)::BIGINT AS row_count
+    COUNT(*)::BIGINT AS row_count,
+    0::BIGINT AS partition_hash
 FROM partitioned
 GROUP BY partition_id
 ORDER BY partition_id"#,
@@ -120,9 +259,41 @@ ORDER BY partition_id"#,
 // Tier 2: ROW_NUMBER range count queries
 // ============================================================================
 
-/// Generate MSSQL query to count rows using ROW_NUMBER range.
+/// Generate MSSQL query to count rows and compute range hash using ROW_NUMBER range.
+///
+/// Returns row_count and range_hash for Tier 2 verification with update detection.
+pub fn mssql_row_count_with_rownum_query_with_hash(
+    schema: &str,
+    table: &Table,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = mssql_pk_order_by(pk_columns);
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns);
+
+    // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT
+    // Matches PostgreSQL's BIT_XOR on the same 32-bit value
+    format!(
+        r#"WITH numbered AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
+           {row_hash_expr} AS row_hash
+    FROM [{schema}].[{table_name}] WITH (NOLOCK)
+)
+SELECT
+    COUNT(*) AS row_count,
+    CAST(ISNULL(CHECKSUM_AGG(CONVERT(INT, CONVERT(VARBINARY(4), LEFT(row_hash, 8), 2))), 0) AS BIGINT) AS range_hash
+FROM numbered
+WHERE row_num >= @P1 AND row_num < @P2"#,
+        pk_order_by = pk_order_by,
+        row_hash_expr = row_hash_expr,
+        schema = schema.replace(']', "]]"),
+        table_name = table.name.replace(']', "]]"),
+    )
+}
+
+/// Generate MSSQL query to count rows using ROW_NUMBER range (count only).
 ///
 /// Used for Tier 2 verification with any PK type.
+/// Use `mssql_row_count_with_rownum_query_with_hash` for update detection.
 pub fn mssql_row_count_with_rownum_query(
     schema: &str,
     table_name: &str,
@@ -143,7 +314,73 @@ WHERE row_num >= @P1 AND row_num < @P2"#,
     )
 }
 
-/// Generate PostgreSQL query to count rows using ROW_NUMBER range.
+/// Generate PostgreSQL query to count rows and compute range hash using ROW_NUMBER range.
+///
+/// Returns row_count and range_hash for Tier 2 verification with update detection.
+/// Uses stored row_hash column (for PostgreSQL as target).
+pub fn postgres_row_count_with_rownum_query_with_hash(
+    schema: &str,
+    table_name: &str,
+    pk_columns: &[String],
+    row_hash_column: &str,
+) -> String {
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let row_hash_col = row_hash_column.replace('"', "\"\"");
+
+    // BIT_XOR aggregate: convert first 8 hex chars to 32-bit integer
+    // Matches MSSQL's CHECKSUM_AGG on the same 32-bit value
+    format!(
+        r#"WITH numbered AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
+           "{row_hash_col}" AS row_hash
+    FROM "{schema}"."{table_name}"
+)
+SELECT
+    COUNT(*) AS row_count,
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS range_hash
+FROM numbered
+WHERE row_num >= $1 AND row_num < $2"#,
+        pk_order_by = pk_order_by,
+        row_hash_col = row_hash_col,
+        schema = schema.replace('"', "\"\""),
+        table_name = table_name.replace('"', "\"\""),
+    )
+}
+
+/// Generate PostgreSQL query to count rows and compute range hash using ROW_NUMBER range.
+///
+/// Returns row_count and range_hash for Tier 2 verification with update detection.
+/// Computes row hashes on-the-fly (for PostgreSQL as source).
+pub fn postgres_row_count_with_rownum_query_computed(
+    schema: &str,
+    table: &Table,
+) -> String {
+    let pk_columns = &table.primary_key;
+    let pk_order_by = postgres_pk_order_by(pk_columns);
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns);
+
+    // BIT_XOR aggregate on computed hashes (first 8 hex chars = 32-bit)
+    format!(
+        r#"WITH numbered AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY {pk_order_by}) AS row_num,
+           {row_hash_expr} AS row_hash
+    FROM "{schema}"."{table_name}"
+)
+SELECT
+    COUNT(*) AS row_count,
+    COALESCE(BIT_XOR(('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer), 0)::BIGINT AS range_hash
+FROM numbered
+WHERE row_num >= $1 AND row_num < $2"#,
+        pk_order_by = pk_order_by,
+        row_hash_expr = row_hash_expr,
+        schema = schema.replace('"', "\"\""),
+        table_name = table.name.replace('"', "\"\""),
+    )
+}
+
+/// Generate PostgreSQL query to count rows using ROW_NUMBER range (count only).
+///
+/// Use `postgres_row_count_with_rownum_query_with_hash` for update detection.
 pub fn postgres_row_count_with_rownum_query(
     schema: &str,
     table_name: &str,
@@ -437,5 +674,90 @@ mod tests {
 
         let pg_order = postgres_pk_order_by(&pk_columns);
         assert_eq!(pg_order, "\"tenant_id\", \"order_id\"");
+    }
+
+    // =========================================================================
+    // Tests for hash-enabled queries (update detection)
+    // =========================================================================
+
+    #[test]
+    fn test_mssql_ntile_partition_query_with_hash() {
+        let table = make_test_table();
+        let query = mssql_ntile_partition_query_with_hash("dbo", &table, 10);
+
+        assert!(query.contains("NTILE(10)"));
+        assert!(query.contains("partition_id"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("partition_hash"));
+        assert!(query.contains("CHECKSUM_AGG"));
+        assert!(query.contains("HASHBYTES"));
+    }
+
+    #[test]
+    fn test_postgres_ntile_partition_query_with_hash() {
+        let pk_columns = vec!["id".to_string()];
+        let query = postgres_ntile_partition_query_with_hash(
+            "public", "users", &pk_columns, 10, "row_hash"
+        );
+
+        assert!(query.contains("NTILE(10)"));
+        assert!(query.contains("partition_id"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("partition_hash"));
+        assert!(query.contains("BIT_XOR"));
+        assert!(query.contains("row_hash"));
+    }
+
+    #[test]
+    fn test_postgres_ntile_partition_query_computed() {
+        let table = make_test_table();
+        let query = postgres_ntile_partition_query_computed("public", &table, 10);
+
+        assert!(query.contains("NTILE(10)"));
+        assert!(query.contains("partition_id"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("partition_hash"));
+        assert!(query.contains("BIT_XOR"));
+        assert!(query.contains("md5")); // computed hash
+    }
+
+    #[test]
+    fn test_mssql_row_count_with_rownum_query_with_hash() {
+        let table = make_test_table();
+        let query = mssql_row_count_with_rownum_query_with_hash("dbo", &table);
+
+        assert!(query.contains("ROW_NUMBER()"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("range_hash"));
+        assert!(query.contains("CHECKSUM_AGG"));
+        assert!(query.contains("@P1"));
+        assert!(query.contains("@P2"));
+    }
+
+    #[test]
+    fn test_postgres_row_count_with_rownum_query_with_hash() {
+        let pk_columns = vec!["id".to_string()];
+        let query = postgres_row_count_with_rownum_query_with_hash(
+            "public", "users", &pk_columns, "row_hash"
+        );
+
+        assert!(query.contains("ROW_NUMBER()"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("range_hash"));
+        assert!(query.contains("BIT_XOR"));
+        assert!(query.contains("$1"));
+        assert!(query.contains("$2"));
+    }
+
+    #[test]
+    fn test_postgres_row_count_with_rownum_query_computed() {
+        let table = make_test_table();
+        let query = postgres_row_count_with_rownum_query_computed("public", &table);
+
+        assert!(query.contains("ROW_NUMBER()"));
+        assert!(query.contains("row_count"));
+        assert!(query.contains("range_hash"));
+        assert!(query.contains("BIT_XOR"));
+        assert!(query.contains("md5")); // computed hash
     }
 }

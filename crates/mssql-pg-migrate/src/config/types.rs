@@ -728,9 +728,10 @@ impl MigrationConfig {
     }
 
     /// Check if hash-based change detection is enabled.
-    /// Defaults to true for upsert mode, false otherwise.
+    /// Defaults to true for all modes so row_hash column is always populated.
+    /// This allows switching to upsert mode later without re-migrating.
     pub fn use_hash_detection(&self) -> bool {
-        self.use_hash_detection.unwrap_or(matches!(self.target_mode, TargetMode::Upsert))
+        self.use_hash_detection.unwrap_or(true)
     }
 
     /// Get the row hash column name.
