@@ -61,8 +61,9 @@ pub fn pg_normalize_expr(col: &Column) -> String {
             )
         }
         "timetz" | "time with time zone" => {
+            // Use 'US' for microseconds and 'OF' for timezone offset with space separator
             format!(
-                "COALESCE(TO_CHAR({}, 'HH24:MI:SS.USOF'), '')",
+                "COALESCE(TO_CHAR({}, 'HH24:MI:SS.US OF'), '')",
                 col_name
             )
         }
@@ -73,8 +74,9 @@ pub fn pg_normalize_expr(col: &Column) -> String {
             )
         }
         "timestamptz" | "timestamp with time zone" => {
+            // Convert to UTC first, then format (no timezone offset needed after conversion)
             format!(
-                "COALESCE(TO_CHAR({} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.USOF'), '')",
+                "COALESCE(TO_CHAR({} AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US'), '')",
                 col_name
             )
         }
@@ -210,7 +212,7 @@ mod tests {
         assert!(expr.contains("\"name\""));
         assert!(expr.contains("\"created_at\""));
         // id is a PK so shouldn't be in the hash of non-PK columns
-        assert!(!expr.contains("\"id\"") || expr.contains("||"));
+        assert!(!expr.contains("\"id\""));
     }
 
     #[test]

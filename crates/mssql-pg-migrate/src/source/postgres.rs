@@ -38,7 +38,9 @@ impl PgSourcePool {
             recycling_method: RecyclingMethod::Fast,
         };
 
-        // SourceConfig doesn't have ssl_mode, default to "require"
+        // TODO: Add ssl_mode to SourceConfig for consistency with TargetConfig.
+        // Currently defaults to "require" which enables TLS but doesn't verify certificates.
+        // Users who need stricter security should use "verify-full" when this is configurable.
         let ssl_mode = "require";
         let pool = match ssl_mode.to_lowercase().as_str() {
             "disable" => {
@@ -786,11 +788,17 @@ fn estimate_pg_column_size(col: &Column) -> i64 {
 }
 
 /// Extract a PkValue from a PostgreSQL row.
+///
+/// Returns a diagnostic string for unsupported types instead of panicking,
+/// allowing the migration to continue and log a meaningful error.
 fn extract_pk_value(row: &tokio_postgres::Row, idx: usize) -> PkValue {
     if let Ok(v) = row.try_get::<_, i64>(idx) {
         return PkValue::Int(v);
     }
     if let Ok(v) = row.try_get::<_, i32>(idx) {
+        return PkValue::Int(v as i64);
+    }
+    if let Ok(v) = row.try_get::<_, i16>(idx) {
         return PkValue::Int(v as i64);
     }
     if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
@@ -799,10 +807,23 @@ fn extract_pk_value(row: &tokio_postgres::Row, idx: usize) -> PkValue {
     if let Ok(v) = row.try_get::<_, String>(idx) {
         return PkValue::String(v);
     }
-    panic!(
-        "Failed to extract primary key value from PostgreSQL row at index {} - unsupported type",
-        idx
+
+    // Fallback: return a diagnostic string instead of panicking
+    // This allows the migration to continue and log a meaningful error
+    let col_type_name = row
+        .columns()
+        .get(idx)
+        .map(|c| c.type_().name().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    warn!(
+        "Unsupported primary key type at index {} (postgres type: {})",
+        idx, col_type_name
     );
+
+    PkValue::String(format!(
+        "UNSUPPORTED_PK_TYPE_{}_{}", idx, col_type_name
+    ))
 }
 
 /// Convert a PostgreSQL row value to SqlValue based on column type.
@@ -886,6 +907,17 @@ fn convert_pg_row_value(row: &tokio_postgres::Row, idx: usize, data_type: &str) 
 }
 
 /// Certificate verifier that accepts any certificate.
+///
+/// # Security Warning
+///
+/// This verifier bypasses all certificate validation, making the connection
+/// vulnerable to man-in-the-middle attacks. It should ONLY be used in:
+/// - Development/testing environments with self-signed certificates
+/// - Trusted internal networks where MITM attacks are not a concern
+/// - When the `ssl_mode=require` option is explicitly chosen by the user
+///
+/// For production environments with untrusted networks, use `ssl_mode=verify-full`
+/// which validates the server certificate against trusted CAs.
 #[derive(Debug)]
 struct NoVerifier;
 

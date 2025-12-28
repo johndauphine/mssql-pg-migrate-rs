@@ -232,7 +232,14 @@ ORDER BY row_num"#,
 
 /// Generate PostgreSQL query to fetch (pk_cols..., row_hash) using ROW_NUMBER range.
 ///
-/// Computes row hashes server-side using MD5 (for when PostgreSQL is the source).
+/// This variant *computes* the row hash server-side using MD5 via [`pg_row_hash_expr`],
+/// and is intended for scenarios where PostgreSQL is the **source** and there is no
+/// precomputed `row_hash` column on the table.
+///
+/// In contrast, [`postgres_row_hashes_with_rownum_query`] reads an existing `row_hash`
+/// column (typically on the migrated/target PostgreSQL table) instead of recomputing it.
+/// Both functions return the same logical shape: `(pk_cols..., row_hash)` ordered by PK.
+///
 /// Works with any PK type including composite keys.
 pub fn postgres_row_hashes_with_rownum_query_computed(
     schema: &str,

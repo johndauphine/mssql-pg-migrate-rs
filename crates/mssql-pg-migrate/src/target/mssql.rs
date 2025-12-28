@@ -379,7 +379,7 @@ impl MssqlTargetPool {
                 let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
 
                 format!(
-                    "{} {}{}  {}",
+                    "{} {}{} {}",
                     Self::quote_ident(&c.name),
                     target_type,
                     identity_clause,
@@ -412,18 +412,13 @@ impl MssqlTargetPool {
     ) -> Result<bool> {
         let mut conn = self.get_conn().await?;
 
-        // Check if column exists
-        let check_query = format!(
-            r#"SELECT COUNT(*) FROM sys.columns c
+        // Check if column exists using parameterized query
+        let check_query = r#"SELECT COUNT(*) FROM sys.columns c
                JOIN sys.tables t ON c.object_id = t.object_id
                JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND c.name = '{}'"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''"),
-            row_hash_column.replace('\'', "''")
-        );
+               WHERE s.name = @P1 AND t.name = @P2 AND c.name = @P3"#;
 
-        let result = conn.simple_query(&check_query).await?;
+        let result = conn.query(check_query, &[&schema, &table, &row_hash_column]).await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             if count > 0 {
@@ -577,7 +572,7 @@ impl TargetPool for MssqlTargetPool {
                 let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
 
                 format!(
-                    "{} {}{}  {}",
+                    "{} {}{} {}",
                     Self::quote_ident(&c.name),
                     target_type,
                     identity_clause,
@@ -631,13 +626,9 @@ impl TargetPool for MssqlTargetPool {
 
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let mut conn = self.get_conn().await?;
-        let query = format!(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'",
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
+        let query = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2";
 
-        let result = conn.simple_query(&query).await?;
+        let result = conn.query(query, &[&schema, &table]).await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             return Ok(count > 0);
@@ -692,19 +683,15 @@ impl TargetPool for MssqlTargetPool {
     async fn drop_non_pk_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
         let mut conn = self.get_conn().await?;
 
-        // Get list of non-PK indexes
-        let query = format!(
-            r#"SELECT i.name
+        // Get list of non-PK indexes using parameterized query
+        let query = r#"SELECT i.name
                FROM sys.indexes i
                JOIN sys.tables t ON i.object_id = t.object_id
                JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}'
-                 AND i.is_primary_key = 0 AND i.type > 0"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
+               WHERE s.name = @P1 AND t.name = @P2
+                 AND i.is_primary_key = 0 AND i.type > 0"#;
 
-        let result = conn.simple_query(&query).await?;
+        let result = conn.query(query, &[&schema, &table]).await?;
         let rows = result.into_first_result().await?;
         let mut dropped_indexes = Vec::new();
 
@@ -776,15 +763,14 @@ impl TargetPool for MssqlTargetPool {
 
     async fn has_primary_key(&self, schema: &str, table: &str) -> Result<bool> {
         let mut conn = self.get_conn().await?;
-        let query = format!(
-            r#"SELECT COUNT(*)
-               FROM sys.indexes
-               WHERE object_id = OBJECT_ID(N'{}.{}') AND is_primary_key = 1"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
+        // Use parameterized query with sys catalog tables instead of OBJECT_ID
+        let query = r#"SELECT COUNT(*)
+               FROM sys.indexes i
+               JOIN sys.tables t ON i.object_id = t.object_id
+               JOIN sys.schemas s ON t.schema_id = s.schema_id
+               WHERE s.name = @P1 AND t.name = @P2 AND i.is_primary_key = 1"#;
 
-        let result = conn.simple_query(&query).await?;
+        let result = conn.query(query, &[&schema, &table]).await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             return Ok(count > 0);
@@ -837,18 +823,14 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let total_rows = rows.len() as u64;
 
-        // Check for identity column using the SAME connection
-        let identity_query = format!(
-            r#"SELECT COUNT(*)
+        // Check for identity column using parameterized query on the SAME connection
+        let identity_query = r#"SELECT COUNT(*)
                FROM sys.columns c
                JOIN sys.tables t ON c.object_id = t.object_id
                JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
-        debug!("Identity check query for {}.{}: {}", schema, table, identity_query);
-        let result = conn.simple_query(&identity_query).await?;
+               WHERE s.name = @P1 AND t.name = @P2 AND c.is_identity = 1"#;
+        debug!("Identity check query for {}.{}", schema, table);
+        let result = conn.query(identity_query, &[&schema, &table]).await?;
         let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             debug!("Identity check result for {}.{}: count={}, has_identity={}", schema, table, count, count > 0);
@@ -917,17 +899,13 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let total_rows = rows.len() as u64;
 
-        // Check for identity column using the SAME connection
-        let identity_query = format!(
-            r#"SELECT COUNT(*)
+        // Check for identity column using parameterized query on the SAME connection
+        let identity_query = r#"SELECT COUNT(*)
                FROM sys.columns c
                JOIN sys.tables t ON c.object_id = t.object_id
                JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
-        let result = conn.simple_query(&identity_query).await?;
+               WHERE s.name = @P1 AND t.name = @P2 AND c.is_identity = 1"#;
+        let result = conn.query(identity_query, &[&schema, &table]).await?;
         let has_identity = if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             count > 0

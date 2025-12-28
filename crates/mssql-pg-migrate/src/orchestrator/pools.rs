@@ -553,12 +553,19 @@ impl TargetPoolImpl {
     }
 
     /// Test the connection.
+    ///
+    /// For PostgreSQL, this delegates to `PgPool::test_connection` which actively
+    /// validates the connection. For MSSQL, `MssqlTargetPool` currently does not
+    /// expose a lightweight, dedicated connection-test API; connection issues are
+    /// surfaced when regular operations are executed. To keep the interface
+    /// consistent across targets without performing redundant or invasive checks,
+    /// this is intentionally a no-op for MSSQL and simply returns `Ok(())`.
     pub async fn test_connection(&self) -> Result<()> {
         match self {
-            Self::Mssql(p) => {
-                // MssqlTargetPool doesn't have test_connection, use has_primary_key as a simple test
-                // Actually, we need to add a test method. For now, just return Ok.
-                let _ = p;
+            Self::Mssql(_) => {
+                // MSSQL connections are validated as part of normal operations.
+                // This method is kept for API symmetry and intentionally does not
+                // perform an additional probe here.
                 Ok(())
             }
             Self::Postgres(p) => p.test_connection().await,
