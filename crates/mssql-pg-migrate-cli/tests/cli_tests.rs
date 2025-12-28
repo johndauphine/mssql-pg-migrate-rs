@@ -56,7 +56,7 @@ fn test_version_flag() {
         .arg("--version")
         .assert()
         .success()
-        // Verify both program name and semver version format (e.g., "mssql-pg-migrate 0.7.1")
+        // Verify both program name and semver version format (e.g., "mssql-pg-migrate 0.8.0")
         .stdout(predicate::str::is_match(r"mssql-pg-migrate \d+\.\d+\.\d+").unwrap());
 }
 
