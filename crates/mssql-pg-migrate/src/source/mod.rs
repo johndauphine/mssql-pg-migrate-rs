@@ -980,16 +980,27 @@ impl MssqlPool {
 
         let mut partitions = Vec::new();
         for row in rows {
+            // Use try_get to handle type variations gracefully
+            // NTILE returns bigint, COUNT returns int, CHECKSUM_AGG returns int
             let partition_id: i64 = row
-                .get::<i64, _>(0)
-                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
+                .try_get::<i64, _>(0)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(0).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
             let row_count: i64 = row
-                .get::<i64, _>(1)
-                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
-            // partition_hash is column 2 (optional - default to 0 if not present)
+                .try_get::<i64, _>(1)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(1).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            // partition_hash is column 2 - CHECKSUM_AGG returns int (i32)
             let partition_hash: i64 = row
-                .get::<i64, _>(2)
-                .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
+                .try_get::<i64, _>(2)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(2).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
             partitions.push((partition_id, row_count, partition_hash));
         }
 
@@ -1014,13 +1025,21 @@ impl MssqlPool {
         let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
 
         if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
+            // Use try_get to handle type variations gracefully
+            // COUNT(*) returns int (i32) in MSSQL
             let row_count: i64 = row
-                .get::<i64, _>(0)
-                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
-            // range_hash is column 1 (optional - default to 0 if not present)
+                .try_get::<i64, _>(0)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(0).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
+            // range_hash is column 1 - CHECKSUM_AGG returns int (i32)
             let range_hash: i64 = row
-                .get::<i64, _>(1)
-                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
+                .try_get::<i64, _>(1)
+                .ok()
+                .flatten()
+                .or_else(|| row.try_get::<i32, _>(1).ok().flatten().map(|v| v as i64))
+                .unwrap_or(0);
             Ok((row_count, range_hash))
         } else {
             Ok((0, 0))
