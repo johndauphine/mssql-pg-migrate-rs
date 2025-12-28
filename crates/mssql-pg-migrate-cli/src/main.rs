@@ -328,6 +328,7 @@ async fn run() -> Result<(), MigrateError> {
                 target,
                 verify_config,
                 config.migration.row_hash_column.clone(),
+                config.migration.hash_text_columns,
             );
 
             for table in &tables {

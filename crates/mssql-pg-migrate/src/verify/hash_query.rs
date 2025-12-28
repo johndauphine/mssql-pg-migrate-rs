@@ -85,11 +85,12 @@ pub fn mssql_ntile_partition_query_with_hash(
     schema: &str,
     table: &Table,
     num_partitions: i64,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT, then CHECKSUM_AGG
     // CHECKSUM_AGG on INT performs direct XOR (no additional hash applied)
@@ -194,11 +195,12 @@ pub fn postgres_ntile_partition_query_computed(
     schema: &str,
     table: &Table,
     num_partitions: i64,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     // BIT_XOR aggregate on computed MD5 hashes (first 8 hex chars = 32-bit)
     format!(
@@ -267,11 +269,12 @@ ORDER BY partition_id"#,
 pub fn mssql_row_count_with_rownum_query_with_hash(
     schema: &str,
     table: &Table,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     // XOR aggregate: take first 8 hex chars (4 bytes), convert to INT
     // Matches PostgreSQL's BIT_XOR on the same 32-bit value
@@ -357,11 +360,12 @@ WHERE row_num >= $1 AND row_num < $2"#,
 pub fn postgres_row_count_with_rownum_query_computed(
     schema: &str,
     table: &Table,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     // BIT_XOR aggregate on computed hashes (first 8 hex chars = 32-bit)
     format!(
@@ -416,12 +420,13 @@ WHERE row_num >= $1 AND row_num < $2"#,
 pub fn mssql_row_hashes_with_rownum_query(
     schema: &str,
     table: &Table,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = mssql_pk_order_by(pk_columns);
     let pk_select = mssql_pk_select(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = mssql_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     format!(
         r#"WITH numbered AS (
@@ -486,12 +491,13 @@ ORDER BY row_num"#,
 pub fn postgres_row_hashes_with_rownum_query_computed(
     schema: &str,
     table: &Table,
+    hash_text_columns: bool,
 ) -> String {
     let pk_columns = &table.primary_key;
     let pk_order_by = postgres_pk_order_by(pk_columns);
     let pk_select = postgres_pk_select(pk_columns);
-    // Verification always includes all columns to match stored row_hash
-    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, true);
+    // Use same hash_text_columns setting as transfer to match stored row_hash
+    let row_hash_expr = pg_row_hash_expr(&table.columns, pk_columns, hash_text_columns);
 
     format!(
         r#"WITH numbered AS (
@@ -627,7 +633,7 @@ mod tests {
     #[test]
     fn test_mssql_row_hashes_with_rownum_query() {
         let table = make_test_table();
-        let query = mssql_row_hashes_with_rownum_query("dbo", &table);
+        let query = mssql_row_hashes_with_rownum_query("dbo", &table, true);
 
         assert!(query.contains("HASHBYTES"));
         assert!(query.contains("MD5"));
@@ -650,7 +656,7 @@ mod tests {
     #[test]
     fn test_postgres_row_hashes_with_rownum_query_computed() {
         let table = make_test_table();
-        let query = postgres_row_hashes_with_rownum_query_computed("public", &table);
+        let query = postgres_row_hashes_with_rownum_query_computed("public", &table, true);
 
         assert!(query.contains("md5"));
         assert!(query.contains("\"name\""));
@@ -689,7 +695,7 @@ mod tests {
     #[test]
     fn test_mssql_ntile_partition_query_with_hash() {
         let table = make_test_table();
-        let query = mssql_ntile_partition_query_with_hash("dbo", &table, 10);
+        let query = mssql_ntile_partition_query_with_hash("dbo", &table, 10, true);
 
         assert!(query.contains("NTILE(10)"));
         assert!(query.contains("partition_id"));
@@ -717,7 +723,7 @@ mod tests {
     #[test]
     fn test_postgres_ntile_partition_query_computed() {
         let table = make_test_table();
-        let query = postgres_ntile_partition_query_computed("public", &table, 10);
+        let query = postgres_ntile_partition_query_computed("public", &table, 10, true);
 
         assert!(query.contains("NTILE(10)"));
         assert!(query.contains("partition_id"));
@@ -730,7 +736,7 @@ mod tests {
     #[test]
     fn test_mssql_row_count_with_rownum_query_with_hash() {
         let table = make_test_table();
-        let query = mssql_row_count_with_rownum_query_with_hash("dbo", &table);
+        let query = mssql_row_count_with_rownum_query_with_hash("dbo", &table, true);
 
         assert!(query.contains("ROW_NUMBER()"));
         assert!(query.contains("row_count"));
@@ -758,7 +764,7 @@ mod tests {
     #[test]
     fn test_postgres_row_count_with_rownum_query_computed() {
         let table = make_test_table();
-        let query = postgres_row_count_with_rownum_query_computed("public", &table);
+        let query = postgres_row_count_with_rownum_query_computed("public", &table, true);
 
         assert!(query.contains("ROW_NUMBER()"));
         assert!(query.contains("row_count"));
