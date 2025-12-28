@@ -21,9 +21,9 @@ use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
 use crate::verify::hash_query::{
-    mssql_ntile_partition_query, mssql_row_count_with_rownum_query,
+    mssql_ntile_partition_query_with_hash, mssql_row_count_with_rownum_query_with_hash,
     mssql_row_hashes_with_rownum_query, mssql_total_row_count_query,
-    postgres_ntile_partition_query, postgres_row_count_with_rownum_query,
+    postgres_ntile_partition_query_with_hash, postgres_row_count_with_rownum_query_with_hash,
     postgres_row_hashes_with_rownum_query, postgres_total_row_count_query,
 };
 use crate::verify::{
@@ -219,11 +219,16 @@ impl UniversalVerifyEngine {
             / self.config.tier1_batch_size)
             .max(1);
 
-        // Tier 1: Get NTILE partition counts from both databases
+        // Tier 1: Get NTILE partition counts and hashes from both databases
         let source_ntile_sql =
-            mssql_ntile_partition_query(source_schema, &table.name, pk_columns, num_partitions);
-        let target_ntile_sql =
-            postgres_ntile_partition_query(target_schema, &table.name, pk_columns, num_partitions);
+            mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions);
+        let target_ntile_sql = postgres_ntile_partition_query_with_hash(
+            target_schema,
+            &table.name,
+            pk_columns,
+            num_partitions,
+            &self.row_hash_column,
+        );
 
         let (source_partitions, target_partitions) = tokio::join!(
             self.source.execute_ntile_partition_query(&source_ntile_sql),
@@ -347,8 +352,8 @@ impl UniversalVerifyEngine {
     /// rows that exist in one database but not the other.
     fn partitions_to_row_ranges(
         &self,
-        source_partitions: &[(i64, i64)],
-        target_partitions: &[(i64, i64)],
+        source_partitions: &[(i64, i64, i64)],
+        target_partitions: &[(i64, i64, i64)],
     ) -> Vec<RowRange> {
         // Use the max of source/target partitions to ensure we check all rows
         let max_partitions = source_partitions.len().max(target_partitions.len());
@@ -359,8 +364,8 @@ impl UniversalVerifyEngine {
         for i in 0..max_partitions {
             // Use max to ensure we cover all rows from both databases.
             // ROW_NUMBER queries handle the case where one database has fewer rows.
-            let source_count = source_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
-            let target_count = target_partitions.get(i).map(|(_, c)| *c).unwrap_or(0);
+            let source_count = source_partitions.get(i).map(|(_, c, _)| *c).unwrap_or(0);
+            let target_count = target_partitions.get(i).map(|(_, c, _)| *c).unwrap_or(0);
             let partition_rows = source_count.max(target_count);
 
             if partition_rows > 0 {
@@ -376,30 +381,48 @@ impl UniversalVerifyEngine {
         ranges
     }
 
-    /// Compare partition counts and return mismatched ranges.
+    /// Compare partition counts and hashes, returning mismatched ranges.
+    ///
+    /// This compares BOTH the row count AND the partition hash (XOR of row hashes).
+    /// A mismatch on either indicates the partition needs further verification:
+    /// - Count mismatch: rows were inserted or deleted
+    /// - Hash mismatch: rows were updated (content changed but count same)
     async fn compare_partition_counts(
         &self,
-        source_partitions: &[(i64, i64)],
-        target_partitions: &[(i64, i64)],
+        source_partitions: &[(i64, i64, i64)],
+        target_partitions: &[(i64, i64, i64)],
         ranges: &[RowRange],
     ) -> Vec<RowRange> {
         let mut mismatches = Vec::new();
 
-        // Create maps for easy lookup
-        let source_map: std::collections::HashMap<i64, i64> =
-            source_partitions.iter().cloned().collect();
-        let target_map: std::collections::HashMap<i64, i64> =
-            target_partitions.iter().cloned().collect();
+        // Create maps for easy lookup: partition_id -> (count, hash)
+        let source_map: std::collections::HashMap<i64, (i64, i64)> = source_partitions
+            .iter()
+            .map(|(id, count, hash)| (*id, (*count, *hash)))
+            .collect();
+        let target_map: std::collections::HashMap<i64, (i64, i64)> = target_partitions
+            .iter()
+            .map(|(id, count, hash)| (*id, (*count, *hash)))
+            .collect();
 
         for range in ranges {
             if let Some(partition_id) = range.partition_id {
-                let source_count = source_map.get(&partition_id).copied().unwrap_or(0);
-                let target_count = target_map.get(&partition_id).copied().unwrap_or(0);
+                let (source_count, source_hash) =
+                    source_map.get(&partition_id).copied().unwrap_or((0, 0));
+                let (target_count, target_hash) =
+                    target_map.get(&partition_id).copied().unwrap_or((0, 0));
 
+                // Check BOTH count AND hash - this is the key fix for update detection
                 if source_count != target_count {
                     debug!(
                         "Partition {}: count mismatch (src: {}, tgt: {})",
                         partition_id, source_count, target_count
+                    );
+                    mismatches.push(range.clone());
+                } else if source_hash != target_hash {
+                    debug!(
+                        "Partition {}: hash mismatch (src: {:016x}, tgt: {:016x}) - updates detected",
+                        partition_id, source_hash, target_hash
                     );
                     mismatches.push(range.clone());
                 }
@@ -409,7 +432,10 @@ impl UniversalVerifyEngine {
         mismatches
     }
 
-    /// Verify a tier using ROW_NUMBER-based count queries.
+    /// Verify a tier using ROW_NUMBER-based count and hash queries.
+    ///
+    /// Compares both row count and range hash for each range, detecting both
+    /// insert/delete (count mismatch) and update (hash mismatch) scenarios.
     async fn verify_tier_with_rownum(
         &self,
         table: &Table,
@@ -422,14 +448,17 @@ impl UniversalVerifyEngine {
 
         let pk_columns = &table.primary_key;
 
-        // Build count queries
-        let source_count_sql =
-            mssql_row_count_with_rownum_query(source_schema, &table.name, pk_columns);
-        let target_count_sql =
-            postgres_row_count_with_rownum_query(target_schema, &table.name, pk_columns);
+        // Build count+hash queries
+        let source_count_sql = mssql_row_count_with_rownum_query_with_hash(source_schema, table);
+        let target_count_sql = postgres_row_count_with_rownum_query_with_hash(
+            target_schema,
+            &table.name,
+            pk_columns,
+            &self.row_hash_column,
+        );
 
         for (i, range) in ranges.iter().enumerate() {
-            // Execute count queries in parallel
+            // Execute count+hash queries in parallel
             let (source_result, target_result) = tokio::join!(
                 self.source
                     .execute_count_query_with_rownum(&source_count_sql, range),
@@ -437,13 +466,20 @@ impl UniversalVerifyEngine {
                     .execute_count_query_with_rownum(&target_count_sql, range)
             );
 
-            let source_count = source_result?;
-            let target_count = target_result?;
+            let (source_count, source_hash) = source_result?;
+            let (target_count, target_hash) = target_result?;
 
+            // Check BOTH count AND hash for update detection
             if source_count != target_count {
                 debug!(
                     "{} range {}..{}: count mismatch (src: {}, tgt: {})",
                     tier, range.start_row, range.end_row, source_count, target_count
+                );
+                mismatches.push(range.clone());
+            } else if source_hash != target_hash {
+                debug!(
+                    "{} range {}..{}: hash mismatch (src: {:016x}, tgt: {:016x}) - updates detected",
+                    tier, range.start_row, range.end_row, source_hash, target_hash
                 );
                 mismatches.push(range.clone());
             }

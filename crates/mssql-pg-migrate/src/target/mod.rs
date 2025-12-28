@@ -1804,10 +1804,11 @@ impl PgPool {
         Ok(row_count)
     }
 
-    /// Execute NTILE partition query and return partition row counts.
+    /// Execute NTILE partition query and return partition data with hash.
     ///
-    /// Returns a vector of (partition_id, row_count) tuples for Tier 1.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64)>> {
+    /// Returns a vector of (partition_id, row_count, partition_hash) tuples for Tier 1.
+    /// The partition_hash enables detection of updates even when row counts match.
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
         let client = self
             .pool
             .get()
@@ -1821,14 +1822,18 @@ impl PgPool {
 
         let mut partitions = Vec::new();
         for row in rows {
-            // NTILE returns int4, COUNT returns int8
+            // NTILE returns int4, COUNT returns int8, hash returns int8
             let partition_id: i64 = row.try_get::<_, i64>(0)
                 .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
                 .unwrap_or(0);
             let row_count: i64 = row.try_get::<_, i64>(1)
                 .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
                 .unwrap_or(0);
-            partitions.push((partition_id, row_count));
+            // partition_hash is column 2 (optional - default to 0 if not present)
+            let partition_hash: i64 = row.try_get::<_, i64>(2)
+                .or_else(|_| row.try_get::<_, i32>(2).map(|v| v as i64))
+                .unwrap_or(0);
+            partitions.push((partition_id, row_count, partition_hash));
         }
 
         Ok(partitions)
@@ -1836,12 +1841,13 @@ impl PgPool {
 
     /// Execute count query using ROW_NUMBER range (Tier 2 verification).
     ///
+    /// Returns (row_count, range_hash) for update detection.
     /// Used for tables with any PK type (int, uuid, string, composite).
     pub async fn execute_count_query_with_rownum(
         &self,
         query: &str,
         range: &RowRange,
-    ) -> Result<i64> {
+    ) -> Result<(i64, i64)> {
         let client = self
             .pool
             .get()
@@ -1853,8 +1859,14 @@ impl PgPool {
             .await
             .map_err(MigrateError::Target)?;
 
-        let row_count: i64 = row.get(0);
-        Ok(row_count)
+        let row_count: i64 = row.try_get::<_, i64>(0)
+            .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
+            .unwrap_or(0);
+        // range_hash is column 1 (optional - default to 0 if not present)
+        let range_hash: i64 = row.try_get::<_, i64>(1)
+            .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
+            .unwrap_or(0);
+        Ok((row_count, range_hash))
     }
 
     /// Fetch row hashes using ROW_NUMBER range with composite PK support (Tier 3).
