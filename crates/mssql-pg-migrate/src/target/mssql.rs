@@ -24,15 +24,13 @@ use tracing::{debug, info, warn};
 /// so this constant represents the exact 65535-byte limit.
 const BULK_INSERT_STRING_LIMIT: usize = 65535;
 
-/// Schema name for staging tables used in upsert operations.
-/// Using a dedicated schema keeps staging tables separate from production data.
-const STAGING_SCHEMA: &str = "mssql_pg_migrate_staging";
-
 /// Maximum number of retry attempts for deadlock errors during MERGE operations.
-const DEADLOCK_MAX_RETRIES: u32 = 3;
+/// Increased to 5 to handle high-contention scenarios with many parallel writers.
+const DEADLOCK_MAX_RETRIES: u32 = 5;
 
-/// Delay between deadlock retry attempts in milliseconds.
-const DEADLOCK_RETRY_DELAY_MS: u64 = 100;
+/// Base delay between deadlock retry attempts in milliseconds.
+/// Uses linear backoff: 200ms, 400ms, 600ms, 800ms, 1000ms (delay * attempt)
+const DEADLOCK_RETRY_DELAY_MS: u64 = 200;
 
 /// Connection manager for bb8 pool with tiberius for MSSQL target.
 #[derive(Clone)]
@@ -180,24 +178,6 @@ impl MssqlTargetPool {
         }
     }
 
-    /// Ensure the staging schema exists for upsert operations.
-    ///
-    /// Creates the dedicated staging schema if it doesn't exist.
-    /// This schema holds temporary staging tables used during upsert operations.
-    async fn ensure_staging_schema(
-        conn: &mut tiberius::Client<Compat<TcpStream>>,
-    ) -> Result<()> {
-        let check_sql = format!(
-            "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{}') \
-             EXEC('CREATE SCHEMA [{}]')",
-            STAGING_SCHEMA, STAGING_SCHEMA
-        );
-        conn.execute(&check_sql, &[]).await.map_err(|e| {
-            MigrateError::transfer(STAGING_SCHEMA, format!("creating staging schema: {}", e))
-        })?;
-        Ok(())
-    }
-
     /// Get column definitions for creating a staging table.
     ///
     /// Returns column definitions WITHOUT identity property to allow bulk insert.
@@ -266,8 +246,9 @@ impl MssqlTargetPool {
 
     /// Ensure a staging table exists for the given target table and writer.
     ///
-    /// Creates a staging table in the staging schema with the same structure
+    /// Creates a staging table in the target schema with the same structure
     /// as the target table, but WITHOUT identity columns (to allow bulk insert).
+    /// Staging table name: _staging_[table]_[writer_id]
     /// Uses TRUNCATE for subsequent calls to reuse the table efficiently.
     async fn ensure_staging_table(
         conn: &mut tiberius::Client<Compat<TcpStream>>,
@@ -275,21 +256,19 @@ impl MssqlTargetPool {
         table: &str,
         writer_id: usize,
     ) -> Result<String> {
-        // Ensure staging schema exists
-        Self::ensure_staging_schema(conn).await?;
-
-        // Build staging table name: mssql_pg_migrate_staging.[schema_table_writerid]
-        let staging_table_name = format!("{}_{}_{}", schema, table, writer_id);
+        // Build staging table name in target schema: [schema].[_staging_table_writerid]
+        // Prefix with underscore to clearly mark as staging/internal table
+        let staging_table_name = format!("_staging_{}_{}", table, writer_id);
         let qualified_staging = format!(
             "{}.{}",
-            Self::quote_ident(STAGING_SCHEMA),
+            Self::quote_ident(schema),
             Self::quote_ident(&staging_table_name)
         );
 
         // Check if staging table already exists
         let check_sql = format!(
             "SELECT OBJECT_ID('{}.{}', 'U')",
-            STAGING_SCHEMA, staging_table_name
+            schema, staging_table_name
         );
         let result = conn.simple_query(&check_sql).await.map_err(|e| {
             MigrateError::transfer(&qualified_staging, format!("checking staging table: {}", e))
@@ -386,8 +365,9 @@ impl MssqlTargetPool {
 
         if update_cols.is_empty() {
             // PK-only table: just INSERT new rows, ignore matches
+            // WITH (TABLOCK) serializes MERGE operations to prevent S->X lock conversion deadlocks
             format!(
-                r#"MERGE INTO {} AS target
+                r#"MERGE INTO {} WITH (TABLOCK) AS target
                    USING {} AS source
                    ON {}
                    WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});"#,
@@ -413,8 +393,10 @@ impl MssqlTargetPool {
                 })
                 .collect();
 
+            // WITH (TABLOCK) serializes MERGE operations to prevent S->X lock conversion deadlocks
+            // This is critical for parallel writers targeting the same table
             format!(
-                r#"MERGE INTO {} AS target
+                r#"MERGE INTO {} WITH (TABLOCK) AS target
                    USING {} AS source
                    ON {}
                    WHEN MATCHED AND ({}) THEN UPDATE SET {}
@@ -1788,15 +1770,15 @@ mod tests {
 
         let sql = MssqlTargetPool::build_staging_merge_sql(
             "[dbo].[users]",
-            "[mssql_pg_migrate_staging].[dbo_users_0]",
+            "[dbo].[_staging_users_0]",
             &cols,
             &pk_cols,
         );
 
-        // Should have MERGE INTO target
-        assert!(sql.contains("MERGE INTO [dbo].[users] AS target"));
-        // Should have USING staging
-        assert!(sql.contains("USING [mssql_pg_migrate_staging].[dbo_users_0] AS source"));
+        // Should have MERGE INTO target WITH (TABLOCK) for deadlock prevention
+        assert!(sql.contains("MERGE INTO [dbo].[users] WITH (TABLOCK) AS target"));
+        // Should have USING staging (now in target schema with _staging_ prefix)
+        assert!(sql.contains("USING [dbo].[_staging_users_0] AS source"));
         // Should have join condition on PK
         assert!(sql.contains("ON target.[id] = source.[id]"));
         // Should have change detection (MSSQL style with <> and IS NULL checks)
@@ -1816,11 +1798,13 @@ mod tests {
 
         let sql = MssqlTargetPool::build_staging_merge_sql(
             "[dbo].[lookup]",
-            "[staging].[lookup_0]",
+            "[dbo].[_staging_lookup_0]",
             &cols,
             &pk_cols,
         );
 
+        // Should have WITH (TABLOCK) for deadlock prevention
+        assert!(sql.contains("WITH (TABLOCK)"));
         // PK-only table should not have WHEN MATCHED (no columns to update)
         assert!(!sql.contains("WHEN MATCHED"));
         // Should still have INSERT for new rows
@@ -1838,7 +1822,7 @@ mod tests {
 
         let sql = MssqlTargetPool::build_staging_merge_sql(
             "[dbo].[user_roles]",
-            "[staging].[user_roles_0]",
+            "[dbo].[_staging_user_roles_0]",
             &cols,
             &pk_cols,
         );
