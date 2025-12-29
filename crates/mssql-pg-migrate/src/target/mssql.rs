@@ -23,8 +23,9 @@ const MAX_ROWS_PER_INSERT: usize = 1000;
 
 /// Maximum string length (in bytes) for TDS bulk insert.
 /// Tiberius bulk insert has a hard limit of 65535 bytes for UTF-16 encoded strings.
-/// UTF-16 uses 2 bytes per character for BMP characters, so approximately 32K chars.
-/// We use a conservative limit to account for surrogate pairs.
+/// UTF-16 uses 2 bytes per code unit for BMP characters, so approximately 32K code units.
+/// The byte-length calculation (using `c.len_utf16() * 2`) already accounts for surrogate pairs,
+/// so this constant represents the exact 65535-byte limit.
 const BULK_INSERT_STRING_LIMIT: usize = 65535;
 
 /// Connection manager for bb8 pool with tiberius for MSSQL target.
@@ -352,7 +353,8 @@ impl MssqlTargetPool {
     fn row_has_oversized_strings(row: &[SqlValue]) -> bool {
         for value in row {
             if let SqlValue::String(s) = value {
-                // Calculate UTF-16 encoded length (2 bytes per char for BMP, 4 for surrogates)
+                // Calculate UTF-16 encoded byte length: len_utf16() returns code units (1 for BMP,
+                // 2 for surrogate pairs), multiplied by 2 to get bytes (2 for BMP, 4 for surrogates).
                 let utf16_len: usize = s.chars().map(|c| c.len_utf16() * 2).sum();
                 if utf16_len > BULK_INSERT_STRING_LIMIT {
                     return true;
@@ -1385,5 +1387,77 @@ mod tests {
         let uuid_val = SqlValue::Uuid(uuid);
 
         assert!(matches!(sql_value_to_column_data(&uuid_val), ColumnData::Guid(Some(_))));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_empty_row() {
+        let row: Vec<SqlValue> = vec![];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_small_strings() {
+        let row = vec![
+            SqlValue::String("hello".to_string()),
+            SqlValue::String("world".to_string()),
+            SqlValue::I32(42),
+        ];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_non_string_values() {
+        let row = vec![
+            SqlValue::I32(42),
+            SqlValue::I64(123456789),
+            SqlValue::F64(3.14159),
+            SqlValue::Bool(true),
+        ];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_at_limit() {
+        // 65535 bytes / 2 bytes per BMP char = 32767 chars (and 1 byte remainder)
+        // Actually, 65535 / 2 = 32767.5, so 32767 chars = 65534 bytes (under limit)
+        let at_limit = "a".repeat(32767); // 32767 * 2 = 65534 bytes (under limit)
+        let row = vec![SqlValue::String(at_limit)];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_over_limit() {
+        // 32768 chars * 2 bytes = 65536 bytes (over 65535 limit)
+        let over_limit = "a".repeat(32768);
+        let row = vec![SqlValue::String(over_limit)];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_with_surrogate_pairs() {
+        // Emoji characters require surrogate pairs (4 bytes each in UTF-16)
+        // 65535 / 4 = 16383.75, so 16383 emojis = 65532 bytes (under limit)
+        // 16384 emojis = 65536 bytes (over limit)
+        let under_limit = "😀".repeat(16383); // 16383 * 4 = 65532 bytes
+        let row = vec![SqlValue::String(under_limit)];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+
+        let over_limit = "😀".repeat(16384); // 16384 * 4 = 65536 bytes
+        let row = vec![SqlValue::String(over_limit)];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_mixed_row() {
+        // One oversized string among normal values should trigger true
+        let normal_string = SqlValue::String("hello".to_string());
+        let oversized_string = SqlValue::String("x".repeat(40000)); // 80000 bytes
+        let row = vec![
+            SqlValue::I32(1),
+            normal_string,
+            oversized_string,
+            SqlValue::Bool(false),
+        ];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
     }
 }
