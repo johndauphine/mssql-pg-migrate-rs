@@ -539,23 +539,37 @@ impl Orchestrator {
         }
 
         // Phase 3: Transfer data (skip in dry-run)
-        // For upsert mode: use batch hashing to detect changes, only sync differences
+        // For upsert mode with hash detection: use batch hashing to detect changes, only sync differences
+        // For upsert mode without hash detection: stream all rows, let PostgreSQL handle comparison
         // For other modes: full transfer of all rows
         let transfer_result = if !dry_run {
-            if matches!(self.config.migration.target_mode, TargetMode::Upsert) {
-                // Upsert mode: Use batch hashing to detect and sync only changed rows
+            let is_upsert = matches!(self.config.migration.target_mode, TargetMode::Upsert);
+            let use_hash = self.config.migration.use_hash_detection();
+
+            if is_upsert && use_hash {
+                // Upsert with hash detection: Use batch hashing to detect and sync only changed rows
                 info!("Phase 3: Batch sync (detecting changes with batch hashing)");
                 self.emit_progress("batch_sync", tables.len(), total_rows);
                 self.batch_sync(&tables, &mut state, &cancel).await
             } else {
-                // Drop/recreate or truncate: Full transfer of all rows
-                info!("Phase 3: Transferring data");
+                // Fast path: stream all rows, let PostgreSQL handle comparison via ON CONFLICT
+                // Used for drop_recreate, truncate, and upsert without hash detection
+                if is_upsert {
+                    info!("Phase 3: Fast upsert (streaming all rows, PostgreSQL handles comparison)");
+                } else {
+                    info!("Phase 3: Transferring data");
+                }
                 self.emit_progress("transferring", tables.len(), total_rows);
                 self.transfer_data(&tables, &mut state, &cancel).await
             }
         } else {
-            if matches!(self.config.migration.target_mode, TargetMode::Upsert) {
+            let is_upsert = matches!(self.config.migration.target_mode, TargetMode::Upsert);
+            let use_hash = self.config.migration.use_hash_detection();
+
+            if is_upsert && use_hash {
                 info!("Phase 3: [DRY RUN] Would detect and sync changes with batch hashing");
+            } else if is_upsert {
+                info!("Phase 3: [DRY RUN] Would fast upsert (stream all, PostgreSQL compares)");
             } else {
                 info!(
                     "Phase 3: [DRY RUN] Would transfer data for {} tables",
