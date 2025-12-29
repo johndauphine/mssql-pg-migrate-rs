@@ -265,12 +265,11 @@ impl MssqlTargetPool {
             Self::quote_ident(&staging_table_name)
         );
 
-        // Check if staging table already exists
+        // Check if staging table already exists using QUOTENAME for safe identifier handling
         let check_sql = format!(
-            "SELECT OBJECT_ID('{}.{}', 'U')",
-            schema, staging_table_name
+            "SELECT OBJECT_ID(QUOTENAME(@P1) + '.' + QUOTENAME(@P2), 'U')"
         );
-        let result = conn.simple_query(&check_sql).await.map_err(|e| {
+        let result = conn.query(&check_sql, &[&schema, &staging_table_name]).await.map_err(|e| {
             MigrateError::transfer(&qualified_staging, format!("checking staging table: {}", e))
         })?;
         let rows = result.into_first_result().await.map_err(|e| {
@@ -414,9 +413,8 @@ impl MssqlTargetPool {
 
     /// Check if a tiberius error is a deadlock error (error 1205).
     fn is_deadlock_error(e: &tiberius::error::Error) -> bool {
-        let err_str = e.to_string();
-        // MSSQL deadlock error code is 1205
-        err_str.contains("1205") || err_str.to_lowercase().contains("deadlock")
+        // Use tiberius built-in method which checks error code 1205
+        e.is_deadlock()
     }
 
     /// Perform bulk insert into a table (staging or target).
