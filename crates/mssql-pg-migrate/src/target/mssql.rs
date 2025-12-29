@@ -173,6 +173,14 @@ impl MssqlTargetPool {
     /// MSSQL's "timestamp" is actually a rowversion (auto-generated binary), not a datetime.
     /// We use "rowversion" explicitly for MSSQL's auto-generated version column.
     fn is_mssql_type(data_type: &str) -> bool {
+        // Note: The following ambiguous types are intentionally NOT included here:
+        // - 'text', 'ntext': Deprecated MSSQL types (use nvarchar(max) instead)
+        //   Also, PostgreSQL has 'text' type
+        // - 'char', 'varchar': PostgreSQL also has these types, and we want
+        //   PostgreSQL char/varchar to map to nchar/nvarchar for Unicode support
+        //
+        // Types listed here are MSSQL-specific types that should be formatted
+        // directly rather than going through postgres_to_mssql mapping.
         let lower = data_type.to_lowercase();
         matches!(
             lower.as_str(),
@@ -190,15 +198,10 @@ impl MssqlTargetPool {
                 | "datetime"
                 | "datetime2"
                 | "smalldatetime"
-                | "date"
                 | "time"
                 | "datetimeoffset"
-                | "char"
-                | "varchar"
-                | "text"
                 | "nchar"
                 | "nvarchar"
-                | "ntext"
                 | "binary"
                 | "varbinary"
                 | "image"
@@ -1033,7 +1036,7 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             SqlNullType::Decimal => ColumnData::Numeric(None),
             SqlNullType::DateTime => ColumnData::DateTime2(None),
             SqlNullType::DateTimeOffset => ColumnData::DateTimeOffset(None),
-            SqlNullType::Date => ColumnData::Date(None),
+            SqlNullType::Date => ColumnData::DateTime2(None), // Date maps to datetime2 for bulk insert compatibility
             SqlNullType::Time => ColumnData::Time(None),
         },
         SqlValue::Bool(b) => ColumnData::Bit(Some(*b)),
@@ -1121,17 +1124,22 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             )))
         }
         SqlValue::Date(d) => {
-            // Convert chrono::NaiveDate to Tiberius Date
-            // Date is days since year 1, January 1
+            // Convert chrono::NaiveDate to Tiberius DateTime2 with midnight time.
+            // Note: We use DateTime2 instead of Date because Tiberius bulk insert
+            // has issues with the DATE type serialization. The type mapping also
+            // maps PostgreSQL date to datetime2 for this reason.
             let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
             let days_i64 = (*d - epoch).num_days();
             // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
             if days_i64 < 0 || days_i64 > u32::MAX as i64 {
                 warn!("Date out of valid range (days={}), converting to NULL", days_i64);
-                return ColumnData::Date(None);
+                return ColumnData::DateTime2(None);
             }
             let days = days_i64 as u32;
-            ColumnData::Date(Some(tiberius::time::Date::new(days)))
+            let date = tiberius::time::Date::new(days);
+            // Midnight time (0 increments at scale 7)
+            let time = tiberius::time::Time::new(0, 7);
+            ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(date, time)))
         }
         SqlValue::Time(t) => {
             // Convert chrono::NaiveTime to Tiberius Time
@@ -1204,7 +1212,8 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         let date_val = SqlValue::Date(date);
 
-        assert!(matches!(sql_value_to_column_data(&date_val), ColumnData::Date(Some(_))));
+        // Date is converted to DateTime2 for bulk insert compatibility
+        assert!(matches!(sql_value_to_column_data(&date_val), ColumnData::DateTime2(Some(_))));
     }
 
     #[test]

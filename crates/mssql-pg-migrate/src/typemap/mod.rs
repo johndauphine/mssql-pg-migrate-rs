@@ -198,7 +198,13 @@ pub fn postgres_to_mssql(
         "bytea" => TypeMapping::lossless("varbinary(max)"),
 
         // Date/time types
-        "date" => TypeMapping::lossless("date"),
+        // Note: PostgreSQL date is mapped to datetime2 instead of date because
+        // Tiberius bulk insert has issues with the DATE type serialization.
+        // The time component will always be midnight (00:00:00.0000000).
+        "date" => TypeMapping::lossy(
+            "datetime2",
+            "Date stored as datetime2 with midnight time component.",
+        ),
         "time" | "time without time zone" => TypeMapping::lossless("time"),
         "timetz" | "time with time zone" => TypeMapping::lossy(
             "datetimeoffset",
