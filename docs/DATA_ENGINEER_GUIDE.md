@@ -7,13 +7,11 @@ A comprehensive technical reference for data engineers using mssql-pg-migrate-rs
 1. [Overview](#overview)
 2. [Architecture](#architecture)
 3. [Transfer Modes](#transfer-modes)
-4. [Change Detection](#change-detection)
-5. [Multi-Tier Verification](#multi-tier-verification)
-6. [Configuration Reference](#configuration-reference)
-7. [CLI Commands](#cli-commands)
-8. [Performance Tuning](#performance-tuning)
-9. [Production Deployment](#production-deployment)
-10. [Troubleshooting](#troubleshooting)
+4. [Configuration Reference](#configuration-reference)
+5. [CLI Commands](#cli-commands)
+6. [Performance Tuning](#performance-tuning)
+7. [Production Deployment](#production-deployment)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -21,8 +19,8 @@ A comprehensive technical reference for data engineers using mssql-pg-migrate-rs
 
 mssql-pg-migrate-rs is a production-ready data migration tool designed for:
 
-- **High throughput**: 160K-193K rows/sec for bulk operations, ~80K rows/sec for upsert
-- **Incremental sync**: Hash-based change detection transfers only modified rows
+- **High throughput**: 160K-193K rows/sec for bulk operations, ~106K rows/sec for upsert
+- **Incremental sync**: Efficient change detection using PostgreSQL's `IS DISTINCT FROM`
 - **Headless operation**: Ideal for Kubernetes, Airflow DAGs, and CI/CD pipelines
 - **Resume capability**: JSON state files enable safe restart after interruption
 - **Memory safety**: Auto-tuning prevents OOM conditions
@@ -35,7 +33,7 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 |------|----------|------------|----------|
 | `drop_recreate` | 119s | 162,452 rows/sec | Full refresh |
 | `truncate` | ~100s | ~193,000 rows/sec | Schema-preserving refresh |
-| `upsert` | ~240s | ~80,000 rows/sec | Incremental sync |
+| `upsert` | ~180s | ~106,000 rows/sec | Incremental sync |
 
 ---
 
@@ -57,8 +55,8 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
 │  │                        TRANSFER ENGINE                                │  │
 │  │  ┌─────────────┐   ┌────────────────┐   ┌──────────────────────────┐ │  │
-│  │  │  Parallel   │──>│  Read-Ahead    │──>│  Hash-Based Filtering    │ │  │
-│  │  │  Readers    │   │  Buffer Queue  │   │  (Upsert Mode Only)      │ │  │
+│  │  │  Parallel   │──>│  Read-Ahead    │──>│  Binary COPY Protocol    │ │  │
+│  │  │  Readers    │   │  Buffer Queue  │   │  (Streaming to PG)       │ │  │
 │  │  │  (per table)│   │  (4-32 chunks) │   │                          │ │  │
 │  │  └─────────────┘   └────────────────┘   └────────────┬─────────────┘ │  │
 │  │                                                       │               │  │
@@ -95,7 +93,6 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 | **Schema Extractor** | Table, column, index, FK, constraint discovery from MSSQL |
 | **Connection Pools** | bb8 (MSSQL), deadpool (PostgreSQL) connection management |
 | **Transfer Engine** | Parallel read/write orchestration with range tracking |
-| **Verify Engine** | Multi-tier hash comparison for data consistency |
 | **State Manager** | Resume capability, progress tracking, config hash validation |
 
 ### Large Table Handling
@@ -124,11 +121,11 @@ Each partition processed by parallel readers with keyset pagination
 | **Primary Key Required** | No | No | **Yes** |
 | **Schema Preserved** | No | Yes | Yes |
 | **Data Preservation** | None | None | Existing data kept |
-| **Transfer Type** | Full copy | Full copy | Delta sync |
-| **Change Detection** | N/A | N/A | MD5 hash-based |
+| **Transfer Type** | Full copy | Full copy | Streaming upsert |
+| **Change Detection** | N/A | N/A | `IS DISTINCT FROM` |
 | **Deletes Performed** | N/A | N/A | No (safety) |
-| **Speed** | Fastest | Fastest | Moderate |
-| **Network Usage** | Full dataset | Full dataset | Changed rows only |
+| **Speed** | Fastest | Fastest | Fast (~106K rows/sec) |
+| **Network Usage** | Full dataset | Full dataset | Full dataset (filtered at target) |
 
 ### DROP_RECREATE Mode
 
@@ -167,9 +164,8 @@ migration:
 **Behavior**:
 1. Truncates existing tables (deletes all rows, preserves structure)
 2. Creates tables if they don't exist
-3. Ensures `row_hash` column exists (if hash detection enabled)
-4. Optionally converts to UNLOGGED for faster writes
-5. Transfers all rows
+3. Optionally converts to UNLOGGED for faster writes
+4. Transfers all rows using binary COPY protocol
 
 **Advantages**:
 - Preserves table structure, permissions, dependencies
@@ -187,227 +183,48 @@ migration:
 ```yaml
 migration:
   target_mode: upsert
-  use_hash_detection: true
-  row_hash_column: row_hash
-  hash_text_columns: false
   upsert_batch_size: 2000
   upsert_parallel_tasks: 4
 ```
 
 **Behavior**:
 1. Validates primary key exists on all tables
-2. Uses multi-tier verification to detect differences
-3. INSERTs new rows
-4. UPDATEs changed rows (where hash differs)
+2. Streams all rows to PostgreSQL via staging table
+3. Uses `INSERT...ON CONFLICT DO UPDATE` with `IS DISTINCT FROM` for change detection
+4. Only updates rows where column values actually differ
 5. Does NOT delete rows (safety feature)
 
-**Change Detection Process**:
+**How Change Detection Works**:
 
+The tool uses PostgreSQL's `IS DISTINCT FROM` operator for NULL-safe column comparison:
+
+```sql
+INSERT INTO target_table (pk, col1, col2, ...)
+SELECT pk, col1, col2, ... FROM staging_table
+ON CONFLICT (pk) DO UPDATE SET
+  col1 = EXCLUDED.col1,
+  col2 = EXCLUDED.col2,
+  ...
+WHERE target_table.col1 IS DISTINCT FROM EXCLUDED.col1
+   OR target_table.col2 IS DISTINCT FROM EXCLUDED.col2
+   ...
 ```
-Source Table (MSSQL)          Target Table (PostgreSQL)
-┌─────┬──────────┬──────┐    ┌─────┬──────────┬──────────────────────┐
-│ PK  │  Data    │      │    │ PK  │  Data    │ row_hash             │
-├─────┼──────────┼──────┤    ├─────┼──────────┼──────────────────────┤
-│  1  │  Alice   │      │───>│  1  │  Alice   │ a1b2c3d4...          │ Match (skip)
-│  2  │  Bob*    │      │───>│  2  │  Robert  │ e5f6g7h8...          │ Mismatch (UPDATE)
-│  3  │  Carol   │      │───>│     │          │                      │ Missing (INSERT)
-│     │          │      │    │  4  │  Dave    │ i9j0k1l2...          │ Extra (keep)
-└─────┴──────────┴──────┘    └─────┴──────────┴──────────────────────┘
-```
+
+This approach:
+- Streams all source rows (no pre-filtering overhead)
+- Lets PostgreSQL efficiently detect which rows actually changed
+- Only writes to disk when values differ (reduces I/O)
+- Handles NULL values correctly (`NULL IS DISTINCT FROM NULL` = false)
 
 **Advantages**:
-- Minimal data transfer (only changes)
+- Fast (~106K rows/sec) - no pre-computation overhead
 - Preserves existing target data
 - Suitable for append-heavy workloads
 - Safe (no deletes without explicit request)
+- Simple architecture (no hash columns needed)
 
 **Requirements**:
 - All tables must have primary keys
-- Target tables should exist with `row_hash` column (auto-created if missing)
-
----
-
-## Change Detection
-
-### Hash Computation Algorithm
-
-The tool uses MD5 hashing to detect row changes. Hash is computed on **non-PK columns only** (PKs identify rows, not content).
-
-**Hash Function** (`crates/mssql-pg-migrate/src/target/mod.rs`):
-
-```rust
-fn calculate_row_hash(
-    row: &[SqlValue],
-    pk_indices: &[usize],
-    skip_indices: &[usize],  // Text columns if hash_text_columns: false
-) -> String {
-    let mut hasher = Md5::new();
-
-    for (i, value) in row.iter().enumerate() {
-        if pk_indices.contains(&i) || skip_indices.contains(&i) {
-            continue;  // Skip PKs and optional text columns
-        }
-
-        let normalized = match value {
-            SqlValue::Null => "\\N".to_string(),
-            SqlValue::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-            SqlValue::Float(f) => format!("{:.15}", f),  // 15 decimal precision
-            SqlValue::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f"),
-            // ... other types
-        };
-
-        hasher.update(normalized.as_bytes());
-        hasher.update(b"|");  // Separator
-    }
-
-    format!("{:x}", hasher.finalize())  // 32-char hex
-}
-```
-
-### Value Normalization
-
-Cross-database hash comparison requires identical normalization:
-
-| Data Type | MSSQL Normalization | PostgreSQL Normalization |
-|-----------|---------------------|--------------------------|
-| DateTime | `CONVERT(VARCHAR, col, 121)` | `TO_CHAR(col, 'YYYY-MM-DD HH24:MI:SS.US')` |
-| Boolean/Bit | `'t'` or `'f'` | `CASE WHEN col THEN '1' ELSE '0' END` |
-| Float (f64) | `STR(col, 25, 15)` | `col::text` |
-| Decimal | `CONVERT(VARCHAR, col)` | `col::text` |
-| UUID | `LOWER(CONVERT(VARCHAR(36), col))` | `col::text` (lowercase) |
-| Binary | `CONVERT(VARCHAR(MAX), col, 2)` (hex) | `encode(col, 'hex')` |
-| NULL | `'\N'` literal | `'\N'` literal |
-
-### Text Column Handling
-
-By default, text columns are **excluded** from hash computation for performance:
-
-```yaml
-migration:
-  hash_text_columns: false  # Default: skip TEXT, NTEXT, VARCHAR(MAX), NVARCHAR(MAX), XML
-```
-
-**Excluded types** (when `hash_text_columns: false`):
-- `text`, `ntext`
-- `varchar(max)`, `nvarchar(max)`
-- `xml`
-
-**When to enable `hash_text_columns: true`**:
-- You need to detect changes in large text fields
-- Text columns contain critical business data
-- Performance impact is acceptable
-
-### Hash Storage
-
-The `row_hash` column is automatically added to target tables:
-
-```sql
-ALTER TABLE target_schema.table_name
-ADD COLUMN IF NOT EXISTS row_hash VARCHAR(32);
-```
-
----
-
-## Multi-Tier Verification
-
-The `verify` command and upsert mode use a 4-tier drill-down approach for efficient difference detection.
-
-### Tier Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    MULTI-TIER VERIFICATION PROCESS                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  TIER 1: COARSE PARTITION (~1M rows each)                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  NTILE(n) partitioning by row_number                                  │  │
-│  │  Compare: COUNT(*) + CHECKSUM_AGG(LEFT(row_hash, 8))                 │  │
-│  │                                                                       │  │
-│  │  Partition 1: ✓ Match     │  Partition 2: ✗ Mismatch  │  ...         │  │
-│  │  (Skip)                    │  (Drill down)             │              │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                       │                                      │
-│                                       ▼                                      │
-│  TIER 2: FINE RANGES (~10K rows each)                                       │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  ROW_NUMBER() ranges within mismatched Tier 1 partitions             │  │
-│  │  Compare: COUNT(*) + aggregate hash                                   │  │
-│  │                                                                       │  │
-│  │  Range 1-10K: ✓  │  Range 10K-20K: ✗  │  Range 20K-30K: ✓  │  ...   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                              │                                               │
-│                              ▼                                               │
-│  TIER 3: ROW-LEVEL COMPARISON                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  Fetch individual (PK, row_hash) pairs for mismatched ranges         │  │
-│  │  Build HashMap<PK, Hash> for both source and target                  │  │
-│  │                                                                       │  │
-│  │  Compare:                                                             │  │
-│  │  • In source, not in target → INSERT needed                          │  │
-│  │  • In both, hash differs → UPDATE needed                             │  │
-│  │  • In target, not in source → DELETE candidate (skipped for safety)  │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                              │                                               │
-│                              ▼                                               │
-│  TIER 4: SYNC (Upsert Mode Only)                                            │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  Transfer only identified changed rows                               │  │
-│  │  INSERT...ON CONFLICT for efficient merging                          │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Partition Hash Algorithm
-
-Both MSSQL and PostgreSQL compute aggregate hashes identically:
-
-**MSSQL**:
-```sql
-SELECT
-    partition_num,
-    COUNT(*) as row_count,
-    CHECKSUM_AGG(
-        CONVERT(INT, CONVERT(VARBINARY(4), LEFT(row_hash, 8), 2))
-    ) as partition_hash
-FROM (
-    SELECT *, NTILE(@partitions) OVER (ORDER BY pk) as partition_num
-    FROM table_name
-) sub
-GROUP BY partition_num
-```
-
-**PostgreSQL**:
-```sql
-SELECT
-    partition_num,
-    COUNT(*) as row_count,
-    BIT_XOR(
-        ('x' || COALESCE(LEFT(row_hash, 8), '00000000'))::bit(32)::integer
-    ) as partition_hash
-FROM (
-    SELECT *, NTILE(partitions) OVER (ORDER BY pk) as partition_num
-    FROM table_name
-) sub
-GROUP BY partition_num
-```
-
-**Why this works**:
-- `LEFT(row_hash, 8)` = first 8 hex chars = 4 bytes = 32-bit integer
-- `CHECKSUM_AGG` (MSSQL) and `BIT_XOR` (PostgreSQL) both perform XOR aggregation
-- XOR is order-independent: same rows in any order produce same result
-- XOR is self-inverse: same row twice cancels out
-
-### Verification Configuration
-
-```yaml
-migration:
-  batch_verify:
-    tier1_batch_size: 1000000   # Rows per Tier 1 partition
-    tier2_batch_size: 10000     # Rows per Tier 2 range
-    parallel_verify_ranges: 4   # Concurrent range verifications
-```
 
 ---
 
@@ -469,9 +286,6 @@ migration:
   copy_buffer_rows: 10000        # COPY flush threshold
 
   # Upsert mode settings
-  use_hash_detection: true       # Enable hash-based change detection
-  row_hash_column: row_hash      # Hash column name
-  hash_text_columns: false       # Include text columns in hash
   upsert_batch_size: 2000        # Rows per upsert batch
   upsert_parallel_tasks: 4       # Parallel upsert operations
 
@@ -487,12 +301,6 @@ migration:
   create_indexes: true           # Create non-PK indexes
   create_foreign_keys: true      # Create foreign key constraints
   create_check_constraints: true # Create check constraints
-
-  # Batch verification (for upsert/verify)
-  batch_verify:
-    tier1_batch_size: 1000000    # Coarse partition size
-    tier2_batch_size: 10000      # Fine range size
-    parallel_verify_ranges: 4    # Concurrent verifications
 ```
 
 ### Environment Variable Support
@@ -565,28 +373,13 @@ mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state resume
 - State file must exist and be readable
 - Run ID preserved for continuity
 
-### verify - Data Consistency Check
-
-```bash
-mssql-pg-migrate -c config.yaml verify [OPTIONS]
-
-Options:
-      --tier1-size <N>  Tier 1 partition size (default: 1000000)
-      --tier2-size <N>  Tier 2 range size (default: 10000)
-```
-
-**Output includes**:
-- Per-table verification status
-- Row counts (source vs target)
-- Mismatch details (inserts, updates, deletes needed)
-
 ### validate - Row Count Check
 
 ```bash
 mssql-pg-migrate -c config.yaml validate
 ```
 
-Quick check that row counts match between source and target. Faster than full `verify`.
+Quick check that row counts match between source and target.
 
 ### health-check - Connection Test
 
@@ -744,17 +537,17 @@ with DAG(
         do_xcom_push=True,
     )
 
-    verify = BashOperator(
-        task_id='verify_sync',
+    validate = BashOperator(
+        task_id='validate_sync',
         bash_command='''
             mssql-pg-migrate \
                 -c /opt/airflow/config/migration.yaml \
                 --output-json \
-                verify
+                validate
         ''',
     )
 
-    migrate >> verify
+    migrate >> validate
 ```
 
 ### Kubernetes Deployment
@@ -851,12 +644,6 @@ Error: Table 'orders' has no primary key, required for upsert mode
 ```
 
 **Solution**: Add primary key to source table or switch to `truncate` mode.
-
-#### Hash Mismatch Due to Precision
-
-Floating-point precision differences between MSSQL and PostgreSQL:
-
-**Solution**: Verify your float columns are using consistent precision. Consider using DECIMAL for exact values.
 
 #### Memory Pressure / OOM
 
@@ -987,4 +774,4 @@ mssql-pg-migrate -c config.yaml --progress run 2>&1 | \
 
 ---
 
-*Documentation generated for mssql-pg-migrate-rs v0.8.2*
+*Documentation generated for mssql-pg-migrate-rs v0.8.5*
