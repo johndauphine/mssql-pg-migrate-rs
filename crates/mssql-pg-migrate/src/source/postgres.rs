@@ -126,9 +126,7 @@ impl PgSourcePool {
                 COALESCE(
                     (SELECT true FROM pg_catalog.pg_class c
                      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                     WHERE n.nspname = columns.table_schema
-                       AND c.relname = columns.table_name
+                     WHERE c.relname = columns.table_name
                        AND a.attname = columns.column_name
                        AND a.attidentity IN ('a', 'd')),
                     false
