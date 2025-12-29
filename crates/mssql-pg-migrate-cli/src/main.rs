@@ -141,7 +141,12 @@ async fn run() -> Result<(), MigrateError> {
     let cli = Cli::parse();
 
     // Handle init command separately (doesn't need existing config)
-    if let Commands::Init { output, advanced, force } = cli.command {
+    if let Commands::Init {
+        output,
+        advanced,
+        force,
+    } = cli.command
+    {
         // No logging setup for wizard - keeps terminal clean for interactive prompts
         let output_path = output.unwrap_or_else(|| PathBuf::from("config.yaml"));
         wizard::run_wizard(&output_path, advanced, force)
@@ -208,7 +213,11 @@ async fn run() -> Result<(), MigrateError> {
             if cli.output_json {
                 println!("{}", result.to_json()?);
             } else {
-                let status_msg = if dry_run { "Dry run completed!" } else { "Migration completed!" };
+                let status_msg = if dry_run {
+                    "Dry run completed!"
+                } else {
+                    "Migration completed!"
+                };
                 println!("\n{}", status_msg);
                 println!("  Run ID: {}", result.run_id);
                 println!("  Duration: {:.2}s", result.duration_seconds);
@@ -358,10 +367,22 @@ async fn run() -> Result<(), MigrateError> {
             if total_result.tables_skipped > 0 {
                 println!("  Tables skipped: {}", total_result.tables_skipped);
             }
-            println!("  Total rows to insert: {}", total_result.total_rows_to_insert);
-            println!("  Total rows to update: {}", total_result.total_rows_to_update);
-            println!("  Total rows to delete: {}", total_result.total_rows_to_delete);
-            println!("  Duration: {:.2}s", total_result.duration_ms as f64 / 1000.0);
+            println!(
+                "  Total rows to insert: {}",
+                total_result.total_rows_to_insert
+            );
+            println!(
+                "  Total rows to update: {}",
+                total_result.total_rows_to_update
+            );
+            println!(
+                "  Total rows to delete: {}",
+                total_result.total_rows_to_delete
+            );
+            println!(
+                "  Duration: {:.2}s",
+                total_result.duration_ms as f64 / 1000.0
+            );
 
             if cli.output_json {
                 println!("\n{}", serde_json::to_string_pretty(&total_result)?);
@@ -378,7 +399,11 @@ async fn run() -> Result<(), MigrateError> {
                 println!("Health Check Results:");
                 println!(
                     "  Source (MSSQL): {} ({}ms)",
-                    if result.source_connected { "OK" } else { "FAILED" },
+                    if result.source_connected {
+                        "OK"
+                    } else {
+                        "FAILED"
+                    },
                     result.source_latency_ms
                 );
                 if let Some(ref err) = result.source_error {
@@ -386,7 +411,11 @@ async fn run() -> Result<(), MigrateError> {
                 }
                 println!(
                     "  Target (PostgreSQL): {} ({}ms)",
-                    if result.target_connected { "OK" } else { "FAILED" },
+                    if result.target_connected {
+                        "OK"
+                    } else {
+                        "FAILED"
+                    },
                     result.target_latency_ms
                 );
                 if let Some(ref err) = result.target_error {
@@ -394,7 +423,11 @@ async fn run() -> Result<(), MigrateError> {
                 }
                 println!(
                     "\n  Overall: {}",
-                    if result.healthy { "HEALTHY" } else { "UNHEALTHY" }
+                    if result.healthy {
+                        "HEALTHY"
+                    } else {
+                        "UNHEALTHY"
+                    }
                 );
             }
 
@@ -473,7 +506,10 @@ async fn setup_signal_handler(shutdown_timeout: u64) -> Result<CancellationToken
     tokio::spawn(async move {
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
         sigint.recv().await;
-        eprintln!("\nReceived SIGINT. Shutting down gracefully (timeout: {}s)...", shutdown_timeout);
+        eprintln!(
+            "\nReceived SIGINT. Shutting down gracefully (timeout: {}s)...",
+            shutdown_timeout
+        );
         token_int.cancel();
     });
 
@@ -481,7 +517,10 @@ async fn setup_signal_handler(shutdown_timeout: u64) -> Result<CancellationToken
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
         sigterm.recv().await;
-        eprintln!("\nReceived SIGTERM. Shutting down gracefully (timeout: {}s)...", shutdown_timeout);
+        eprintln!(
+            "\nReceived SIGTERM. Shutting down gracefully (timeout: {}s)...",
+            shutdown_timeout
+        );
         token_term.cancel();
     });
 

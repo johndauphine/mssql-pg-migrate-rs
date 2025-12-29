@@ -41,9 +41,8 @@ impl Config {
 
     /// Parse configuration from a JSON string.
     pub fn from_json(json: &str) -> Result<Self> {
-        let config: Config = serde_json::from_str(json).map_err(|e| {
-            MigrateError::Config(format!("Failed to parse JSON config: {}", e))
-        })?;
+        let config: Config = serde_json::from_str(json)
+            .map_err(|e| MigrateError::Config(format!("Failed to parse JSON config: {}", e)))?;
         config.validate()?;
         Ok(config)
     }
@@ -306,13 +305,20 @@ migration:
         assert_eq!(json_config.target.port, yaml_config.target.port);
         assert_eq!(json_config.target.database, yaml_config.target.database);
         assert_eq!(json_config.migration.workers, yaml_config.migration.workers);
-        assert_eq!(json_config.migration.chunk_size, yaml_config.migration.chunk_size);
+        assert_eq!(
+            json_config.migration.chunk_size,
+            yaml_config.migration.chunk_size
+        );
     }
 
     #[test]
     fn test_filter_tables_no_filters() {
         let config = Config::from_yaml(VALID_YAML).unwrap();
-        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "Orders".to_string(),
+            "Products".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, tables);
     }
@@ -321,7 +327,11 @@ migration:
     fn test_filter_tables_include_exact() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.include_tables = vec!["Users".to_string(), "Orders".to_string()];
-        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "Orders".to_string(),
+            "Products".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users", "Orders"]);
     }
@@ -330,7 +340,11 @@ migration:
     fn test_filter_tables_include_wildcard() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.include_tables = vec!["User*".to_string()];
-        let tables = vec!["Users".to_string(), "UserRoles".to_string(), "Orders".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "UserRoles".to_string(),
+            "Orders".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users", "UserRoles"]);
     }
@@ -339,7 +353,11 @@ migration:
     fn test_filter_tables_exclude_exact() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.exclude_tables = vec!["Products".to_string()];
-        let tables = vec!["Users".to_string(), "Orders".to_string(), "Products".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "Orders".to_string(),
+            "Products".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users", "Orders"]);
     }
@@ -348,7 +366,11 @@ migration:
     fn test_filter_tables_exclude_wildcard() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.exclude_tables = vec!["*Log*".to_string()];
-        let tables = vec!["Users".to_string(), "AuditLog".to_string(), "LogEntries".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "AuditLog".to_string(),
+            "LogEntries".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users"]);
     }
@@ -358,7 +380,11 @@ migration:
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.include_tables = vec!["User*".to_string()];
         config.migration.exclude_tables = vec!["UserSecrets".to_string()];
-        let tables = vec!["Users".to_string(), "UserRoles".to_string(), "UserSecrets".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "UserRoles".to_string(),
+            "UserSecrets".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users", "UserRoles"]);
     }
@@ -367,7 +393,11 @@ migration:
     fn test_filter_tables_case_insensitive() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.include_tables = vec!["users".to_string()];
-        let tables = vec!["Users".to_string(), "USERS".to_string(), "Orders".to_string()];
+        let tables = vec![
+            "Users".to_string(),
+            "USERS".to_string(),
+            "Orders".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Users", "USERS"]);
     }
@@ -376,7 +406,12 @@ migration:
     fn test_filter_tables_question_mark_wildcard() {
         let mut config = Config::from_yaml(VALID_YAML).unwrap();
         config.migration.include_tables = vec!["Log?".to_string()];
-        let tables = vec!["Log1".to_string(), "Log2".to_string(), "Logs".to_string(), "LogAB".to_string()];
+        let tables = vec![
+            "Log1".to_string(),
+            "Log2".to_string(),
+            "Logs".to_string(),
+            "LogAB".to_string(),
+        ];
         let filtered = config.migration.filter_tables(&tables);
         assert_eq!(filtered, vec!["Log1", "Log2", "Logs"]);
     }

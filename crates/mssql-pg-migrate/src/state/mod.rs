@@ -264,7 +264,10 @@ mod tests {
 
         let content = std::fs::read_to_string(file.path()).unwrap();
         // Pretty JSON should have newlines and indentation
-        assert!(content.contains('\n'), "JSON should be pretty-printed with newlines");
+        assert!(
+            content.contains('\n'),
+            "JSON should be pretty-printed with newlines"
+        );
         assert!(content.contains("  "), "JSON should have indentation");
     }
 
@@ -281,8 +284,14 @@ mod tests {
             "State file should not be YAML (no --- header)"
         );
         // Should contain JSON markers
-        assert!(content.contains('{'), "State file should contain JSON object");
-        assert!(content.contains('}'), "State file should contain JSON object");
+        assert!(
+            content.contains('{'),
+            "State file should contain JSON object"
+        );
+        assert!(
+            content.contains('}'),
+            "State file should contain JSON object"
+        );
         assert!(
             content.contains("\"run_id\""),
             "State file should have quoted keys (JSON format)"

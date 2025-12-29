@@ -31,10 +31,7 @@ pub fn pg_normalize_expr(col: &Column) -> String {
 
         // Boolean - convert to 1/0 to match MSSQL bit
         "bool" | "boolean" => {
-            format!(
-                "COALESCE(CASE WHEN {} THEN '1' ELSE '0' END, '')",
-                col_name
-            )
+            format!("COALESCE(CASE WHEN {} THEN '1' ELSE '0' END, '')", col_name)
         }
 
         // Numeric/decimal - normalize precision
@@ -52,10 +49,7 @@ pub fn pg_normalize_expr(col: &Column) -> String {
 
         // UUID - normalize to lowercase without dashes for cross-platform consistency
         "uuid" => {
-            format!(
-                "COALESCE(LOWER(REPLACE({}::text, '-', '')), '')",
-                col_name
-            )
+            format!("COALESCE(LOWER(REPLACE({}::text, '-', '')), '')", col_name)
         }
 
         // Date/time types - use ISO format
@@ -63,17 +57,11 @@ pub fn pg_normalize_expr(col: &Column) -> String {
             format!("COALESCE(TO_CHAR({}, 'YYYY-MM-DD'), '')", col_name)
         }
         "time" | "time without time zone" => {
-            format!(
-                "COALESCE(TO_CHAR({}, 'HH24:MI:SS.US'), '')",
-                col_name
-            )
+            format!("COALESCE(TO_CHAR({}, 'HH24:MI:SS.US'), '')", col_name)
         }
         "timetz" | "time with time zone" => {
             // Use 'US' for microseconds and 'OF' for timezone offset with space separator
-            format!(
-                "COALESCE(TO_CHAR({}, 'HH24:MI:SS.US OF'), '')",
-                col_name
-            )
+            format!("COALESCE(TO_CHAR({}, 'HH24:MI:SS.US OF'), '')", col_name)
         }
         "timestamp" | "timestamp without time zone" => {
             format!(

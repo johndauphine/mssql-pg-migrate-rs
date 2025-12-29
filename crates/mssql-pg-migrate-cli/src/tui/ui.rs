@@ -45,12 +45,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Status bar
-            progress_height,        // Progress bars (only during transfer)
-            Constraint::Min(10),    // Content
-            log_height,             // Log panel (collapsed or expanded)
-            command_input_height,   // Command input line
-            Constraint::Length(1),  // Footer
+            Constraint::Length(1), // Status bar
+            progress_height,       // Progress bars (only during transfer)
+            Constraint::Min(10),   // Content
+            log_height,            // Log panel (collapsed or expanded)
+            command_input_height,  // Command input line
+            Constraint::Length(1), // Footer
         ])
         .split(frame.area());
 
@@ -106,7 +106,9 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let status = Line::from(vec![
         Span::styled(
             format!(" [{}] ", app.phase),
-            Style::default().fg(phase_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(phase_color)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
             "Tables {}/{} | ",
@@ -125,8 +127,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
 
-    let status_bar = Paragraph::new(status)
-        .style(Style::default().bg(Color::DarkGray));
+    let status_bar = Paragraph::new(status).style(Style::default().bg(Color::DarkGray));
 
     frame.render_widget(status_bar, area);
 }
@@ -145,11 +146,7 @@ fn render_progress_bars(frame: &mut Frame, app: &App, area: Rect) {
     let filled = ((rows_percent / 100.0) * bar_width as f64) as usize;
     let empty = bar_width.saturating_sub(filled);
 
-    let bar = format!(
-        "[{}{}]",
-        "█".repeat(filled),
-        "░".repeat(empty),
-    );
+    let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(empty),);
 
     // Phase-specific message
     let phase_msg = match app.phase {
@@ -165,7 +162,9 @@ fn render_progress_bars(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(
             format!("{:5.1}%", rows_percent),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" │ "),
         Span::styled(
@@ -181,12 +180,8 @@ fn render_progress_bars(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(phase_msg, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let progress = Paragraph::new(vec![
-        Line::from(""),
-        progress_line,
-        Line::from(""),
-    ])
-    .block(Block::default().borders(Borders::BOTTOM));
+    let progress = Paragraph::new(vec![Line::from(""), progress_line, Line::from("")])
+        .block(Block::default().borders(Borders::BOTTOM));
 
     frame.render_widget(progress, area);
 }
@@ -197,8 +192,8 @@ fn render_content(frame: &mut Frame, app: &App, area: Rect) {
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(40),      // Transcript
-            Constraint::Length(30),   // Side panel
+            Constraint::Min(40),    // Transcript
+            Constraint::Length(30), // Side panel
         ])
         .split(area);
 
@@ -222,10 +217,10 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         .take(visible_height)
         .map(|entry| {
             let icon_style = match entry.icon {
-                '\u{2713}' => Style::default().fg(Color::Green),  // Check
-                '\u{2717}' => Style::default().fg(Color::Red),    // X
+                '\u{2713}' => Style::default().fg(Color::Green), // Check
+                '\u{2717}' => Style::default().fg(Color::Red),   // X
                 '\u{23F3}' => Style::default().fg(Color::Yellow), // Hourglass
-                _ => Style::default().fg(Color::Cyan),            // Arrow
+                _ => Style::default().fg(Color::Cyan),           // Arrow
             };
 
             let mut spans = vec![
@@ -246,12 +241,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let title = format!(" Transcript ({}) ", app.transcript.len());
-    let transcript = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        );
+    let transcript = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
 
     frame.render_widget(transcript, area);
 }
@@ -261,8 +251,8 @@ fn render_side_panel(frame: &mut Frame, app: &App, area: Rect) {
     let side_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),  // Config summary
-            Constraint::Min(5),     // Throughput sparkline
+            Constraint::Length(9), // Config summary
+            Constraint::Min(5),    // Throughput sparkline
         ])
         .split(area);
 
@@ -292,27 +282,24 @@ fn render_side_panel(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     // Get config filename for title
-    let config_filename = app.config_summary.config_path
+    let config_filename = app
+        .config_summary
+        .config_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "config".to_string());
 
-    let config_para = Paragraph::new(config_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", config_filename)),
-        );
+    let config_para = Paragraph::new(config_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", config_filename)),
+    );
 
     frame.render_widget(config_para, side_chunks[0]);
 
     // Throughput sparkline
     let sparkline = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Throughput "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" Throughput "))
         .data(&app.throughput_history)
         .style(Style::default().fg(Color::Cyan));
 
@@ -355,11 +342,7 @@ fn render_logs(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let logs = Paragraph::new(log_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
 
     frame.render_widget(logs, area);
@@ -465,8 +448,7 @@ fn render_suggestions(frame: &mut Frame, app: &App, input_area: Rect) {
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().style(Style::default().bg(Color::DarkGray)));
+    let list = List::new(items).block(Block::default().style(Style::default().bg(Color::DarkGray)));
 
     frame.render_widget(list, dropdown_area);
 }
@@ -483,18 +465,17 @@ fn render_palette(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3),  // Search input
-            Constraint::Min(1),     // Results
+            Constraint::Length(3), // Search input
+            Constraint::Min(1),    // Results
         ])
         .split(area);
 
     // Search input
-    let input = Paragraph::new(format!("> {}", app.palette_query))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Command Palette "),
-        );
+    let input = Paragraph::new(format!("> {}", app.palette_query)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Command Palette "),
+    );
     frame.render_widget(input, area);
 
     // Action list
@@ -512,10 +493,7 @@ fn render_palette(frame: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            let mut spans = vec![
-                Span::raw("  "),
-                Span::styled(action.label(), style),
-            ];
+            let mut spans = vec![Span::raw("  "), Span::styled(action.label(), style)];
 
             if let Some(shortcut) = action.shortcut() {
                 spans.push(Span::styled(
@@ -548,7 +526,10 @@ fn render_help(frame: &mut Frame) {
 
     let help_text = vec![
         Line::from(""),
-        Line::from(Span::styled(" Keyboard Shortcuts ", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            " Keyboard Shortcuts ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("  /         ", Style::default().fg(Color::Cyan)),
@@ -579,7 +560,10 @@ fn render_help(frame: &mut Frame) {
             Span::raw("Scroll logs"),
         ]),
         Line::from(""),
-        Line::from(Span::styled(" Slash Commands ", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            " Slash Commands ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled("  /run      ", Style::default().fg(Color::Green)),
@@ -617,13 +601,12 @@ fn render_help(frame: &mut Frame) {
         Line::from(""),
     ];
 
-    let help = Paragraph::new(help_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Help ")
-                .style(Style::default().bg(Color::DarkGray)),
-        );
+    let help = Paragraph::new(help_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Help ")
+            .style(Style::default().bg(Color::DarkGray)),
+    );
 
     frame.render_widget(help, area);
 }
@@ -651,11 +634,21 @@ fn render_wizard(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             " Configuration Wizard ",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
         )),
         Line::from(vec![
-            Span::styled(format!(" {} ", file_action), Style::default().fg(Color::Gray)),
-            Span::styled(format!("{}", file_path), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} ", file_action),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("{}", file_path),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(format!(
             " Step {} of {} ",
@@ -680,9 +673,10 @@ fn render_wizard(frame: &mut Frame, app: &App) {
     // Current prompt
     let prompt = wizard.get_prompt();
 
-    lines.push(Line::from(vec![
-        Span::styled(&prompt, Style::default().fg(Color::Yellow)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        &prompt,
+        Style::default().fg(Color::Yellow),
+    )]));
 
     // Check if this is an enum selection step
     if wizard.step.is_enum_selection() {
@@ -693,14 +687,19 @@ fn render_wizard(frame: &mut Frame, app: &App) {
             let is_selected = i == wizard.selected_option;
             let marker = if is_selected { "▸ " } else { "  " };
             let style = if is_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
             lines.push(Line::from(vec![
                 Span::styled(format!(" {}", marker), style),
                 Span::styled(option.label, style),
-                Span::styled(format!("  {}", option.description), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  {}", option.description),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
         lines.push(Line::from(""));
@@ -752,13 +751,12 @@ fn render_wizard(frame: &mut Frame, app: &App) {
         ]));
     }
 
-    let wizard_widget = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Wizard ")
-                .style(Style::default().bg(Color::Black)),
-        );
+    let wizard_widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Wizard ")
+            .style(Style::default().bg(Color::Black)),
+    );
 
     frame.render_widget(wizard_widget, area);
 }

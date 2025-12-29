@@ -403,7 +403,10 @@ impl Orchestrator {
 
     /// Extract schema from the source database.
     pub async fn extract_schema(&self) -> Result<Vec<Table>> {
-        let tables = self.source.extract_schema(&self.config.source.schema).await?;
+        let tables = self
+            .source
+            .extract_schema(&self.config.source.schema)
+            .await?;
 
         // Filter tables based on include/exclude patterns
         let filtered: Vec<_> = tables
@@ -554,7 +557,10 @@ impl Orchestrator {
             if matches!(self.config.migration.target_mode, TargetMode::Upsert) {
                 info!("Phase 3: [DRY RUN] Would detect and sync changes with batch hashing");
             } else {
-                info!("Phase 3: [DRY RUN] Would transfer data for {} tables", tables.len());
+                info!(
+                    "Phase 3: [DRY RUN] Would transfer data for {} tables",
+                    tables.len()
+                );
             }
             Ok(())
         };
@@ -980,7 +986,11 @@ impl Orchestrator {
                                 target_mode: self.config.migration.target_mode.clone(),
                                 target_schema: self.config.target.schema.clone(),
                                 use_hash_detection: self.config.migration.use_hash_detection(),
-                                row_hash_column: self.config.migration.get_row_hash_column().to_string(),
+                                row_hash_column: self
+                                    .config
+                                    .migration
+                                    .get_row_hash_column()
+                                    .to_string(),
                                 hash_text_columns: self.config.migration.hash_text_columns,
                             };
 
@@ -1051,7 +1061,10 @@ impl Orchestrator {
         while let Some(join_result) = join_set.join_next().await {
             // Check for cancellation - abort remaining tasks
             if cancel.is_cancelled() {
-                info!("Cancellation detected, aborting remaining {} tasks", join_set.len());
+                info!(
+                    "Cancellation detected, aborting remaining {} tasks",
+                    join_set.len()
+                );
                 join_set.abort_all();
                 // Save current state before breaking
                 self.save_state(state)?;
@@ -1609,13 +1622,11 @@ mod tests {
             rows_skipped: 0,
             rows_per_second: 1777,
             failed_tables: vec!["dbo.Orders".into(), "dbo.Items".into()],
-            table_errors: vec![
-                TableError {
-                    table: "dbo.Orders".into(),
-                    error_type: "transfer".into(),
-                    message: "Connection lost".into(),
-                },
-            ],
+            table_errors: vec![TableError {
+                table: "dbo.Orders".into(),
+                error_type: "transfer".into(),
+                message: "Connection lost".into(),
+            }],
             error: None,
             error_type: None,
             recoverable: Some(true),

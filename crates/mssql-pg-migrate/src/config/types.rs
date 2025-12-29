@@ -503,8 +503,7 @@ impl MigrationConfig {
         let memory_budget_bytes_u64 =
             (resources.total_memory_bytes as f64 * memory_budget_pct) as u64;
         // Saturate to usize::MAX on 32-bit systems to prevent panic
-        let memory_budget_bytes = usize::try_from(memory_budget_bytes_u64)
-            .unwrap_or(usize::MAX);
+        let memory_budget_bytes = usize::try_from(memory_budget_bytes_u64).unwrap_or(usize::MAX);
         let memory_budget_mb = memory_budget_bytes / (1024 * 1024);
 
         info!(

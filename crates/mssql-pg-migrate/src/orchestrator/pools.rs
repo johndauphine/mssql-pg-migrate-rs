@@ -157,8 +157,14 @@ impl SourcePoolImpl {
         pk_column_count: usize,
     ) -> Result<CompositeRowHashMap> {
         match self {
-            Self::Mssql(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
-            Self::Postgres(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
+            Self::Mssql(p) => {
+                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
+                    .await
+            }
         }
     }
 
@@ -171,8 +177,14 @@ impl SourcePoolImpl {
         max_pk: i64,
     ) -> Result<Vec<Vec<SqlValue>>> {
         match self {
-            Self::Mssql(p) => p.fetch_rows_for_range(table, pk_column, min_pk, max_pk).await,
-            Self::Postgres(p) => p.fetch_rows_for_range(table, pk_column, min_pk, max_pk).await,
+            Self::Mssql(p) => {
+                p.fetch_rows_for_range(table, pk_column, min_pk, max_pk)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.fetch_rows_for_range(table, pk_column, min_pk, max_pk)
+                    .await
+            }
         }
     }
 
@@ -298,8 +310,14 @@ impl TargetPoolImpl {
         row_hash_column: &str,
     ) -> Result<()> {
         match self {
-            Self::Mssql(p) => p.create_table_with_hash(table, target_schema, row_hash_column).await,
-            Self::Postgres(p) => p.create_table_with_hash(table, target_schema, row_hash_column).await,
+            Self::Mssql(p) => {
+                p.create_table_with_hash(table, target_schema, row_hash_column)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.create_table_with_hash(table, target_schema, row_hash_column)
+                    .await
+            }
         }
     }
 
@@ -311,8 +329,14 @@ impl TargetPoolImpl {
         row_hash_column: &str,
     ) -> Result<bool> {
         match self {
-            Self::Mssql(p) => p.ensure_row_hash_column(schema, table, row_hash_column).await,
-            Self::Postgres(p) => p.ensure_row_hash_column(schema, table, row_hash_column).await,
+            Self::Mssql(p) => {
+                p.ensure_row_hash_column(schema, table, row_hash_column)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.ensure_row_hash_column(schema, table, row_hash_column)
+                    .await
+            }
         }
     }
 
@@ -349,7 +373,12 @@ impl TargetPoolImpl {
     }
 
     /// Create an index.
-    pub async fn create_index(&self, table: &Table, idx: &Index, target_schema: &str) -> Result<()> {
+    pub async fn create_index(
+        &self,
+        table: &Table,
+        idx: &Index,
+        target_schema: &str,
+    ) -> Result<()> {
         match self {
             Self::Mssql(p) => p.create_index(table, idx, target_schema).await,
             Self::Postgres(p) => p.create_index(table, idx, target_schema).await,
@@ -457,12 +486,28 @@ impl TargetPoolImpl {
     ) -> Result<u64> {
         match self {
             Self::Mssql(p) => {
-                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-                    .await
+                p.upsert_chunk(
+                    schema,
+                    table,
+                    cols,
+                    pk_cols,
+                    rows,
+                    writer_id,
+                    row_hash_column,
+                )
+                .await
             }
             Self::Postgres(p) => {
-                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-                    .await
+                p.upsert_chunk(
+                    schema,
+                    table,
+                    cols,
+                    pk_cols,
+                    rows,
+                    writer_id,
+                    row_hash_column,
+                )
+                .await
             }
         }
     }
@@ -480,12 +525,28 @@ impl TargetPoolImpl {
     ) -> Result<u64> {
         match self {
             Self::Mssql(p) => {
-                p.upsert_chunk_with_hash(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-                    .await
+                p.upsert_chunk_with_hash(
+                    schema,
+                    table,
+                    cols,
+                    pk_cols,
+                    rows,
+                    writer_id,
+                    row_hash_column,
+                )
+                .await
             }
             Self::Postgres(p) => {
-                p.upsert_chunk_with_hash(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-                    .await
+                p.upsert_chunk_with_hash(
+                    schema,
+                    table,
+                    cols,
+                    pk_cols,
+                    rows,
+                    writer_id,
+                    row_hash_column,
+                )
+                .await
             }
         }
     }
@@ -501,8 +562,14 @@ impl TargetPoolImpl {
         max_pk: Option<i64>,
     ) -> Result<std::collections::HashMap<String, String>> {
         match self {
-            Self::Mssql(p) => p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk).await,
-            Self::Postgres(p) => p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk).await,
+            Self::Mssql(p) => {
+                p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk)
+                    .await
+            }
         }
     }
 
@@ -547,8 +614,14 @@ impl TargetPoolImpl {
         pk_column_count: usize,
     ) -> Result<crate::verify::CompositeRowHashMap> {
         match self {
-            Self::Mssql(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
-            Self::Postgres(p) => p.fetch_row_hashes_with_rownum(query, range, pk_column_count).await,
+            Self::Mssql(p) => {
+                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
+                    .await
+            }
         }
     }
 

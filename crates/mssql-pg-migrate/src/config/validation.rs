@@ -57,15 +57,42 @@ pub fn validate(config: &Config) -> Result<()> {
     validate_nonzero_option(config.migration.workers, "migration.workers")?;
     validate_nonzero_option(config.migration.chunk_size, "migration.chunk_size")?;
     validate_nonzero_option(config.migration.max_partitions, "migration.max_partitions")?;
-    validate_nonzero_option(config.migration.read_ahead_buffers, "migration.read_ahead_buffers")?;
-    validate_nonzero_option(config.migration.write_ahead_writers, "migration.write_ahead_writers")?;
-    validate_nonzero_option(config.migration.parallel_readers, "migration.parallel_readers")?;
-    validate_nonzero_option(config.migration.max_mssql_connections, "migration.max_mssql_connections")?;
-    validate_nonzero_option(config.migration.max_pg_connections, "migration.max_pg_connections")?;
-    validate_nonzero_option(config.migration.finalizer_concurrency, "migration.finalizer_concurrency")?;
-    validate_nonzero_option(config.migration.copy_buffer_rows, "migration.copy_buffer_rows")?;
-    validate_nonzero_option(config.migration.upsert_batch_size, "migration.upsert_batch_size")?;
-    validate_nonzero_option(config.migration.upsert_parallel_tasks, "migration.upsert_parallel_tasks")?;
+    validate_nonzero_option(
+        config.migration.read_ahead_buffers,
+        "migration.read_ahead_buffers",
+    )?;
+    validate_nonzero_option(
+        config.migration.write_ahead_writers,
+        "migration.write_ahead_writers",
+    )?;
+    validate_nonzero_option(
+        config.migration.parallel_readers,
+        "migration.parallel_readers",
+    )?;
+    validate_nonzero_option(
+        config.migration.max_mssql_connections,
+        "migration.max_mssql_connections",
+    )?;
+    validate_nonzero_option(
+        config.migration.max_pg_connections,
+        "migration.max_pg_connections",
+    )?;
+    validate_nonzero_option(
+        config.migration.finalizer_concurrency,
+        "migration.finalizer_concurrency",
+    )?;
+    validate_nonzero_option(
+        config.migration.copy_buffer_rows,
+        "migration.copy_buffer_rows",
+    )?;
+    validate_nonzero_option(
+        config.migration.upsert_batch_size,
+        "migration.upsert_batch_size",
+    )?;
+    validate_nonzero_option(
+        config.migration.upsert_parallel_tasks,
+        "migration.upsert_parallel_tasks",
+    )?;
 
     // Validate table filter patterns for SQL injection prevention
     for pattern in &config.migration.include_tables {
@@ -241,7 +268,10 @@ mod tests {
         config.migration.write_ahead_writers = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("write_ahead_writers"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("write_ahead_writers"));
     }
 
     #[test]
@@ -250,7 +280,10 @@ mod tests {
         config.migration.max_mssql_connections = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_mssql_connections"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max_mssql_connections"));
     }
 
     #[test]
@@ -277,7 +310,10 @@ mod tests {
         config.migration.read_ahead_buffers = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("read_ahead_buffers"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("read_ahead_buffers"));
     }
 
     #[test]
@@ -286,7 +322,10 @@ mod tests {
         config.migration.max_pg_connections = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("max_pg_connections"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("max_pg_connections"));
     }
 
     #[test]
@@ -295,7 +334,10 @@ mod tests {
         config.migration.finalizer_concurrency = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("finalizer_concurrency"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("finalizer_concurrency"));
     }
 
     #[test]
@@ -313,7 +355,10 @@ mod tests {
         config.migration.upsert_batch_size = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("upsert_batch_size"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("upsert_batch_size"));
     }
 
     #[test]
@@ -322,7 +367,10 @@ mod tests {
         config.migration.upsert_parallel_tasks = Some(0);
         let result = validate(&config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("upsert_parallel_tasks"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("upsert_parallel_tasks"));
     }
 
     #[test]
@@ -373,7 +421,9 @@ mod tests {
     fn test_special_chars_in_pattern_rejected() {
         let mut config = valid_config();
         // Test various SQL injection characters
-        for pattern in &["Table;", "Table--", "Table/*", "Table'", "Table\"", "Table\\", "Table()", "Table[]"] {
+        for pattern in &[
+            "Table;", "Table--", "Table/*", "Table'", "Table\"", "Table\\", "Table()", "Table[]",
+        ] {
             config.migration.include_tables = vec![pattern.to_string()];
             let result = validate(&config);
             assert!(result.is_err(), "Pattern '{}' should be rejected", pattern);

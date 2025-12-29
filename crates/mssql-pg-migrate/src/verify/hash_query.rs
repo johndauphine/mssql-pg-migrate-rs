@@ -24,9 +24,9 @@
 //! When partition hashes differ, the partition is marked for Tier 2/3 drill-down
 //! even if row counts match (indicating updates rather than inserts/deletes).
 
-use crate::source::Table;
 use super::normalize::mssql_row_hash_expr;
 use super::normalize_pg::pg_row_hash_expr;
+use crate::source::Table;
 
 // ============================================================================
 // Helper functions for building SQL clauses
@@ -645,7 +645,8 @@ mod tests {
     #[test]
     fn test_postgres_row_hashes_with_rownum_query() {
         let pk_columns = vec!["id".to_string()];
-        let query = postgres_row_hashes_with_rownum_query("public", "users", &pk_columns, "row_hash");
+        let query =
+            postgres_row_hashes_with_rownum_query("public", "users", &pk_columns, "row_hash");
 
         assert!(query.contains("\"row_hash\""));
         assert!(query.contains("$1"));
@@ -709,7 +710,11 @@ mod tests {
     fn test_postgres_ntile_partition_query_with_hash() {
         let pk_columns = vec!["id".to_string()];
         let query = postgres_ntile_partition_query_with_hash(
-            "public", "users", &pk_columns, 10, "row_hash"
+            "public",
+            "users",
+            &pk_columns,
+            10,
+            "row_hash",
         );
 
         assert!(query.contains("NTILE(10)"));
@@ -750,7 +755,10 @@ mod tests {
     fn test_postgres_row_count_with_rownum_query_with_hash() {
         let pk_columns = vec!["id".to_string()];
         let query = postgres_row_count_with_rownum_query_with_hash(
-            "public", "users", &pk_columns, "row_hash"
+            "public",
+            "users",
+            &pk_columns,
+            "row_hash",
         );
 
         assert!(query.contains("ROW_NUMBER()"));

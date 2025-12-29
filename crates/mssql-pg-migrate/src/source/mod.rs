@@ -768,12 +768,7 @@ impl MssqlPool {
     /// Execute a count query and return row_count.
     ///
     /// Used for Tier 1/2 quick verification.
-    pub async fn execute_count_query(
-        &self,
-        query: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<i64> {
+    pub async fn execute_count_query(&self, query: &str, min_pk: i64, max_pk: i64) -> Result<i64> {
         let mut client = self.get_client().await?;
 
         let mut q = Query::new(query);
@@ -806,12 +801,16 @@ impl MssqlPool {
         q.bind(max_pk);
 
         let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
-        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+        let rows = result
+            .into_first_result()
+            .await
+            .map_err(MigrateError::Source)?;
 
         let mut hashes = std::collections::HashMap::new();
         for row in rows {
             // Try i32 first (common case), then i64 for BIGINT columns
-            let pk: Option<i64> = row.get::<i32, _>(0)
+            let pk: Option<i64> = row
+                .get::<i32, _>(0)
                 .map(|v| v as i64)
                 .or_else(|| row.get::<i64, _>(0));
             let hash: Option<&str> = row.get(1);
@@ -825,10 +824,7 @@ impl MssqlPool {
     }
 
     /// Get PK boundaries (min, max, count) for a table.
-    pub async fn get_pk_bounds(
-        &self,
-        query: &str,
-    ) -> Result<(i64, i64, i64)> {
+    pub async fn get_pk_bounds(&self, query: &str) -> Result<(i64, i64, i64)> {
         let mut client = self.get_client().await?;
 
         let result = client
@@ -838,11 +834,14 @@ impl MssqlPool {
 
         if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
             // Try i64 first (query uses CAST AS BIGINT), fallback to i32 for compatibility
-            let min_pk: i64 = row.get::<i64, _>(0)
+            let min_pk: i64 = row
+                .get::<i64, _>(0)
                 .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
-            let max_pk: i64 = row.get::<i64, _>(1)
+            let max_pk: i64 = row
+                .get::<i64, _>(1)
                 .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
-            let row_count: i64 = row.get::<i64, _>(2)
+            let row_count: i64 = row
+                .get::<i64, _>(2)
                 .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
             Ok((min_pk, max_pk, row_count))
         } else {
@@ -965,10 +964,7 @@ impl MssqlPool {
     ///
     /// Returns a vector of (partition_id, row_count, partition_hash) tuples for Tier 1.
     /// The partition_hash enables detection of updates even when row counts match.
-    pub async fn execute_ntile_partition_query(
-        &self,
-        query: &str,
-    ) -> Result<Vec<(i64, i64, i64)>> {
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
         let mut client = self.get_client().await?;
 
         let result = client
@@ -976,7 +972,10 @@ impl MssqlPool {
             .await
             .map_err(MigrateError::Source)?;
 
-        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+        let rows = result
+            .into_first_result()
+            .await
+            .map_err(MigrateError::Source)?;
 
         let mut partitions = Vec::new();
         for row in rows {
@@ -1063,7 +1062,10 @@ impl MssqlPool {
         q.bind(range.end_row);
 
         let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
-        let rows = result.into_first_result().await.map_err(MigrateError::Source)?;
+        let rows = result
+            .into_first_result()
+            .await
+            .map_err(MigrateError::Source)?;
 
         let mut hashes = HashMap::new();
         for row in rows {

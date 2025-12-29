@@ -6,19 +6,22 @@
 //! - Streaming log output
 //! - Interactive migration control
 
+mod actions;
 mod app;
 mod events;
-mod ui;
-mod actions;
 mod logging;
+mod ui;
 mod widgets;
 mod wizard;
 
-pub use app::{App, InputMode, SlashCommand, Suggestion};
-pub use wizard::{WizardState, WizardStep};
-pub use events::{AppEvent, EventHandler, SharedInputMode, INPUT_MODE_NORMAL, INPUT_MODE_COMMAND, INPUT_MODE_FILE, INPUT_MODE_WIZARD};
 pub use actions::Action;
+pub use app::{App, InputMode, SlashCommand, Suggestion};
+pub use events::{
+    AppEvent, EventHandler, SharedInputMode, INPUT_MODE_COMMAND, INPUT_MODE_FILE,
+    INPUT_MODE_NORMAL, INPUT_MODE_WIZARD,
+};
 pub use logging::TuiLogLayer;
+pub use wizard::{WizardState, WizardStep};
 
 use crate::tui::ui::render;
 use crossterm::{
@@ -29,8 +32,8 @@ use crossterm::{
 use mssql_pg_migrate::{Config, MigrateError};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
-use std::path::Path;
 use std::panic;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -41,24 +44,29 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 /// Setup the terminal for TUI mode.
 pub fn setup_terminal() -> Result<Tui, MigrateError> {
-    enable_raw_mode().map_err(|e| MigrateError::Config(format!("Failed to enable raw mode: {}", e)))?;
+    enable_raw_mode()
+        .map_err(|e| MigrateError::Config(format!("Failed to enable raw mode: {}", e)))?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| MigrateError::Config(format!("Failed to enter alternate screen: {}", e)))?;
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(|e| MigrateError::Config(format!("Failed to create terminal: {}", e)))
+    Terminal::new(backend)
+        .map_err(|e| MigrateError::Config(format!("Failed to create terminal: {}", e)))
 }
 
 /// Restore the terminal to normal mode.
 pub fn restore_terminal(terminal: &mut Tui) -> Result<(), MigrateError> {
-    disable_raw_mode().map_err(|e| MigrateError::Config(format!("Failed to disable raw mode: {}", e)))?;
+    disable_raw_mode()
+        .map_err(|e| MigrateError::Config(format!("Failed to disable raw mode: {}", e)))?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
     )
     .map_err(|e| MigrateError::Config(format!("Failed to leave alternate screen: {}", e)))?;
-    terminal.show_cursor().map_err(|e| MigrateError::Config(format!("Failed to show cursor: {}", e)))?;
+    terminal
+        .show_cursor()
+        .map_err(|e| MigrateError::Config(format!("Failed to show cursor: {}", e)))?;
     Ok(())
 }
 
@@ -141,7 +149,8 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
         // Wait for at least one event
         if let Some(event) = event_rx.recv().await {
             // Check if this is a progress event with table completion
-            let is_table_completion = matches!(&event, AppEvent::Progress(p) if p.current_table.is_some());
+            let is_table_completion =
+                matches!(&event, AppEvent::Progress(p) if p.current_table.is_some());
 
             match app.handle_event(event).await {
                 Ok(should_quit) => {

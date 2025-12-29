@@ -43,7 +43,10 @@ impl From<std::io::Error> for WizardError {
 
 impl From<dialoguer::Error> for WizardError {
     fn from(e: dialoguer::Error) -> Self {
-        Self::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        Self::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
     }
 }
 
@@ -96,10 +99,8 @@ pub async fn run_wizard(output: &Path, advanced: bool, force: bool) -> WizardRes
     let target = prompt_target_config(existing_config.as_ref().map(|c| &c.target))?;
 
     // Prompt for migration configuration
-    let migration = prompt_migration_config(
-        existing_config.as_ref().map(|c| &c.migration),
-        advanced,
-    )?;
+    let migration =
+        prompt_migration_config(existing_config.as_ref().map(|c| &c.migration), advanced)?;
 
     // Build the config
     let config = Config {
@@ -185,7 +186,11 @@ fn prompt_source_config(existing: Option<&SourceConfig>) -> WizardResult<SourceC
 
     let schema: String = Input::new()
         .with_prompt("  Schema")
-        .default(existing.map(|c| c.schema.clone()).unwrap_or_else(|| "dbo".to_string()))
+        .default(
+            existing
+                .map(|c| c.schema.clone())
+                .unwrap_or_else(|| "dbo".to_string()),
+        )
         .interact_text()?;
 
     let encrypt = Confirm::new()
@@ -246,7 +251,11 @@ fn prompt_target_config(existing: Option<&TargetConfig>) -> WizardResult<TargetC
 
     let schema: String = Input::new()
         .with_prompt("  Schema")
-        .default(existing.map(|c| c.schema.clone()).unwrap_or_else(|| "public".to_string()))
+        .default(
+            existing
+                .map(|c| c.schema.clone())
+                .unwrap_or_else(|| "public".to_string()),
+        )
         .interact_text()?;
 
     let ssl_modes = &["require", "disable", "verify-ca", "verify-full"];
@@ -306,7 +315,11 @@ fn prompt_migration_config(
     // Table filters
     let include_str: String = Input::new()
         .with_prompt("  Include tables (comma-separated, blank for all)")
-        .default(existing.map(|c| c.include_tables.join(", ")).unwrap_or_default())
+        .default(
+            existing
+                .map(|c| c.include_tables.join(", "))
+                .unwrap_or_default(),
+        )
         .allow_empty(true)
         .interact_text()?;
 
@@ -318,7 +331,11 @@ fn prompt_migration_config(
 
     let exclude_str: String = Input::new()
         .with_prompt("  Exclude tables (comma-separated, blank for none)")
-        .default(existing.map(|c| c.exclude_tables.join(", ")).unwrap_or_default())
+        .default(
+            existing
+                .map(|c| c.exclude_tables.join(", "))
+                .unwrap_or_default(),
+        )
         .allow_empty(true)
         .interact_text()?;
 
@@ -341,7 +358,11 @@ fn prompt_migration_config(
 
     let create_check_constraints = Confirm::new()
         .with_prompt("  Create check constraints after transfer")
-        .default(existing.map(|c| c.create_check_constraints).unwrap_or(false))
+        .default(
+            existing
+                .map(|c| c.create_check_constraints)
+                .unwrap_or(false),
+        )
         .interact()?;
 
     // Start with defaults, then set what we've gathered
@@ -359,7 +380,8 @@ fn prompt_migration_config(
         println!("  (Leave blank to use auto-tuned values)");
 
         config.workers = prompt_optional_usize("  Workers", existing.and_then(|c| c.workers))?;
-        config.chunk_size = prompt_optional_usize("  Chunk size", existing.and_then(|c| c.chunk_size))?;
+        config.chunk_size =
+            prompt_optional_usize("  Chunk size", existing.and_then(|c| c.chunk_size))?;
 
         let memory_budget: u8 = Input::new()
             .with_prompt("  Memory budget percent (1-100)")
@@ -382,12 +404,28 @@ fn prompt_migration_config(
             .default(existing.map(|c| c.use_unlogged_tables).unwrap_or(false))
             .interact()?;
 
-        config.max_partitions = prompt_optional_usize("  Max partitions", existing.and_then(|c| c.max_partitions))?;
-        config.parallel_readers = prompt_optional_usize("  Parallel readers", existing.and_then(|c| c.parallel_readers))?;
-        config.write_ahead_writers = prompt_optional_usize("  Parallel writers", existing.and_then(|c| c.write_ahead_writers))?;
-        config.read_ahead_buffers = prompt_optional_usize("  Read-ahead buffers", existing.and_then(|c| c.read_ahead_buffers))?;
-        config.max_mssql_connections = prompt_optional_usize("  Max MSSQL connections", existing.and_then(|c| c.max_mssql_connections))?;
-        config.max_pg_connections = prompt_optional_usize("  Max PostgreSQL connections", existing.and_then(|c| c.max_pg_connections))?;
+        config.max_partitions =
+            prompt_optional_usize("  Max partitions", existing.and_then(|c| c.max_partitions))?;
+        config.parallel_readers = prompt_optional_usize(
+            "  Parallel readers",
+            existing.and_then(|c| c.parallel_readers),
+        )?;
+        config.write_ahead_writers = prompt_optional_usize(
+            "  Parallel writers",
+            existing.and_then(|c| c.write_ahead_writers),
+        )?;
+        config.read_ahead_buffers = prompt_optional_usize(
+            "  Read-ahead buffers",
+            existing.and_then(|c| c.read_ahead_buffers),
+        )?;
+        config.max_mssql_connections = prompt_optional_usize(
+            "  Max MSSQL connections",
+            existing.and_then(|c| c.max_mssql_connections),
+        )?;
+        config.max_pg_connections = prompt_optional_usize(
+            "  Max PostgreSQL connections",
+            existing.and_then(|c| c.max_pg_connections),
+        )?;
     }
 
     println!();
@@ -403,15 +441,15 @@ fn prompt_password(prompt: &str, has_existing: bool) -> WizardResult<String> {
             .interact()?;
         Ok(input)
     } else {
-        let input: String = Password::new()
-            .with_prompt(prompt)
-            .interact()?;
+        let input: String = Password::new().with_prompt(prompt).interact()?;
         Ok(input)
     }
 }
 
 fn prompt_optional_usize(prompt: &str, existing: Option<usize>) -> WizardResult<Option<usize>> {
-    let default_str = existing.map(|v| v.to_string()).unwrap_or_else(|| "auto".to_string());
+    let default_str = existing
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "auto".to_string());
 
     let input: String = Input::new()
         .with_prompt(prompt)
@@ -521,7 +559,11 @@ async fn test_connections(config: &Config) -> WizardResult<()> {
         Ok(health) => {
             println!(
                 "  Source (MSSQL): {} ({}ms)",
-                if health.source_connected { "OK" } else { "FAILED" },
+                if health.source_connected {
+                    "OK"
+                } else {
+                    "FAILED"
+                },
                 health.source_latency_ms
             );
             if let Some(ref err) = health.source_error {
@@ -530,7 +572,11 @@ async fn test_connections(config: &Config) -> WizardResult<()> {
 
             println!(
                 "  Target (PostgreSQL): {} ({}ms)",
-                if health.target_connected { "OK" } else { "FAILED" },
+                if health.target_connected {
+                    "OK"
+                } else {
+                    "FAILED"
+                },
                 health.target_latency_ms
             );
             if let Some(ref err) = health.target_error {
@@ -564,8 +610,7 @@ fn write_config(config: &Config, path: &Path) -> WizardResult<()> {
 
 "#;
 
-    let yaml = serde_yaml::to_string(config)
-        .map_err(|e| WizardError::Config(e.to_string()))?;
+    let yaml = serde_yaml::to_string(config).map_err(|e| WizardError::Config(e.to_string()))?;
 
     std::fs::write(path, format!("{}{}", header, yaml))?;
 
