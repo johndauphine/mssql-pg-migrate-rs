@@ -1837,4 +1837,175 @@ mod tests {
         assert!(!update_set_part.contains("[tenant_id] = source.[tenant_id]"));
         assert!(!update_set_part.contains("[user_id] = source.[user_id]"));
     }
+
+    #[test]
+    fn test_build_staging_merge_sql_null_safe_change_detection() {
+        let cols = vec!["id".to_string(), "nullable_col".to_string()];
+        let pk_cols = vec!["id".to_string()];
+
+        let sql = MssqlTargetPool::build_staging_merge_sql(
+            "[dbo].[test]",
+            "[dbo].[_staging_test_0]",
+            &cols,
+            &pk_cols,
+        );
+
+        // Should have NULL-safe change detection pattern for nullable columns
+        // Pattern: (col <> col OR (col IS NULL AND col IS NOT NULL) OR (col IS NOT NULL AND col IS NULL))
+        assert!(sql.contains("target.[nullable_col] <> source.[nullable_col]"));
+        assert!(sql.contains("target.[nullable_col] IS NULL AND source.[nullable_col] IS NOT NULL"));
+        assert!(sql.contains("target.[nullable_col] IS NOT NULL AND source.[nullable_col] IS NULL"));
+    }
+
+    #[test]
+    fn test_partition_rows_by_string_size() {
+        // Test helper to simulate the partitioning logic in bulk_insert_to_table
+        let normal_row1 = vec![
+            SqlValue::I32(1),
+            SqlValue::String("short".to_string()),
+        ];
+        let normal_row2 = vec![
+            SqlValue::I32(2),
+            SqlValue::String("also short".to_string()),
+        ];
+        let oversized_row = vec![
+            SqlValue::I32(3),
+            SqlValue::String("x".repeat(40000)), // 80000 UTF-16 bytes > 65535 limit
+        ];
+        let rows = vec![normal_row1.clone(), oversized_row.clone(), normal_row2.clone()];
+
+        // Partition rows (mimics bulk_insert_to_table logic)
+        let mut bulk_rows = Vec::new();
+        let mut oversized_rows = Vec::new();
+        for row in &rows {
+            if MssqlTargetPool::row_has_oversized_strings(row) {
+                oversized_rows.push(row.clone());
+            } else {
+                bulk_rows.push(row.clone());
+            }
+        }
+
+        // Should partition correctly
+        assert_eq!(bulk_rows.len(), 2);
+        assert_eq!(oversized_rows.len(), 1);
+
+        // Verify correct rows in each partition
+        assert_eq!(bulk_rows[0], normal_row1);
+        assert_eq!(bulk_rows[1], normal_row2);
+        assert_eq!(oversized_rows[0], oversized_row);
+    }
+
+    #[test]
+    fn test_partition_rows_all_normal() {
+        let rows: Vec<Vec<SqlValue>> = (0..100)
+            .map(|i| vec![
+                SqlValue::I32(i),
+                SqlValue::String(format!("row_{}", i)),
+            ])
+            .collect();
+
+        let mut bulk_rows = Vec::new();
+        let mut oversized_rows = Vec::new();
+        for row in &rows {
+            if MssqlTargetPool::row_has_oversized_strings(row) {
+                oversized_rows.push(row.clone());
+            } else {
+                bulk_rows.push(row.clone());
+            }
+        }
+
+        assert_eq!(bulk_rows.len(), 100);
+        assert_eq!(oversized_rows.len(), 0);
+    }
+
+    #[test]
+    fn test_partition_rows_all_oversized() {
+        let oversized_string = "x".repeat(40000);
+        let rows: Vec<Vec<SqlValue>> = (0..5)
+            .map(|i| vec![
+                SqlValue::I32(i),
+                SqlValue::String(oversized_string.clone()),
+            ])
+            .collect();
+
+        let mut bulk_rows = Vec::new();
+        let mut oversized_rows = Vec::new();
+        for row in &rows {
+            if MssqlTargetPool::row_has_oversized_strings(row) {
+                oversized_rows.push(row.clone());
+            } else {
+                bulk_rows.push(row.clone());
+            }
+        }
+
+        assert_eq!(bulk_rows.len(), 0);
+        assert_eq!(oversized_rows.len(), 5);
+    }
+
+    #[test]
+    fn test_partition_rows_empty() {
+        let rows: Vec<Vec<SqlValue>> = vec![];
+
+        let mut bulk_rows = Vec::new();
+        let mut oversized_rows = Vec::new();
+        for row in &rows {
+            if MssqlTargetPool::row_has_oversized_strings(row) {
+                oversized_rows.push(row.clone());
+            } else {
+                bulk_rows.push(row.clone());
+            }
+        }
+
+        assert_eq!(bulk_rows.len(), 0);
+        assert_eq!(oversized_rows.len(), 0);
+    }
+
+    #[test]
+    fn test_build_staging_merge_sql_multiple_non_pk_columns() {
+        let cols = vec![
+            "id".to_string(),
+            "col1".to_string(),
+            "col2".to_string(),
+            "col3".to_string(),
+        ];
+        let pk_cols = vec!["id".to_string()];
+
+        let sql = MssqlTargetPool::build_staging_merge_sql(
+            "[dbo].[test]",
+            "[dbo].[_staging_test_0]",
+            &cols,
+            &pk_cols,
+        );
+
+        // Should have change detection with OR between columns
+        assert!(sql.contains(" OR "));
+
+        // All non-PK columns should be in change detection
+        assert!(sql.contains("target.[col1]"));
+        assert!(sql.contains("target.[col2]"));
+        assert!(sql.contains("target.[col3]"));
+
+        // All non-PK columns should be in UPDATE SET
+        assert!(sql.contains("[col1] = source.[col1]"));
+        assert!(sql.contains("[col2] = source.[col2]"));
+        assert!(sql.contains("[col3] = source.[col3]"));
+    }
+
+    #[test]
+    fn test_is_deadlock_error_uses_tiberius_builtin() {
+        // Note: is_deadlock_error uses tiberius::Error::is_deadlock() which checks error code 1205.
+        // We can't easily unit test this without creating actual tiberius Server errors,
+        // but we verify the function exists and compiles correctly.
+        // Integration tests should cover actual deadlock scenarios.
+
+        // Test with non-server errors (should return false)
+        let io_error = tiberius::error::Error::Io {
+            kind: std::io::ErrorKind::ConnectionRefused,
+            message: "connection refused".to_string(),
+        };
+        assert!(!MssqlTargetPool::is_deadlock_error(&io_error));
+
+        let protocol_error = tiberius::error::Error::Protocol("protocol error".into());
+        assert!(!MssqlTargetPool::is_deadlock_error(&protocol_error));
+    }
 }

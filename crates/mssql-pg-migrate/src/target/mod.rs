@@ -125,7 +125,7 @@ pub trait TargetPool: Send + Sync {
 }
 
 /// SQL value enum for type-safe row handling.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Null(SqlNullType),
     Bool(bool),
@@ -145,7 +145,7 @@ pub enum SqlValue {
 }
 
 /// Type hint for NULL values to ensure correct PostgreSQL encoding.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SqlNullType {
     Bool,
     I16,
