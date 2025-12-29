@@ -17,8 +17,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
-use md5::Md5;
 use md5::Digest;
+use md5::Md5;
 use rustls::ClientConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -192,7 +192,11 @@ pub enum SqlNullType {
 /// `skip_indices` contains additional column indices to skip (e.g., text columns).
 ///
 /// Returns a 32-character lowercase hex string.
-pub fn calculate_row_hash(row: &[SqlValue], pk_indices: &[usize], skip_indices: &[usize]) -> String {
+pub fn calculate_row_hash(
+    row: &[SqlValue],
+    pk_indices: &[usize],
+    skip_indices: &[usize],
+) -> String {
     let mut hasher = Md5::new();
     let mut first = true;
 
@@ -396,18 +400,20 @@ impl PgPool {
             "disable" => {
                 warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
                 let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
-                Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e, "creating PostgreSQL connection pool")
-                })?
+                Pool::builder(mgr)
+                    .max_size(max_conns)
+                    .build()
+                    .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?
             }
             ssl_mode => {
                 // Build TLS config based on ssl_mode
                 let tls_config = Self::build_tls_config(ssl_mode)?;
                 let tls_connector = MakeRustlsConnect::new(tls_config);
                 let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
-                let pool = Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e, "creating PostgreSQL connection pool")
-                })?;
+                let pool = Pool::builder(mgr)
+                    .max_size(max_conns)
+                    .build()
+                    .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?;
                 info!("PostgreSQL TLS enabled (ssl_mode={})", ssl_mode);
                 pool
             }
@@ -536,7 +542,10 @@ impl PgPool {
 
         // Add row_hash column if requested (for upsert mode with hash detection)
         if let Some(hash_col) = row_hash_column {
-            ddl.push_str(&format!("    {} VARCHAR(32)\n", Self::quote_ident(hash_col)));
+            ddl.push_str(&format!(
+                "    {} VARCHAR(32)\n",
+                Self::quote_ident(hash_col)
+            ));
         }
 
         ddl.push_str(")");
@@ -571,40 +580,86 @@ impl PgPool {
         let lower = data_type.to_lowercase();
         matches!(
             lower.as_str(),
-            "boolean" | "bool"
-            | "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8"
-            | "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
-            | "real" | "float4" | "double precision" | "float8"
-            | "numeric" | "decimal"
-            | "char" | "character" | "bpchar" | "varchar" | "character varying" | "text" | "name"
-            | "bytea"
-            | "date" | "time" | "time without time zone" | "time with time zone" | "timetz"
-            | "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
-            | "interval"
-            | "uuid"
-            | "json" | "jsonb"
-            | "xml"
-            | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
-            | "inet" | "cidr" | "macaddr" | "macaddr8"
-            | "tsvector" | "tsquery"
-            | "bit" | "bit varying" | "varbit"
-            | "money"
-            | "oid"
+            "boolean"
+                | "bool"
+                | "smallint"
+                | "int2"
+                | "integer"
+                | "int"
+                | "int4"
+                | "bigint"
+                | "int8"
+                | "serial"
+                | "serial4"
+                | "bigserial"
+                | "serial8"
+                | "smallserial"
+                | "serial2"
+                | "real"
+                | "float4"
+                | "double precision"
+                | "float8"
+                | "numeric"
+                | "decimal"
+                | "char"
+                | "character"
+                | "bpchar"
+                | "varchar"
+                | "character varying"
+                | "text"
+                | "name"
+                | "bytea"
+                | "date"
+                | "time"
+                | "time without time zone"
+                | "time with time zone"
+                | "timetz"
+                | "timestamp"
+                | "timestamp without time zone"
+                | "timestamp with time zone"
+                | "timestamptz"
+                | "interval"
+                | "uuid"
+                | "json"
+                | "jsonb"
+                | "xml"
+                | "point"
+                | "line"
+                | "lseg"
+                | "box"
+                | "path"
+                | "polygon"
+                | "circle"
+                | "inet"
+                | "cidr"
+                | "macaddr"
+                | "macaddr8"
+                | "tsvector"
+                | "tsquery"
+                | "bit"
+                | "bit varying"
+                | "varbit"
+                | "money"
+                | "oid"
         )
     }
 
     /// Format a PostgreSQL type with proper length/precision for DDL.
-    fn format_postgres_type(data_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+    fn format_postgres_type(
+        data_type: &str,
+        max_length: i32,
+        precision: i32,
+        scale: i32,
+    ) -> String {
         let lower = data_type.to_lowercase();
         match lower.as_str() {
             // Fixed-size types - return as-is
-            "boolean" | "bool" | "smallint" | "int2" | "integer" | "int" | "int4"
-            | "bigint" | "int8" | "real" | "float4" | "double precision" | "float8"
-            | "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2"
-            | "text" | "bytea" | "date" | "uuid" | "json" | "jsonb" | "xml" | "money"
-            | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
-            | "inet" | "cidr" | "macaddr" | "macaddr8" | "tsvector" | "tsquery" | "oid"
-            | "name" => data_type.to_string(),
+            "boolean" | "bool" | "smallint" | "int2" | "integer" | "int" | "int4" | "bigint"
+            | "int8" | "real" | "float4" | "double precision" | "float8" | "serial" | "serial4"
+            | "bigserial" | "serial8" | "smallserial" | "serial2" | "text" | "bytea" | "date"
+            | "uuid" | "json" | "jsonb" | "xml" | "money" | "point" | "line" | "lseg" | "box"
+            | "path" | "polygon" | "circle" | "inet" | "cidr" | "macaddr" | "macaddr8"
+            | "tsvector" | "tsquery" | "oid" | "name" => data_type.to_string(),
 
             // Numeric with precision and scale
             "numeric" | "decimal" => {
@@ -814,10 +869,7 @@ impl PgPool {
                 Self::quote_ident(row_hash_column)
             );
             client.execute(&alter_sql, &[]).await?;
-            info!(
-                "Added {} column to {}.{}",
-                row_hash_column, schema, table
-            );
+            info!("Added {} column to {}.{}", row_hash_column, schema, table);
             return Ok(true);
         }
 
@@ -838,11 +890,10 @@ impl PgPool {
         min_pk: Option<i64>,
         max_pk: Option<i64>,
     ) -> Result<HashMap<String, String>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for hash fetch"))?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                MigrateError::pool(e, "getting PostgreSQL connection for hash fetch")
+            })?;
 
         // Build PK column select list
         let pk_select: Vec<String> = pk_cols.iter().map(|c| Self::quote_ident(c)).collect();
@@ -940,7 +991,8 @@ impl PgPool {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let ddl = self.generate_ddl_with_options(table, target_schema, false, Some(row_hash_column));
+        let ddl =
+            self.generate_ddl_with_options(table, target_schema, false, Some(row_hash_column));
         client.execute(&ddl, &[]).await?;
 
         debug!(
@@ -1418,9 +1470,11 @@ impl TargetPool for PgPool {
         // reducing catalog churn while avoiding race conditions.
         let staging_table = format!("_staging_{}_{}_{}", schema, table, writer_id);
 
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting PostgreSQL connection for upsert")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for upsert"))?;
 
         // 1. Create temp staging table if not exists, then truncate for reuse
         // This reduces system catalog churn by reusing the same table across batches
@@ -1429,12 +1483,15 @@ impl TargetPool for PgPool {
             pg_quote_ident(&staging_table),
             pg_qualify_table(schema, table)
         );
-        client.execute(&create_staging_sql, &[]).await.map_err(|e| {
-            MigrateError::transfer(
-                format!("{}.{}", schema, table),
-                format!("creating staging table: {}", e),
-            )
-        })?;
+        client
+            .execute(&create_staging_sql, &[])
+            .await
+            .map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", schema, table),
+                    format!("creating staging table: {}", e),
+                )
+            })?;
 
         // Truncate to clear any previous batch data (faster than DROP/CREATE)
         let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
@@ -1525,8 +1582,14 @@ impl TargetPool for PgPool {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql =
-            build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, row_hash_column);
+        let merge_sql = build_staging_merge_sql(
+            schema,
+            table,
+            &staging_table,
+            cols,
+            pk_cols,
+            row_hash_column,
+        );
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1571,8 +1634,16 @@ impl TargetPool for PgPool {
     ) -> Result<u64> {
         // Hash filtering reduces network transfer, but we still use the DB-side
         // WHERE clause to prevent unnecessary writes (WAL, triggers, etc.)
-        self.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-            .await
+        self.upsert_chunk(
+            schema,
+            table,
+            cols,
+            pk_cols,
+            rows,
+            writer_id,
+            row_hash_column,
+        )
+        .await
     }
 
     fn db_type(&self) -> &str {
@@ -1602,12 +1673,7 @@ impl PgPool {
     /// Execute a count query and return row_count.
     ///
     /// Used for Tier 1/2 quick verification.
-    pub async fn execute_count_query(
-        &self,
-        query: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<i64> {
+    pub async fn execute_count_query(&self, query: &str, min_pk: i64, max_pk: i64) -> Result<i64> {
         let client = self
             .pool
             .get()
@@ -1691,7 +1757,10 @@ impl PgPool {
         }
 
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, format!("getting connection for DELETE on {}.{}", schema, table))
+            MigrateError::pool(
+                e,
+                format!("getting connection for DELETE on {}.{}", schema, table),
+            )
         })?;
 
         let mut total_deleted = 0i64;
@@ -1743,7 +1812,10 @@ impl PgPool {
         let client = self.pool.get().await.map_err(|e| {
             MigrateError::pool(
                 e,
-                format!("getting connection for fetch_rows_for_range on {}.{}", schema, table),
+                format!(
+                    "getting connection for fetch_rows_for_range on {}.{}",
+                    schema, table
+                ),
             )
         })?;
 
@@ -1826,14 +1898,17 @@ impl PgPool {
         let mut partitions = Vec::new();
         for row in rows {
             // NTILE returns int4, COUNT returns int8, hash returns int8
-            let partition_id: i64 = row.try_get::<_, i64>(0)
+            let partition_id: i64 = row
+                .try_get::<_, i64>(0)
                 .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
                 .unwrap_or(0);
-            let row_count: i64 = row.try_get::<_, i64>(1)
+            let row_count: i64 = row
+                .try_get::<_, i64>(1)
                 .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
                 .unwrap_or(0);
             // partition_hash is column 2 (optional - default to 0 if not present)
-            let partition_hash: i64 = row.try_get::<_, i64>(2)
+            let partition_hash: i64 = row
+                .try_get::<_, i64>(2)
                 .or_else(|_| row.try_get::<_, i32>(2).map(|v| v as i64))
                 .unwrap_or(0);
             partitions.push((partition_id, row_count, partition_hash));
@@ -1862,11 +1937,13 @@ impl PgPool {
             .await
             .map_err(MigrateError::Target)?;
 
-        let row_count: i64 = row.try_get::<_, i64>(0)
+        let row_count: i64 = row
+            .try_get::<_, i64>(0)
             .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
             .unwrap_or(0);
         // range_hash is column 1 (optional - default to 0 if not present)
-        let range_hash: i64 = row.try_get::<_, i64>(1)
+        let range_hash: i64 = row
+            .try_get::<_, i64>(1)
             .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
             .unwrap_or(0);
         Ok((row_count, range_hash))
@@ -1938,10 +2015,7 @@ impl PgPool {
         let client = self.pool.get().await.map_err(|e| {
             MigrateError::pool(
                 e,
-                format!(
-                    "getting connection for DELETE on {}.{}",
-                    schema, table
-                ),
+                format!("getting connection for DELETE on {}.{}", schema, table),
             )
         })?;
 
@@ -2052,7 +2126,10 @@ impl PgPool {
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, format!("getting connection for COPY to {}.{}", schema, table))
+            MigrateError::pool(
+                e,
+                format!("getting connection for COPY to {}.{}", schema, table),
+            )
         })?;
 
         // Build column list
@@ -2129,7 +2206,10 @@ impl PgPool {
         let t0 = Instant::now();
 
         let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, format!("getting connection for binary COPY to {}.{}", schema, table))
+            MigrateError::pool(
+                e,
+                format!("getting connection for binary COPY to {}.{}", schema, table),
+            )
         })?;
         let t_conn = t0.elapsed();
 
@@ -2771,7 +2851,7 @@ mod tests {
     fn test_calculate_row_hash_basic() {
         // Test with simple string values, PK at index 0
         let row = vec![
-            SqlValue::I64(1),                         // PK - should be excluded
+            SqlValue::I64(1), // PK - should be excluded
             SqlValue::String("hello".to_string()),
             SqlValue::I32(42),
         ];
@@ -2788,11 +2868,11 @@ mod tests {
     fn test_calculate_row_hash_excludes_pk() {
         // Two rows with same non-PK data but different PKs should have same hash
         let row1 = vec![
-            SqlValue::I64(1),                         // PK
+            SqlValue::I64(1), // PK
             SqlValue::String("data".to_string()),
         ];
         let row2 = vec![
-            SqlValue::I64(999),                       // Different PK
+            SqlValue::I64(999), // Different PK
             SqlValue::String("data".to_string()),
         ];
         let pk_indices = vec![0];
@@ -2806,14 +2886,8 @@ mod tests {
     #[test]
     fn test_calculate_row_hash_detects_changes() {
         // Two rows with same PK but different data should have different hashes
-        let row1 = vec![
-            SqlValue::I64(1),
-            SqlValue::String("value1".to_string()),
-        ];
-        let row2 = vec![
-            SqlValue::I64(1),
-            SqlValue::String("value2".to_string()),
-        ];
+        let row1 = vec![SqlValue::I64(1), SqlValue::String("value1".to_string())];
+        let row2 = vec![SqlValue::I64(1), SqlValue::String("value2".to_string())];
         let pk_indices = vec![0];
 
         let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
@@ -2825,14 +2899,8 @@ mod tests {
     #[test]
     fn test_calculate_row_hash_null_handling() {
         // NULL values should be handled consistently
-        let row1 = vec![
-            SqlValue::I64(1),
-            SqlValue::Null(SqlNullType::String),
-        ];
-        let row2 = vec![
-            SqlValue::I64(2),
-            SqlValue::Null(SqlNullType::String),
-        ];
+        let row1 = vec![SqlValue::I64(1), SqlValue::Null(SqlNullType::String)];
+        let row2 = vec![SqlValue::I64(2), SqlValue::Null(SqlNullType::String)];
         let pk_indices = vec![0];
 
         let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
@@ -2845,14 +2913,8 @@ mod tests {
     #[test]
     fn test_calculate_row_hash_null_vs_empty_string() {
         // NULL and empty string should have different hashes
-        let row1 = vec![
-            SqlValue::I64(1),
-            SqlValue::Null(SqlNullType::String),
-        ];
-        let row2 = vec![
-            SqlValue::I64(1),
-            SqlValue::String("".to_string()),
-        ];
+        let row1 = vec![SqlValue::I64(1), SqlValue::Null(SqlNullType::String)];
+        let row2 = vec![SqlValue::I64(1), SqlValue::String("".to_string())];
         let pk_indices = vec![0];
 
         let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
@@ -2865,8 +2927,8 @@ mod tests {
     fn test_calculate_row_hash_composite_pk() {
         // Test with composite primary key
         let row = vec![
-            SqlValue::I64(1),                         // PK part 1
-            SqlValue::I64(2),                         // PK part 2
+            SqlValue::I64(1), // PK part 1
+            SqlValue::I64(2), // PK part 2
             SqlValue::String("data".to_string()),
         ];
         let pk_indices = vec![0, 1];
@@ -2880,7 +2942,7 @@ mod tests {
     fn test_calculate_row_hash_all_types() {
         // Test with all supported types
         let row = vec![
-            SqlValue::I64(1),                                                          // PK
+            SqlValue::I64(1), // PK
             SqlValue::Bool(true),
             SqlValue::I16(16),
             SqlValue::I32(32),
@@ -2906,11 +2968,11 @@ mod tests {
         // Floats should use fixed precision for hash stability
         let row1 = vec![
             SqlValue::I64(1),
-            SqlValue::F64(1.0 / 3.0),  // 0.333333...
+            SqlValue::F64(1.0 / 3.0), // 0.333333...
         ];
         let row2 = vec![
             SqlValue::I64(1),
-            SqlValue::F64(1.0 / 3.0),  // Same calculation
+            SqlValue::F64(1.0 / 3.0), // Same calculation
         ];
         let pk_indices = vec![0];
 
@@ -2966,14 +3028,8 @@ mod tests {
         let pk_cols = vec!["id".to_string()];
 
         // Should always include change detection WHERE clause (fallback to column comparison)
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            None,
-        );
+        let sql =
+            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, None);
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("IS DISTINCT FROM"));
         assert!(sql.contains("DO UPDATE SET"));
@@ -2988,14 +3044,8 @@ mod tests {
         let cols = vec!["id".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql = build_staging_merge_sql(
-            "public",
-            "lookup",
-            "_staging_lookup",
-            &cols,
-            &pk_cols,
-            None,
-        );
+        let sql =
+            build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols, None);
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
     }
@@ -3030,11 +3080,7 @@ mod tests {
     #[test]
     fn test_build_staging_merge_sql_with_custom_hash_column() {
         // When using a custom hash column name
-        let cols = vec![
-            "id".to_string(),
-            "name".to_string(),
-            "_hash".to_string(),
-        ];
+        let cols = vec!["id".to_string(), "name".to_string(), "_hash".to_string()];
         let pk_cols = vec!["id".to_string()];
 
         let sql = build_staging_merge_sql(
@@ -3075,10 +3121,10 @@ mod tests {
     fn test_calculate_row_hash_skip_indices() {
         // Test that skip_indices excludes columns from hash computation
         let row = vec![
-            SqlValue::I32(1),                              // index 0 - PK
-            SqlValue::String("name".to_string()),          // index 1 - normal
+            SqlValue::I32(1),                                // index 0 - PK
+            SqlValue::String("name".to_string()),            // index 1 - normal
             SqlValue::String("large text body".to_string()), // index 2 - text to skip
-            SqlValue::I32(42),                             // index 3 - normal
+            SqlValue::I32(42),                               // index 3 - normal
         ];
         let pk_indices = vec![0];
 
@@ -3106,10 +3152,10 @@ mod tests {
     fn test_calculate_row_hash_skip_multiple_indices() {
         // Test skipping multiple columns
         let row = vec![
-            SqlValue::I32(1),                         // index 0 - PK
-            SqlValue::String("text1".to_string()),    // index 1 - skip
-            SqlValue::String("keep".to_string()),     // index 2 - keep
-            SqlValue::String("text2".to_string()),    // index 3 - skip
+            SqlValue::I32(1),                      // index 0 - PK
+            SqlValue::String("text1".to_string()), // index 1 - skip
+            SqlValue::String("keep".to_string()),  // index 2 - keep
+            SqlValue::String("text2".to_string()), // index 3 - skip
         ];
         let pk_indices = vec![0];
 

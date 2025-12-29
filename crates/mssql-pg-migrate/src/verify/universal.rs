@@ -21,18 +21,14 @@ use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
 use crate::verify::hash_query::{
-    mssql_ntile_partition_query_with_hash,
-    mssql_row_count_with_rownum_query_with_hash,
-    mssql_row_hashes_with_rownum_query,
-    mssql_total_row_count_query,
-    postgres_ntile_partition_query_with_hash,
-    postgres_row_count_with_rownum_query_with_hash,
-    postgres_row_hashes_with_rownum_query,
-    postgres_total_row_count_query,
+    mssql_ntile_partition_query_with_hash, mssql_row_count_with_rownum_query_with_hash,
+    mssql_row_hashes_with_rownum_query, mssql_total_row_count_query,
+    postgres_ntile_partition_query_with_hash, postgres_row_count_with_rownum_query_with_hash,
+    postgres_row_hashes_with_rownum_query, postgres_total_row_count_query,
 };
 use crate::verify::{
-    CompositePk, RowHashDiffComposite, RowRange, SyncStats,
-    TableVerifyResult, VerifyProgressUpdate, VerifyTier,
+    CompositePk, RowHashDiffComposite, RowRange, SyncStats, TableVerifyResult,
+    VerifyProgressUpdate, VerifyTier,
 };
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -222,12 +218,16 @@ impl UniversalVerifyEngine {
             ));
         }
 
-        let num_partitions = ((total_rows + self.config.tier1_batch_size - 1)
-            / self.config.tier1_batch_size)
-            .max(1);
+        let num_partitions =
+            ((total_rows + self.config.tier1_batch_size - 1) / self.config.tier1_batch_size).max(1);
 
         // Tier 1: Get NTILE partition counts and hashes from both databases
-        let source_ntile_sql = mssql_ntile_partition_query_with_hash(source_schema, table, num_partitions, self.hash_text_columns);
+        let source_ntile_sql = mssql_ntile_partition_query_with_hash(
+            source_schema,
+            table,
+            num_partitions,
+            self.hash_text_columns,
+        );
         let target_ntile_sql = postgres_ntile_partition_query_with_hash(
             target_schema,
             &table.name,
@@ -455,7 +455,11 @@ impl UniversalVerifyEngine {
         let pk_columns = &table.primary_key;
 
         // Build count+hash queries
-        let source_count_sql = mssql_row_count_with_rownum_query_with_hash(source_schema, table, self.hash_text_columns);
+        let source_count_sql = mssql_row_count_with_rownum_query_with_hash(
+            source_schema,
+            table,
+            self.hash_text_columns,
+        );
         let target_count_sql = postgres_row_count_with_rownum_query_with_hash(
             target_schema,
             &table.name,
@@ -516,7 +520,8 @@ impl UniversalVerifyEngine {
         let pk_count = pk_columns.len();
 
         // Build queries for (pk_cols..., row_hash) tuples
-        let source_hash_sql = mssql_row_hashes_with_rownum_query(source_schema, table, self.hash_text_columns);
+        let source_hash_sql =
+            mssql_row_hashes_with_rownum_query(source_schema, table, self.hash_text_columns);
         let target_hash_sql = postgres_row_hashes_with_rownum_query(
             target_schema,
             &table.name,

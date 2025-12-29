@@ -8,9 +8,10 @@
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
+use crate::source::Column;
 use crate::source::Table;
 use crate::target::{calculate_row_hash, SqlValue};
-use crate::verify::normalize::{is_text_type, mssql_row_hash_expr};
+use crate::verify::normalize::{is_text_column, mssql_row_hash_expr};
 use futures::future::try_join_all;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -232,7 +233,11 @@ impl TransferEngine {
             job.target_mode,
             self.config.parallel_readers,
             self.config.parallel_writers,
-            if job.use_hash_detection { ", hash_detection=on" } else { "" }
+            if job.use_hash_detection {
+                ", hash_detection=on"
+            } else {
+                ""
+            }
         );
 
         let start = Instant::now();
@@ -496,7 +501,9 @@ impl TransferEngine {
 
             // Only send if we have rows to write
             if !filtered_rows.is_empty() {
-                let write_job = WriteJob { rows: filtered_rows };
+                let write_job = WriteJob {
+                    rows: filtered_rows,
+                };
 
                 if write_tx.send(write_job).await.is_err() {
                     // Writers have all failed
@@ -583,7 +590,12 @@ impl TransferEngine {
         } else {
             info!(
                 "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-                table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
+                table_name,
+                stats.rows,
+                total_elapsed,
+                rows_per_sec,
+                stats.query_time,
+                stats.write_time
             );
         }
 
@@ -595,14 +607,14 @@ impl TransferEngine {
 ///
 /// When `hash_text_columns` is false, returns indices of text/ntext/varchar(max) columns.
 /// When `hash_text_columns` is true, returns empty vec (skip nothing).
-fn compute_text_skip_indices(col_types: &[String], hash_text_columns: bool) -> Vec<usize> {
+fn compute_text_skip_indices(columns: &[Column], hash_text_columns: bool) -> Vec<usize> {
     if hash_text_columns {
         return Vec::new();
     }
-    col_types
+    columns
         .iter()
         .enumerate()
-        .filter(|(_, t)| is_text_type(t))
+        .filter(|(_, c)| is_text_column(c))
         .map(|(i, _)| i)
         .collect()
 }
@@ -691,7 +703,7 @@ fn filter_unchanged_rows(
 
         match existing_hashes.get(&pk_key) {
             Some(existing) if existing == hash => false, // Hash matches, skip
-            _ => true, // New row or hash changed, include
+            _ => true,                                   // New row or hash changed, include
         }
     };
 
@@ -808,8 +820,19 @@ async fn read_table_chunks_parallel(
         let hash_text_columns = job.hash_text_columns;
         let handle = tokio::spawn(async move {
             read_chunk_range(
-                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx, use_hash, pk_indices, hash_text_columns,
+                source,
+                table,
+                columns,
+                col_types,
+                start_pk,
+                range_max,
+                chunk_size,
+                reader_id,
+                is_resume,
+                tx,
+                use_hash,
+                pk_indices,
+                hash_text_columns,
             )
             .await
         });
@@ -875,7 +898,7 @@ async fn read_chunk_range(
     let use_sql_hash = use_hash && source.db_type() == "mssql";
 
     // Compute indices of text columns to skip in Rust-side hash computation
-    let skip_indices = compute_text_skip_indices(&col_types, hash_text_columns);
+    let skip_indices = compute_text_skip_indices(&table.columns, hash_text_columns);
 
     loop {
         let read_start = Instant::now();
@@ -993,15 +1016,23 @@ async fn read_table_chunks(
     let use_sql_hash = use_hash && use_keyset && source.db_type() == "mssql";
 
     // Compute indices of text columns to skip in Rust-side hash computation
-    let skip_indices = compute_text_skip_indices(&col_types, job.hash_text_columns);
+    let skip_indices = compute_text_skip_indices(&job.table.columns, job.hash_text_columns);
 
     loop {
         let read_start = Instant::now();
 
         let (rows, new_last_pk) = if use_keyset {
             read_chunk_keyset_fast(
-                &source, table, &columns, &col_types, last_pk, max_pk, chunk_size, is_first_chunk,
-                use_sql_hash, job.hash_text_columns,
+                &source,
+                table,
+                &columns,
+                &col_types,
+                last_pk,
+                max_pk,
+                chunk_size,
+                is_first_chunk,
+                use_sql_hash,
+                job.hash_text_columns,
             )
             .await?
         } else {
@@ -1113,7 +1144,13 @@ async fn read_chunk_keyset_fast(
     // Build column list with appropriate quoting
     let mut col_list = columns
         .iter()
-        .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
+        .map(|c| {
+            if is_postgres {
+                quote_pg_ident(c)
+            } else {
+                quote_mssql_ident(c)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1135,7 +1172,11 @@ async fn read_chunk_keyset_fast(
         (columns.to_vec(), col_types.to_vec())
     };
 
-    let pk_quoted = if is_postgres { quote_pg_ident(pk_col) } else { quote_mssql_ident(pk_col) };
+    let pk_quoted = if is_postgres {
+        quote_pg_ident(pk_col)
+    } else {
+        quote_mssql_ident(pk_col)
+    };
     let table_ref = if is_postgres {
         qualify_pg_table(&table.schema, &table.name)
     } else {
@@ -1146,7 +1187,10 @@ async fn read_chunk_keyset_fast(
     let mut query = if is_postgres {
         format!("SELECT {} FROM {}", col_list, table_ref)
     } else {
-        format!("SELECT TOP {} {} FROM {} WITH (NOLOCK)", chunk_size, col_list, table_ref)
+        format!(
+            "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
+            chunk_size, col_list, table_ref
+        )
     };
 
     let mut conditions = Vec::new();
@@ -1172,7 +1216,9 @@ async fn read_chunk_keyset_fast(
         query.push_str(&format!(" LIMIT {}", chunk_size));
     }
 
-    let rows = source.query_rows_fast(&query, &query_columns, &query_col_types).await?;
+    let rows = source
+        .query_rows_fast(&query, &query_columns, &query_col_types)
+        .await?;
 
     // Get the last PK value from the result
     let pk_idx = columns.iter().position(|c| c == pk_col);
@@ -1205,7 +1251,13 @@ async fn read_chunk_offset(
 
     let col_list = columns
         .iter()
-        .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
+        .map(|c| {
+            if is_postgres {
+                quote_pg_ident(c)
+            } else {
+                quote_mssql_ident(c)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1218,7 +1270,11 @@ async fn read_chunk_offset(
     // Create ORDER BY from primary key columns
     let order_by = if table.primary_key.is_empty() {
         if !columns.is_empty() {
-            if is_postgres { quote_pg_ident(&columns[0]) } else { quote_mssql_ident(&columns[0]) }
+            if is_postgres {
+                quote_pg_ident(&columns[0])
+            } else {
+                quote_mssql_ident(&columns[0])
+            }
         } else {
             return Err(MigrateError::Transfer {
                 table: table.full_name(),
@@ -1229,7 +1285,13 @@ async fn read_chunk_offset(
         table
             .primary_key
             .iter()
-            .map(|c| if is_postgres { quote_pg_ident(c) } else { quote_mssql_ident(c) })
+            .map(|c| {
+                if is_postgres {
+                    quote_pg_ident(c)
+                } else {
+                    quote_mssql_ident(c)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -1337,7 +1399,7 @@ mod tests {
         // Add ranges out of order (simulating parallel readers)
         tracker.add_range(Some(200), Some(300)); // Reader B completes first
         tracker.add_range(Some(0), Some(100)); // Reader A completes second
-        // Still gap at 100-200, so safe point is 100
+                                               // Still gap at 100-200, so safe point is 100
         assert_eq!(tracker.safe_resume_point(), Some(100));
 
         // Now fill the gap
@@ -1393,42 +1455,55 @@ mod tests {
         assert_eq!(tracker.safe_resume_point(), Some(100));
     }
 
+    fn make_test_column(name: &str, data_type: &str, max_length: i32) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            max_length,
+            precision: 0,
+            scale: 0,
+            is_nullable: true,
+            is_identity: false,
+            ordinal_pos: 0,
+        }
+    }
+
     #[test]
     fn test_compute_text_skip_indices_hash_text_true() {
         // When hash_text_columns is true, no columns should be skipped
-        let col_types = vec![
-            "int".to_string(),
-            "text".to_string(),
-            "varchar(100)".to_string(),
-            "nvarchar(max)".to_string(),
+        let columns = vec![
+            make_test_column("id", "int", 4),
+            make_test_column("body", "text", -1),
+            make_test_column("name", "varchar", 100),
+            make_test_column("desc", "nvarchar", -1), // nvarchar(max)
         ];
-        let result = compute_text_skip_indices(&col_types, true);
+        let result = compute_text_skip_indices(&columns, true);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_compute_text_skip_indices_hash_text_false() {
         // When hash_text_columns is false, text columns should be skipped
-        let col_types = vec![
-            "int".to_string(),          // index 0 - not text
-            "text".to_string(),          // index 1 - text
-            "varchar(100)".to_string(),  // index 2 - not text
-            "nvarchar(max)".to_string(), // index 3 - text
-            "xml".to_string(),           // index 4 - text
+        let columns = vec![
+            make_test_column("id", "int", 4),         // index 0 - not text
+            make_test_column("body", "text", -1),     // index 1 - text
+            make_test_column("name", "varchar", 100), // index 2 - not text (has max_length)
+            make_test_column("desc", "nvarchar", -1), // index 3 - text (nvarchar(max))
+            make_test_column("data", "xml", 0),       // index 4 - text
         ];
-        let result = compute_text_skip_indices(&col_types, false);
+        let result = compute_text_skip_indices(&columns, false);
         assert_eq!(result, vec![1, 3, 4]);
     }
 
     #[test]
     fn test_compute_text_skip_indices_no_text_columns() {
         // When there are no text columns, should return empty
-        let col_types = vec![
-            "int".to_string(),
-            "varchar(100)".to_string(),
-            "datetime".to_string(),
+        let columns = vec![
+            make_test_column("id", "int", 4),
+            make_test_column("name", "varchar", 100),
+            make_test_column("created", "datetime", 8),
         ];
-        let result = compute_text_skip_indices(&col_types, false);
+        let result = compute_text_skip_indices(&columns, false);
         assert!(result.is_empty());
     }
 }

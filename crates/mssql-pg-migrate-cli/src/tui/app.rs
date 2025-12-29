@@ -5,10 +5,13 @@
 //! - Update: handle_event method that transforms state based on events
 //! - View: Separate ui module renders state to terminal
 
-use crate::tui::events::{AppEvent, SharedInputMode, INPUT_MODE_NORMAL, INPUT_MODE_COMMAND, INPUT_MODE_FILE, INPUT_MODE_WIZARD};
 use crate::tui::actions::Action;
+use crate::tui::events::{
+    AppEvent, SharedInputMode, INPUT_MODE_COMMAND, INPUT_MODE_FILE, INPUT_MODE_NORMAL,
+    INPUT_MODE_WIZARD,
+};
 use crate::tui::wizard::WizardState;
-use mssql_pg_migrate::{Config, MigrateError, Orchestrator, ProgressUpdate, MigrationResult};
+use mssql_pg_migrate::{Config, MigrateError, MigrationResult, Orchestrator, ProgressUpdate};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,16 +58,56 @@ impl SlashCommand {
     /// Get all available slash commands.
     pub fn all() -> Vec<Self> {
         vec![
-            SlashCommand { name: "/run", description: "Start migration", shortcut: None },
-            SlashCommand { name: "/resume", description: "Resume interrupted migration", shortcut: None },
-            SlashCommand { name: "/dry-run", description: "Run without making changes", shortcut: None },
-            SlashCommand { name: "/validate", description: "Validate row counts", shortcut: None },
-            SlashCommand { name: "/health", description: "Run health check", shortcut: None },
-            SlashCommand { name: "/wizard", description: "Configuration wizard [@path]", shortcut: None },
-            SlashCommand { name: "/logs", description: "Save logs to file", shortcut: None },
-            SlashCommand { name: "/clear", description: "Clear transcript", shortcut: None },
-            SlashCommand { name: "/help", description: "Show help", shortcut: Some("?") },
-            SlashCommand { name: "/quit", description: "Exit application", shortcut: Some("q") },
+            SlashCommand {
+                name: "/run",
+                description: "Start migration",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/resume",
+                description: "Resume interrupted migration",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/dry-run",
+                description: "Run without making changes",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/validate",
+                description: "Validate row counts",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/health",
+                description: "Run health check",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/wizard",
+                description: "Configuration wizard [@path]",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/logs",
+                description: "Save logs to file",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/clear",
+                description: "Clear transcript",
+                shortcut: None,
+            },
+            SlashCommand {
+                name: "/help",
+                description: "Show help",
+                shortcut: Some("?"),
+            },
+            SlashCommand {
+                name: "/quit",
+                description: "Exit application",
+                shortcut: Some("q"),
+            },
         ]
     }
 }
@@ -510,9 +553,11 @@ impl App {
             // --- Command input events ---
             AppEvent::CommandInput(c) => {
                 // Handle starting command mode with '/'
-                if c == '/' && self.input_mode == InputMode::Normal && self.command_input.is_empty() {
+                if c == '/' && self.input_mode == InputMode::Normal && self.command_input.is_empty()
+                {
                     self.input_mode = InputMode::Command;
-                    self.shared_input_mode.store(INPUT_MODE_COMMAND, Ordering::Relaxed);
+                    self.shared_input_mode
+                        .store(INPUT_MODE_COMMAND, Ordering::Relaxed);
                 }
 
                 self.command_input.push(c);
@@ -526,7 +571,8 @@ impl App {
                 // Exit command mode if input is empty
                 if self.command_input.is_empty() {
                     self.input_mode = InputMode::Normal;
-                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                    self.shared_input_mode
+                        .store(INPUT_MODE_NORMAL, Ordering::Relaxed);
                     self.suggestions.clear();
                 } else {
                     self.update_suggestions();
@@ -602,7 +648,8 @@ impl App {
                 // Only reset to Normal mode if we didn't start the wizard
                 if self.wizard.is_none() {
                     self.input_mode = InputMode::Normal;
-                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                    self.shared_input_mode
+                        .store(INPUT_MODE_NORMAL, Ordering::Relaxed);
                 }
             }
 
@@ -612,7 +659,8 @@ impl App {
                 self.selected_suggestion = 0;
                 self.history_index = -1;
                 self.input_mode = InputMode::Normal;
-                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                self.shared_input_mode
+                    .store(INPUT_MODE_NORMAL, Ordering::Relaxed);
             }
 
             AppEvent::ClearTranscript => {
@@ -655,9 +703,11 @@ impl App {
             AppEvent::WizardSubmit => {
                 let (done, was_saved, output_path) = if let Some(ref mut wizard) = self.wizard {
                     match wizard.process_input() {
-                        Ok(done) => {
-                            (done, wizard.was_saved, wizard.output_path.display().to_string())
-                        }
+                        Ok(done) => (
+                            done,
+                            wizard.was_saved,
+                            wizard.output_path.display().to_string(),
+                        ),
                         Err(e) => {
                             wizard.error = Some(e);
                             (false, false, String::new())
@@ -669,10 +719,12 @@ impl App {
 
                 if done {
                     self.input_mode = InputMode::Normal;
-                    self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                    self.shared_input_mode
+                        .store(INPUT_MODE_NORMAL, Ordering::Relaxed);
                     if was_saved {
                         self.add_transcript(TranscriptEntry::success(format!(
-                            "Configuration saved to {}", output_path
+                            "Configuration saved to {}",
+                            output_path
                         )));
                     } else {
                         self.add_transcript(TranscriptEntry::info("Wizard cancelled".to_string()));
@@ -710,7 +762,8 @@ impl App {
             AppEvent::WizardCancel => {
                 self.wizard = None;
                 self.input_mode = InputMode::Normal;
-                self.shared_input_mode.store(INPUT_MODE_NORMAL, Ordering::Relaxed);
+                self.shared_input_mode
+                    .store(INPUT_MODE_NORMAL, Ordering::Relaxed);
                 self.add_transcript(TranscriptEntry::info("Wizard cancelled"));
             }
         }
@@ -794,7 +847,9 @@ impl App {
             let result = Self::run_migration(config, progress_tx, cancel, dry_run, resume).await;
             match result {
                 Ok(migration_result) => {
-                    let _ = event_tx.send(AppEvent::MigrationComplete(migration_result)).await;
+                    let _ = event_tx
+                        .send(AppEvent::MigrationComplete(migration_result))
+                        .await;
                 }
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::Error(e.to_string())).await;
@@ -831,31 +886,33 @@ impl App {
 
         tokio::spawn(async move {
             match Orchestrator::new(config).await {
-                Ok(orchestrator) => {
-                    match orchestrator.health_check().await {
-                        Ok(result) => {
-                            if result.healthy {
-                                let msg = format!(
-                                    "Health check passed (source: {}ms, target: {}ms)",
-                                    result.source_latency_ms, result.target_latency_ms
-                                );
-                                let _ = event_tx.send(AppEvent::Success(msg)).await;
-                            } else {
-                                let msg = format!(
-                                    "Health check failed: source={}, target={}",
-                                    result.source_error.unwrap_or_else(|| "ok".to_string()),
-                                    result.target_error.unwrap_or_else(|| "ok".to_string())
-                                );
-                                let _ = event_tx.send(AppEvent::Error(msg)).await;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = event_tx.send(AppEvent::Error(format!("Health check error: {}", e))).await;
+                Ok(orchestrator) => match orchestrator.health_check().await {
+                    Ok(result) => {
+                        if result.healthy {
+                            let msg = format!(
+                                "Health check passed (source: {}ms, target: {}ms)",
+                                result.source_latency_ms, result.target_latency_ms
+                            );
+                            let _ = event_tx.send(AppEvent::Success(msg)).await;
+                        } else {
+                            let msg = format!(
+                                "Health check failed: source={}, target={}",
+                                result.source_error.unwrap_or_else(|| "ok".to_string()),
+                                result.target_error.unwrap_or_else(|| "ok".to_string())
+                            );
+                            let _ = event_tx.send(AppEvent::Error(msg)).await;
                         }
                     }
-                }
+                    Err(e) => {
+                        let _ = event_tx
+                            .send(AppEvent::Error(format!("Health check error: {}", e)))
+                            .await;
+                    }
+                },
                 Err(e) => {
-                    let _ = event_tx.send(AppEvent::Error(format!("Failed to connect: {}", e))).await;
+                    let _ = event_tx
+                        .send(AppEvent::Error(format!("Failed to connect: {}", e)))
+                        .await;
                 }
             }
         });
@@ -863,13 +920,25 @@ impl App {
 
     /// Save logs to a file.
     fn save_logs(&mut self) {
-        let filename = format!("migration-logs-{}.txt", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
-        match std::fs::write(&filename, self.logs.iter().cloned().collect::<Vec<_>>().join("\n")) {
+        let filename = format!(
+            "migration-logs-{}.txt",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        match std::fs::write(
+            &filename,
+            self.logs.iter().cloned().collect::<Vec<_>>().join("\n"),
+        ) {
             Ok(()) => {
-                self.add_transcript(TranscriptEntry::success(format!("Logs saved to {}", filename)));
+                self.add_transcript(TranscriptEntry::success(format!(
+                    "Logs saved to {}",
+                    filename
+                )));
             }
             Err(e) => {
-                self.add_transcript(TranscriptEntry::error(format!("Failed to save logs: {}", e)));
+                self.add_transcript(TranscriptEntry::error(format!(
+                    "Failed to save logs: {}",
+                    e
+                )));
             }
         }
     }
@@ -932,8 +1001,10 @@ impl App {
         // Debug: log when tables_completed changes
         tracing::trace!(
             "Stats update: tables={}/{}, rows={}, rps={}",
-            self.tables_completed, self.tables_total,
-            self.rows_transferred, self.rows_per_second
+            self.tables_completed,
+            self.tables_total,
+            self.rows_transferred,
+            self.rows_per_second
         );
 
         // Update transcript for phase changes
@@ -942,7 +1013,8 @@ impl App {
             self.started_at = Some(Instant::now());
             self.completed_at = None; // Reset for new migration
             self.add_transcript(TranscriptEntry::info("Extracting schema from source..."));
-        } else if update.phase == "preparing_target" && old_phase != MigrationPhase::PreparingTarget {
+        } else if update.phase == "preparing_target" && old_phase != MigrationPhase::PreparingTarget
+        {
             self.add_transcript(TranscriptEntry::success(format!(
                 "Schema extracted ({} tables)",
                 update.tables_total
@@ -966,9 +1038,7 @@ impl App {
                     Some("completed") => {
                         self.add_transcript(TranscriptEntry::success(format!(
                             "Completed {} ({}/{} tables)",
-                            table,
-                            update.tables_completed,
-                            update.tables_total
+                            table, update.tables_completed, update.tables_total
                         )));
                     }
                     _ => {}
@@ -1000,17 +1070,14 @@ impl App {
                 self.phase = MigrationPhase::Completed;
                 self.add_transcript(TranscriptEntry::success(format!(
                     "Migration completed: {} rows in {:.1}s ({} rows/sec)",
-                    result.rows_transferred,
-                    result.duration_seconds,
-                    result.rows_per_second
+                    result.rows_transferred, result.duration_seconds, result.rows_per_second
                 )));
             }
             "dry_run" => {
                 self.phase = MigrationPhase::Completed;
                 self.add_transcript(TranscriptEntry::success(format!(
                     "Dry run completed: {} tables, {} rows would be transferred",
-                    result.tables_total,
-                    result.rows_transferred
+                    result.tables_total, result.rows_transferred
                 )));
             }
             "cancelled" => {
@@ -1019,7 +1086,10 @@ impl App {
             }
             "failed" | _ => {
                 self.phase = MigrationPhase::Failed;
-                let error_msg = result.error.clone().unwrap_or_else(|| "Unknown error".to_string());
+                let error_msg = result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string());
                 self.add_transcript(TranscriptEntry::error(format!(
                     "Migration failed: {}",
                     error_msg
@@ -1069,13 +1139,17 @@ impl App {
             match Config::load(path) {
                 Ok(new_config) => {
                     self.config_path = PathBuf::from(path);
-                    self.config_summary = ConfigSummary::from_config(&new_config, &self.config_path);
+                    self.config_summary =
+                        ConfigSummary::from_config(&new_config, &self.config_path);
                     self.config = new_config;
                     self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
                     true
                 }
                 Err(e) => {
-                    self.add_transcript(TranscriptEntry::error(format!("Failed to load config: {}", e)));
+                    self.add_transcript(TranscriptEntry::error(format!(
+                        "Failed to load config: {}",
+                        e
+                    )));
                     false
                 }
             }
@@ -1118,7 +1192,8 @@ impl App {
                 let path_prefix = &input[at_idx + 1..];
                 self.suggestions = self.glob_files(path_prefix);
                 self.input_mode = InputMode::FileInput;
-                self.shared_input_mode.store(INPUT_MODE_FILE, Ordering::Relaxed);
+                self.shared_input_mode
+                    .store(INPUT_MODE_FILE, Ordering::Relaxed);
                 return;
             }
         }
@@ -1159,7 +1234,10 @@ impl App {
                     .unwrap_or_default(),
             )
         } else {
-            (std::env::current_dir().unwrap_or_default(), prefix.to_string())
+            (
+                std::env::current_dir().unwrap_or_default(),
+                prefix.to_string(),
+            )
         };
 
         // Read directory
@@ -1181,11 +1259,7 @@ impl App {
                     // Filter for yaml/yml files or directories
                     if is_dir || name.ends_with(".yaml") || name.ends_with(".yml") {
                         suggestions.push(Suggestion {
-                            display: if is_dir {
-                                format!("{}/", name)
-                            } else {
-                                name
-                            },
+                            display: if is_dir { format!("{}/", name) } else { name },
                             value: full_path,
                             is_dir,
                         });
@@ -1254,9 +1328,8 @@ impl App {
         };
 
         // Extract file path from args (look for @path) or use inline path
-        let file_path = inline_path.or_else(|| {
-            args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..])
-        });
+        let file_path =
+            inline_path.or_else(|| args.iter().find(|a| a.starts_with('@')).map(|a| &a[1..]));
 
         match cmd {
             "/run" => {
@@ -1344,7 +1417,8 @@ impl App {
 
                 self.wizard = Some(WizardState::with_config(output_path, &config_for_wizard));
                 self.input_mode = InputMode::Wizard;
-                self.shared_input_mode.store(INPUT_MODE_WIZARD, Ordering::Relaxed);
+                self.shared_input_mode
+                    .store(INPUT_MODE_WIZARD, Ordering::Relaxed);
                 self.add_transcript(TranscriptEntry::info(format!(
                     "Starting configuration wizard (output: {})...",
                     path_display

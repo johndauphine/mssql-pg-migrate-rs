@@ -46,17 +46,19 @@ impl PgSourcePool {
             "disable" => {
                 warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
                 let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
-                Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e, "creating PostgreSQL source pool")
-                })?
+                Pool::builder(mgr)
+                    .max_size(max_conns)
+                    .build()
+                    .map_err(|e| MigrateError::pool(e, "creating PostgreSQL source pool"))?
             }
             _ => {
                 let tls_config = Self::build_tls_config(ssl_mode)?;
                 let tls_connector = MakeRustlsConnect::new(tls_config);
                 let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
-                Pool::builder(mgr).max_size(max_conns).build().map_err(|e| {
-                    MigrateError::pool(e, "creating PostgreSQL source pool")
-                })?
+                Pool::builder(mgr)
+                    .max_size(max_conns)
+                    .build()
+                    .map_err(|e| MigrateError::pool(e, "creating PostgreSQL source pool"))?
             }
         };
 
@@ -70,9 +72,7 @@ impl PgSourcePool {
 
         info!(
             "Connected to PostgreSQL source: {}:{}/{}",
-            config.host,
-            config.port,
-            config.database
+            config.host, config.port, config.database
         );
 
         Ok(Self { pool })
@@ -113,9 +113,11 @@ impl PgSourcePool {
 
     /// Load columns for a table.
     async fn load_columns(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_columns")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for load_columns"))?;
 
         let query = r#"
             SELECT
@@ -165,9 +167,11 @@ impl PgSourcePool {
 
     /// Load primary key for a table.
     async fn load_primary_key(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_primary_key")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for load_primary_key"))?;
 
         let query = r#"
             SELECT a.attname
@@ -203,9 +207,11 @@ impl PgSourcePool {
 
     /// Load row count for a table.
     async fn load_row_count(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_row_count")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for load_row_count"))?;
 
         // Use pg_class.reltuples for fast approximate count
         let query = r#"
@@ -215,7 +221,9 @@ impl PgSourcePool {
             WHERE n.nspname = $1 AND c.relname = $2
         "#;
 
-        let row = client.query_one(query, &[&table.schema, &table.name]).await?;
+        let row = client
+            .query_one(query, &[&table.schema, &table.name])
+            .await?;
         table.row_count = row.get::<_, i64>(0);
 
         debug!("Row count for {}: {}", table.full_name(), table.row_count);
@@ -229,9 +237,11 @@ impl PgSourcePool {
         _columns: &[String],
         col_types: &[String],
     ) -> Result<Vec<Vec<SqlValue>>> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for query_rows_fast")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for query_rows_fast"))?;
 
         let rows = client.query(sql, &[]).await?;
         let mut result = Vec::with_capacity(rows.len());
@@ -250,18 +260,22 @@ impl PgSourcePool {
 
     /// Test the connection.
     pub async fn test_connection(&self) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "testing PostgreSQL source connection")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing PostgreSQL source connection"))?;
         client.simple_query("SELECT 1").await?;
         Ok(())
     }
 
     /// Get total row count for a table.
     pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for get_total_row_count")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for get_total_row_count"))?;
 
         let row = client.query_one(query, &[]).await?;
         Ok(row.get::<_, i64>(0))
@@ -269,9 +283,11 @@ impl PgSourcePool {
 
     /// Get the maximum value of a primary key column.
     pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for get_max_pk")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for get_max_pk"))?;
 
         // Quote identifiers for PostgreSQL
         fn quote_ident(name: &str) -> String {
@@ -290,13 +306,12 @@ impl PgSourcePool {
     }
 
     /// Execute NTILE partition query.
-    pub async fn execute_ntile_partition_query(
-        &self,
-        query: &str,
-    ) -> Result<Vec<(i64, i64, i64)>> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for ntile query")
-        })?;
+    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for ntile query"))?;
 
         let rows = client.query(query, &[]).await?;
         let mut partitions = Vec::new();
@@ -317,9 +332,11 @@ impl PgSourcePool {
         query: &str,
         range: &RowRange,
     ) -> Result<(i64, i64)> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for count query")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for count query"))?;
 
         let row = client
             .query_one(query, &[&range.start_row, &range.end_row])
@@ -337,9 +354,11 @@ impl PgSourcePool {
         range: &RowRange,
         pk_column_count: usize,
     ) -> Result<CompositeRowHashMap> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for row hashes")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for row hashes"))?;
 
         let rows = client
             .query(query, &[&range.start_row, &range.end_row])
@@ -470,9 +489,11 @@ impl PgSourcePool {
 #[async_trait]
 impl SourcePool for PgSourcePool {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for extract_schema")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for extract_schema"))?;
 
         let query = r#"
             SELECT table_schema, table_name
@@ -504,11 +525,7 @@ impl SourcePool for PgSourcePool {
             self.load_row_count(&mut table).await?;
 
             // Estimate row size
-            table.estimated_row_size = table
-                .columns
-                .iter()
-                .map(estimate_pg_column_size)
-                .sum();
+            table.estimated_row_size = table.columns.iter().map(estimate_pg_column_size).sum();
 
             tables.push(table);
         }
@@ -529,9 +546,10 @@ impl SourcePool for PgSourcePool {
         }
 
         let pk_col = &table.primary_key[0];
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for partition boundaries")
-        })?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                MigrateError::pool(e, "getting connection for partition boundaries")
+            })?;
 
         let query = format!(
             r#"
@@ -584,9 +602,11 @@ impl SourcePool for PgSourcePool {
     }
 
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_indexes")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for load_indexes"))?;
 
         let query = r#"
             SELECT
@@ -631,9 +651,11 @@ impl SourcePool for PgSourcePool {
     }
 
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_foreign_keys")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for load_foreign_keys"))?;
 
         let query = r#"
             SELECT
@@ -696,9 +718,10 @@ impl SourcePool for PgSourcePool {
     }
 
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for load_check_constraints")
-        })?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                MigrateError::pool(e, "getting connection for load_check_constraints")
+            })?;
 
         let query = r#"
             SELECT
@@ -732,9 +755,11 @@ impl SourcePool for PgSourcePool {
     }
 
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(e, "getting connection for get_row_count")
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for get_row_count"))?;
 
         let query = format!(
             "SELECT COUNT(*)::int8 FROM {}.{}",
@@ -821,9 +846,7 @@ fn extract_pk_value(row: &tokio_postgres::Row, idx: usize) -> PkValue {
         idx, col_type_name
     );
 
-    PkValue::String(format!(
-        "UNSUPPORTED_PK_TYPE_{}_{}", idx, col_type_name
-    ))
+    PkValue::String(format!("UNSUPPORTED_PK_TYPE_{}_{}", idx, col_type_name))
 }
 
 /// Convert a PostgreSQL row value to SqlValue based on column type.

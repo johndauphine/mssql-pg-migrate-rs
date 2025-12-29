@@ -131,14 +131,22 @@ pub fn mssql_to_postgres(mssql_type: &str, max_length: i32, precision: i32, scal
 
 /// Map a PostgreSQL data type to MSSQL.
 /// Returns a TypeMapping with lossy flag set for types that may lose functionality.
-pub fn postgres_to_mssql(pg_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
+pub fn postgres_to_mssql(
+    pg_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> TypeMapping {
     let pg_lower = pg_type.to_lowercase();
 
     // Handle array types (lossy - stored as JSON)
     if pg_lower.ends_with("[]") || pg_lower.starts_with("_") {
         return TypeMapping::lossy(
             "nvarchar(max)".to_string(),
-            format!("Array type '{}' stored as JSON string. Array operations unavailable.", pg_type),
+            format!(
+                "Array type '{}' stored as JSON string. Array operations unavailable.",
+                pg_type
+            ),
         );
     }
 
@@ -222,32 +230,39 @@ pub fn postgres_to_mssql(pg_type: &str, max_length: i32, precision: i32, scale: 
         // Network types (lossy)
         "inet" | "cidr" => TypeMapping::lossy(
             "varchar(50)",
-            format!("Network type '{}' stored as string. Network operations unavailable.", pg_type),
+            format!(
+                "Network type '{}' stored as string. Network operations unavailable.",
+                pg_type
+            ),
         ),
-        "macaddr" | "macaddr8" => TypeMapping::lossy(
-            "char(17)",
-            "MAC address stored as string.",
-        ),
+        "macaddr" | "macaddr8" => TypeMapping::lossy("char(17)", "MAC address stored as string."),
 
         // Geometric types (lossy)
-        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
-            TypeMapping::lossy(
-                "nvarchar(max)",
-                format!("Geometric type '{}' stored as string. Geometric operations unavailable.", pg_type),
-            )
-        }
+        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => TypeMapping::lossy(
+            "nvarchar(max)",
+            format!(
+                "Geometric type '{}' stored as string. Geometric operations unavailable.",
+                pg_type
+            ),
+        ),
 
         // Full-text search types (lossy)
         "tsvector" | "tsquery" => TypeMapping::lossy(
             "nvarchar(max)",
-            format!("Full-text type '{}' stored as string. Use SQL Server full-text search instead.", pg_type),
+            format!(
+                "Full-text type '{}' stored as string. Use SQL Server full-text search instead.",
+                pg_type
+            ),
         ),
 
         // Range types (lossy)
         "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => {
             TypeMapping::lossy(
                 "nvarchar(100)",
-                format!("Range type '{}' stored as string. Range operations unavailable.", pg_type),
+                format!(
+                    "Range type '{}' stored as string. Range operations unavailable.",
+                    pg_type
+                ),
             )
         }
 
@@ -370,18 +385,39 @@ mod tests {
 
     #[test]
     fn test_map_type_postgres_to_mssql() {
-        let mapping = map_type(DatabaseType::Postgres, DatabaseType::Mssql, "integer", 0, 0, 0);
+        let mapping = map_type(
+            DatabaseType::Postgres,
+            DatabaseType::Mssql,
+            "integer",
+            0,
+            0,
+            0,
+        );
         assert_eq!(mapping.target_type, "int");
         assert!(!mapping.is_lossy);
     }
 
     #[test]
     fn test_map_type_same_database() {
-        let mapping = map_type(DatabaseType::Mssql, DatabaseType::Mssql, "nvarchar", 100, 0, 0);
+        let mapping = map_type(
+            DatabaseType::Mssql,
+            DatabaseType::Mssql,
+            "nvarchar",
+            100,
+            0,
+            0,
+        );
         assert_eq!(mapping.target_type, "nvarchar");
         assert!(!mapping.is_lossy);
 
-        let mapping = map_type(DatabaseType::Postgres, DatabaseType::Postgres, "jsonb", 0, 0, 0);
+        let mapping = map_type(
+            DatabaseType::Postgres,
+            DatabaseType::Postgres,
+            "jsonb",
+            0,
+            0,
+            0,
+        );
         assert_eq!(mapping.target_type, "jsonb");
         assert!(!mapping.is_lossy);
     }

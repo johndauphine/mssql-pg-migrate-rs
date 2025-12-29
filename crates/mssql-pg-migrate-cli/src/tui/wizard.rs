@@ -346,21 +346,27 @@ impl WizardState {
 
     /// Get the prompt for the current step.
     pub fn get_prompt(&self) -> String {
-        let step_info = format!("[{}/{}] ", self.step.step_number(), WizardStep::total_steps());
+        let step_info = format!(
+            "[{}/{}] ",
+            self.step.step_number(),
+            WizardStep::total_steps()
+        );
         match self.step {
             WizardStep::SourceHost => format!(
                 "{}Source SQL Server Host [{}]: ",
                 step_info, self.config.source_host
             ),
-            WizardStep::SourcePort => format!(
-                "{}Source Port [{}]: ",
-                step_info, self.config.source_port
-            ),
+            WizardStep::SourcePort => {
+                format!("{}Source Port [{}]: ", step_info, self.config.source_port)
+            }
             WizardStep::SourceDatabase => {
                 if self.config.source_database.is_empty() {
                     format!("{}Source Database: ", step_info)
                 } else {
-                    format!("{}Source Database [{}]: ", step_info, self.config.source_database)
+                    format!(
+                        "{}Source Database [{}]: ",
+                        step_info, self.config.source_database
+                    )
                 }
             }
             WizardStep::SourceUser => {
@@ -381,15 +387,17 @@ impl WizardState {
                 "{}Target PostgreSQL Host [{}]: ",
                 step_info, self.config.target_host
             ),
-            WizardStep::TargetPort => format!(
-                "{}Target Port [{}]: ",
-                step_info, self.config.target_port
-            ),
+            WizardStep::TargetPort => {
+                format!("{}Target Port [{}]: ", step_info, self.config.target_port)
+            }
             WizardStep::TargetDatabase => {
                 if self.config.target_database.is_empty() {
                     format!("{}Target Database: ", step_info)
                 } else {
-                    format!("{}Target Database [{}]: ", step_info, self.config.target_database)
+                    format!(
+                        "{}Target Database [{}]: ",
+                        step_info, self.config.target_database
+                    )
                 }
             }
             WizardStep::TargetUser => {
@@ -410,10 +418,9 @@ impl WizardState {
                 "{}Target Mode (drop_recreate/truncate/upsert) [{}]: ",
                 step_info, self.config.target_mode
             ),
-            WizardStep::Workers => format!(
-                "{}Number of Workers [{}]: ",
-                step_info, self.config.workers
-            ),
+            WizardStep::Workers => {
+                format!("{}Number of Workers [{}]: ", step_info, self.config.workers)
+            }
             WizardStep::OutputFile => format!(
                 "{}Output File [{}]: ",
                 step_info,
@@ -434,7 +441,8 @@ impl WizardState {
                 if !input.is_empty() {
                     self.config.source_host = input.clone();
                 }
-                self.transcript.push(format!("Source Host: {}", self.config.source_host));
+                self.transcript
+                    .push(format!("Source Host: {}", self.config.source_host));
             }
             WizardStep::SourcePort => {
                 if !input.is_empty() {
@@ -442,7 +450,8 @@ impl WizardState {
                         .parse()
                         .map_err(|_| "Invalid port number".to_string())?;
                 }
-                self.transcript.push(format!("Source Port: {}", self.config.source_port));
+                self.transcript
+                    .push(format!("Source Port: {}", self.config.source_port));
             }
             WizardStep::SourceDatabase => {
                 if input.is_empty() && self.config.source_database.is_empty() {
@@ -451,7 +460,8 @@ impl WizardState {
                 if !input.is_empty() {
                     self.config.source_database = input;
                 }
-                self.transcript.push(format!("Source Database: {}", self.config.source_database));
+                self.transcript
+                    .push(format!("Source Database: {}", self.config.source_database));
             }
             WizardStep::SourceUser => {
                 if input.is_empty() && self.config.source_user.is_empty() {
@@ -460,20 +470,23 @@ impl WizardState {
                 if !input.is_empty() {
                     self.config.source_user = input;
                 }
-                self.transcript.push(format!("Source User: {}", self.config.source_user));
+                self.transcript
+                    .push(format!("Source User: {}", self.config.source_user));
             }
             WizardStep::SourcePassword => {
                 // Only update password if input is provided
                 if !input.is_empty() {
                     self.config.source_password = input;
                 }
-                self.transcript.push("Source Password: ********".to_string());
+                self.transcript
+                    .push("Source Password: ********".to_string());
             }
             WizardStep::TargetHost => {
                 if !input.is_empty() {
                     self.config.target_host = input.clone();
                 }
-                self.transcript.push(format!("Target Host: {}", self.config.target_host));
+                self.transcript
+                    .push(format!("Target Host: {}", self.config.target_host));
             }
             WizardStep::TargetPort => {
                 if !input.is_empty() {
@@ -481,7 +494,8 @@ impl WizardState {
                         .parse()
                         .map_err(|_| "Invalid port number".to_string())?;
                 }
-                self.transcript.push(format!("Target Port: {}", self.config.target_port));
+                self.transcript
+                    .push(format!("Target Port: {}", self.config.target_port));
             }
             WizardStep::TargetDatabase => {
                 if input.is_empty() && self.config.target_database.is_empty() {
@@ -490,7 +504,8 @@ impl WizardState {
                 if !input.is_empty() {
                     self.config.target_database = input;
                 }
-                self.transcript.push(format!("Target Database: {}", self.config.target_database));
+                self.transcript
+                    .push(format!("Target Database: {}", self.config.target_database));
             }
             WizardStep::TargetUser => {
                 if input.is_empty() && self.config.target_user.is_empty() {
@@ -499,39 +514,43 @@ impl WizardState {
                 if !input.is_empty() {
                     self.config.target_user = input;
                 }
-                self.transcript.push(format!("Target User: {}", self.config.target_user));
+                self.transcript
+                    .push(format!("Target User: {}", self.config.target_user));
             }
             WizardStep::TargetPassword => {
                 // Only update password if input is provided
                 if !input.is_empty() {
                     self.config.target_password = input;
                 }
-                self.transcript.push("Target Password: ********".to_string());
+                self.transcript
+                    .push("Target Password: ********".to_string());
             }
             WizardStep::TargetMode => {
                 // Use selected option from enum selector
                 let options = self.step.get_options();
                 if let Some(option) = options.get(self.selected_option) {
                     self.config.target_mode = option.value.to_string();
-                    self.transcript.push(format!("Target Mode: {} ({})", option.label, option.value));
+                    self.transcript
+                        .push(format!("Target Mode: {} ({})", option.label, option.value));
                 }
             }
             WizardStep::Workers => {
                 if !input.is_empty() {
-                    self.config.workers = input
-                        .parse()
-                        .map_err(|_| "Invalid number".to_string())?;
+                    self.config.workers =
+                        input.parse().map_err(|_| "Invalid number".to_string())?;
                     if self.config.workers == 0 {
                         return Err("Workers must be at least 1".to_string());
                     }
                 }
-                self.transcript.push(format!("Workers: {}", self.config.workers));
+                self.transcript
+                    .push(format!("Workers: {}", self.config.workers));
             }
             WizardStep::OutputFile => {
                 if !input.is_empty() {
                     self.output_path = PathBuf::from(&input);
                 }
-                self.transcript.push(format!("Output: {}", self.output_path.display()));
+                self.transcript
+                    .push(format!("Output: {}", self.output_path.display()));
             }
             WizardStep::Confirm => {
                 // Use selected option from enum selector (0 = Yes, 1 = No)
@@ -542,7 +561,10 @@ impl WizardState {
                         return Err(format!("Failed to save: {}", e));
                     }
                     self.was_saved = true;
-                    self.transcript.push(format!("Configuration saved to {}", self.output_path.display()));
+                    self.transcript.push(format!(
+                        "Configuration saved to {}",
+                        self.output_path.display()
+                    ));
                 } else {
                     self.was_saved = false;
                     self.transcript.push("Configuration cancelled.".to_string());

@@ -117,9 +117,7 @@ impl MssqlTargetPool {
     }
 
     /// Get a connection from the pool.
-    async fn get_conn(
-        &self,
-    ) -> Result<PooledConnection<'_, TiberiusTargetConnectionManager>> {
+    async fn get_conn(&self) -> Result<PooledConnection<'_, TiberiusTargetConnectionManager>> {
         self.pool
             .get()
             .await
@@ -176,14 +174,39 @@ impl MssqlTargetPool {
         let lower = data_type.to_lowercase();
         matches!(
             lower.as_str(),
-            "bigint" | "int" | "smallint" | "tinyint" | "bit"
-            | "decimal" | "numeric" | "money" | "smallmoney"
-            | "float" | "real"
-            | "datetime" | "datetime2" | "smalldatetime" | "date" | "time" | "datetimeoffset"
-            | "char" | "varchar" | "text" | "nchar" | "nvarchar" | "ntext"
-            | "binary" | "varbinary" | "image"
-            | "uniqueidentifier" | "xml" | "sql_variant" | "rowversion"
-            | "geography" | "geometry" | "hierarchyid"
+            "bigint"
+                | "int"
+                | "smallint"
+                | "tinyint"
+                | "bit"
+                | "decimal"
+                | "numeric"
+                | "money"
+                | "smallmoney"
+                | "float"
+                | "real"
+                | "datetime"
+                | "datetime2"
+                | "smalldatetime"
+                | "date"
+                | "time"
+                | "datetimeoffset"
+                | "char"
+                | "varchar"
+                | "text"
+                | "nchar"
+                | "nvarchar"
+                | "ntext"
+                | "binary"
+                | "varbinary"
+                | "image"
+                | "uniqueidentifier"
+                | "xml"
+                | "sql_variant"
+                | "rowversion"
+                | "geography"
+                | "geometry"
+                | "hierarchyid"
         )
     }
 
@@ -192,8 +215,8 @@ impl MssqlTargetPool {
         let lower = data_type.to_lowercase();
         match lower.as_str() {
             // Fixed-length types
-            "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney"
-            | "real" | "datetime" | "smalldatetime" | "date" | "text" | "ntext" | "image"
+            "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney" | "real"
+            | "datetime" | "smalldatetime" | "date" | "text" | "ntext" | "image"
             | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
             | "geography" | "geometry" | "hierarchyid" => data_type.to_string(),
 
@@ -305,7 +328,9 @@ impl MssqlTargetPool {
             SqlValue::Uuid(u) => format!("'{}'", u),
             SqlValue::Decimal(d) => d.to_string(),
             SqlValue::DateTime(dt) => format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")),
-            SqlValue::DateTimeOffset(dto) => format!("'{}'", dto.format("%Y-%m-%d %H:%M:%S%.6f %:z")),
+            SqlValue::DateTimeOffset(dto) => {
+                format!("'{}'", dto.format("%Y-%m-%d %H:%M:%S%.6f %:z"))
+            }
             SqlValue::Date(d) => format!("'{}'", d.format("%Y-%m-%d")),
             SqlValue::Time(t) => format!("'{}'", t.format("%H:%M:%S%.6f")),
         }
@@ -403,12 +428,8 @@ impl MssqlTargetPool {
                     Self::format_mssql_type(&c.data_type, c.max_length, c.precision, c.scale)
                 } else {
                     // Source is PostgreSQL - use the type mapper
-                    let mapping = postgres_to_mssql(
-                        &c.data_type,
-                        c.max_length,
-                        c.precision,
-                        c.scale,
-                    );
+                    let mapping =
+                        postgres_to_mssql(&c.data_type, c.max_length, c.precision, c.scale);
                     if mapping.is_lossy {
                         if let Some(warning) = &mapping.warning {
                             warn!("Column {}.{}: {}", table.name, c.name, warning);
@@ -431,7 +452,10 @@ impl MssqlTargetPool {
             .collect();
 
         // Add row hash column for change detection
-        col_defs.push(format!("{} NVARCHAR(32) NULL", Self::quote_ident(row_hash_column)));
+        col_defs.push(format!(
+            "{} NVARCHAR(32) NULL",
+            Self::quote_ident(row_hash_column)
+        ));
 
         let ddl = format!(
             "CREATE TABLE {}.{} (\n    {}\n)",
@@ -441,7 +465,10 @@ impl MssqlTargetPool {
         );
 
         conn.execute(&ddl, &[]).await?;
-        debug!("Created table with hash column: {}.{}", target_schema, table.name);
+        debug!(
+            "Created table with hash column: {}.{}",
+            target_schema, table.name
+        );
         Ok(())
     }
 
@@ -460,7 +487,9 @@ impl MssqlTargetPool {
                JOIN sys.schemas s ON t.schema_id = s.schema_id
                WHERE s.name = @P1 AND t.name = @P2 AND c.name = @P3"#;
 
-        let result = conn.query(check_query, &[&schema, &table, &row_hash_column]).await?;
+        let result = conn
+            .query(check_query, &[&schema, &table, &row_hash_column])
+            .await?;
         if let Some(row) = result.into_first_result().await?.into_iter().next() {
             let count: i32 = row.get(0).unwrap_or(0);
             if count > 0 {
@@ -614,12 +643,8 @@ impl TargetPool for MssqlTargetPool {
                     Self::format_mssql_type(&c.data_type, c.max_length, c.precision, c.scale)
                 } else {
                     // Source is PostgreSQL - use the type mapper
-                    let mapping = postgres_to_mssql(
-                        &c.data_type,
-                        c.max_length,
-                        c.precision,
-                        c.scale,
-                    );
+                    let mapping =
+                        postgres_to_mssql(&c.data_type, c.max_length, c.precision, c.scale);
                     if mapping.is_lossy {
                         if let Some(warning) = &mapping.warning {
                             warn!("Column {}.{}: {}", table.name, c.name, warning);
@@ -702,7 +727,11 @@ impl TargetPool for MssqlTargetPool {
         }
 
         let mut conn = self.get_conn().await?;
-        let pk_cols: Vec<String> = table.primary_key.iter().map(|c| Self::quote_ident(c)).collect();
+        let pk_cols: Vec<String> = table
+            .primary_key
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
         let pk_name = format!("PK_{}_{}", target_schema, table.name);
 
         let query = format!(
@@ -723,7 +752,11 @@ impl TargetPool for MssqlTargetPool {
         let idx_cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
 
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
-        let clustered = if idx.is_clustered { "CLUSTERED " } else { "NONCLUSTERED " };
+        let clustered = if idx.is_clustered {
+            "CLUSTERED "
+        } else {
+            "NONCLUSTERED "
+        };
 
         let query = format!(
             "CREATE {}{}INDEX {} ON {}.{} ({})",
@@ -736,7 +769,10 @@ impl TargetPool for MssqlTargetPool {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created index {} on {}.{}", idx.name, target_schema, table.name);
+        debug!(
+            "Created index {} on {}.{}",
+            idx.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -768,7 +804,12 @@ impl TargetPool for MssqlTargetPool {
             }
         }
 
-        debug!("Dropped {} indexes on {}.{}", dropped_indexes.len(), schema, table);
+        debug!(
+            "Dropped {} indexes on {}.{}",
+            dropped_indexes.len(),
+            schema,
+            table
+        );
         Ok(dropped_indexes)
     }
 
@@ -780,7 +821,11 @@ impl TargetPool for MssqlTargetPool {
     ) -> Result<()> {
         let mut conn = self.get_conn().await?;
         let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
-        let ref_cols: Vec<String> = fk.ref_columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let ref_cols: Vec<String> = fk
+            .ref_columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
 
         let query = format!(
             "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({}) ON DELETE {} ON UPDATE {}",
@@ -796,7 +841,10 @@ impl TargetPool for MssqlTargetPool {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created foreign key {} on {}.{}", fk.name, target_schema, table.name);
+        debug!(
+            "Created foreign key {} on {}.{}",
+            fk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -817,7 +865,10 @@ impl TargetPool for MssqlTargetPool {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created check constraint {} on {}.{}", chk.name, target_schema, table.name);
+        debug!(
+            "Created check constraint {} on {}.{}",
+            chk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -921,7 +972,10 @@ impl TargetPool for MssqlTargetPool {
                 )
             };
 
-            debug!("Executing batch: {}...", &batch_sql[..std::cmp::min(200, batch_sql.len())]);
+            debug!(
+                "Executing batch: {}...",
+                &batch_sql[..std::cmp::min(200, batch_sql.len())]
+            );
             conn.simple_query(&batch_sql).await?.into_results().await?;
         }
 
@@ -967,7 +1021,13 @@ impl TargetPool for MssqlTargetPool {
             // Build MERGE statement
             let join_condition: Vec<String> = pk_cols
                 .iter()
-                .map(|pk| format!("target.{} = source.{}", Self::quote_ident(pk), Self::quote_ident(pk)))
+                .map(|pk| {
+                    format!(
+                        "target.{} = source.{}",
+                        Self::quote_ident(pk),
+                        Self::quote_ident(pk)
+                    )
+                })
                 .collect();
 
             let update_cols: Vec<String> = cols
@@ -1014,9 +1074,7 @@ impl TargetPool for MssqlTargetPool {
             let batch_sql = if has_identity {
                 format!(
                     "SET IDENTITY_INSERT {} ON; {} SET IDENTITY_INSERT {} OFF;",
-                    qualified_table,
-                    merge_sql,
-                    qualified_table
+                    qualified_table, merge_sql, qualified_table
                 )
             } else {
                 merge_sql
@@ -1039,8 +1097,16 @@ impl TargetPool for MssqlTargetPool {
         row_hash_column: Option<&str>,
     ) -> Result<u64> {
         // Same as upsert_chunk - hash filtering is done before calling this
-        self.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, row_hash_column)
-            .await
+        self.upsert_chunk(
+            schema,
+            table,
+            cols,
+            pk_cols,
+            rows,
+            writer_id,
+            row_hash_column,
+        )
+        .await
     }
 
     fn db_type(&self) -> &str {

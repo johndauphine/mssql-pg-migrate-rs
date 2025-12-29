@@ -176,7 +176,10 @@ mod tests {
 
     #[test]
     fn test_exit_code_config_errors() {
-        assert_eq!(MigrateError::Config("test".into()).exit_code(), EXIT_CONFIG_ERROR);
+        assert_eq!(
+            MigrateError::Config("test".into()).exit_code(),
+            EXIT_CONFIG_ERROR
+        );
     }
 
     #[test]
@@ -221,7 +224,10 @@ mod tests {
 
     #[test]
     fn test_exit_code_state_errors() {
-        assert_eq!(MigrateError::State("test".into()).exit_code(), EXIT_STATE_ERROR);
+        assert_eq!(
+            MigrateError::State("test".into()).exit_code(),
+            EXIT_STATE_ERROR
+        );
         assert_eq!(MigrateError::ConfigChanged.exit_code(), EXIT_STATE_ERROR);
     }
 
@@ -302,7 +308,10 @@ mod tests {
 
     #[test]
     fn test_error_type_validation() {
-        assert_eq!(MigrateError::Validation("".into()).error_type(), "validation");
+        assert_eq!(
+            MigrateError::Validation("".into()).error_type(),
+            "validation"
+        );
     }
 
     #[test]
@@ -320,7 +329,11 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
         let err = MigrateError::pool(io_err, "context");
         match &err {
-            MigrateError::Pool { message, context, source } => {
+            MigrateError::Pool {
+                message,
+                context,
+                source,
+            } => {
                 assert_eq!(message, "test error");
                 assert_eq!(context, "context");
                 assert!(source.is_some());
@@ -335,7 +348,11 @@ mod tests {
     fn test_pool_msg_helper() {
         let err = MigrateError::pool_msg("message", "context");
         match err {
-            MigrateError::Pool { message, context, source } => {
+            MigrateError::Pool {
+                message,
+                context,
+                source,
+            } => {
                 assert_eq!(message, "message");
                 assert_eq!(context, "context");
                 assert!(source.is_none());

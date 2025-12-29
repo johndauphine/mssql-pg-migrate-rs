@@ -30,6 +30,28 @@ pub fn is_text_type(data_type: &str) -> bool {
         || dt == "nvarchar(max)"
 }
 
+/// Check if a Column is a text type that should be skipped when hash_text_columns is false.
+///
+/// This function checks both data_type and max_length, since MSSQL schema extraction
+/// stores "nvarchar" with max_length=-1 for nvarchar(max) columns.
+pub fn is_text_column(column: &Column) -> bool {
+    let dt = column.data_type.to_lowercase();
+    // Direct text types
+    if matches!(dt.as_str(), "text" | "ntext" | "xml") {
+        return true;
+    }
+    // Check for varchar(max) or nvarchar(max) - stored as max_length = -1
+    if (dt == "varchar" || dt == "nvarchar") && column.max_length == -1 {
+        return true;
+    }
+    // Also handle if type string already includes size
+    if dt == "varchar(-1)" || dt == "nvarchar(-1)" || dt == "varchar(max)" || dt == "nvarchar(max)"
+    {
+        return true;
+    }
+    false
+}
+
 /// Generate MSSQL expression for a normalized column value.
 ///
 /// The expression converts the column to a string representation that
@@ -45,15 +67,11 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
         "datetime" | "datetime2" | "smalldatetime" => {
             // FORMAT with custom pattern to match Rust's chrono format
             // Note: MSSQL datetime only has 3.33ms precision, datetime2 has 100ns
-            format!(
-                "ISNULL(FORMAT([{escaped_name}], 'yyyy-MM-dd HH:mm:ss.ffffff'), '\\N')"
-            )
+            format!("ISNULL(FORMAT([{escaped_name}], 'yyyy-MM-dd HH:mm:ss.ffffff'), '\\N')")
         }
         "datetimeoffset" => {
             // Rust uses RFC3339 format for DateTimeOffset
-            format!(
-                "ISNULL(FORMAT([{escaped_name}], 'yyyy-MM-ddTHH:mm:ss.fffffffzzz'), '\\N')"
-            )
+            format!("ISNULL(FORMAT([{escaped_name}], 'yyyy-MM-ddTHH:mm:ss.fffffffzzz'), '\\N')")
         }
         "date" => {
             // Rust uses: d.to_string() which gives YYYY-MM-DD
@@ -66,9 +84,7 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
 
         // Boolean: 't' or 'f' to match Rust
         "bit" => {
-            format!(
-                "ISNULL(CASE WHEN [{escaped_name}] = 1 THEN 't' ELSE 'f' END, '\\N')"
-            )
+            format!("ISNULL(CASE WHEN [{escaped_name}] = 1 THEN 't' ELSE 'f' END, '\\N')")
         }
 
         // Floating point: fixed precision to match Rust's format!
@@ -100,9 +116,7 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
         // Binary: Rust hashes raw bytes, but for comparison we use hex
         "binary" | "varbinary" | "image" => {
             // Convert to hex without 0x prefix
-            format!(
-                "ISNULL(CONVERT(VARCHAR(MAX), [{escaped_name}], 2), '\\N')"
-            )
+            format!("ISNULL(CONVERT(VARCHAR(MAX), [{escaped_name}], 2), '\\N')")
         }
 
         // Text types: direct conversion
@@ -123,13 +137,17 @@ pub fn mssql_normalize_expr(column: &Column) -> String {
 ///
 /// If `include_text` is false, skips text-type columns (text, ntext, varchar(max), etc.)
 /// for better performance.
-pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String], include_text: bool) -> String {
+pub fn mssql_row_hash_expr(
+    columns: &[Column],
+    pk_columns: &[String],
+    include_text: bool,
+) -> String {
     // Build concatenated expression with '|' separator, excluding PK columns
     // and optionally excluding text columns
     let col_exprs: Vec<String> = columns
         .iter()
         .filter(|c| !pk_columns.contains(&c.name))
-        .filter(|c| include_text || !is_text_type(&c.data_type))
+        .filter(|c| include_text || !is_text_column(c))
         .map(mssql_normalize_expr)
         .collect();
 
@@ -142,14 +160,21 @@ pub fn mssql_row_hash_expr(columns: &[Column], pk_columns: &[String], include_te
     let concat_expr = col_exprs.join(" + '|' + ");
 
     // HASHBYTES returns varbinary, convert to lowercase hex string
-    format!("LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', {}), 2))", concat_expr)
+    format!(
+        "LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', {}), 2))",
+        concat_expr
+    )
 }
 
 /// Generate the MSSQL aggregate hash expression using XOR.
 ///
 /// This produces an aggregate hash for a range of rows that can be compared
 /// to the XOR of row_hash values on the PostgreSQL side.
-pub fn mssql_batch_hash_expr(columns: &[Column], pk_columns: &[String], include_text: bool) -> String {
+pub fn mssql_batch_hash_expr(
+    columns: &[Column],
+    pk_columns: &[String],
+    include_text: bool,
+) -> String {
     let row_hash_expr = mssql_row_hash_expr(columns, pk_columns, include_text);
 
     // For aggregate hash, we need to XOR all row hashes
