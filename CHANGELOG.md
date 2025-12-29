@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.7] - 2025-12-29
+
+### Bug Fixes
+- **PostgreSQL to MSSQL type mapping fixes** - Fixed ambiguous type detection that caused incorrect column types
+  - `text` now correctly maps to `nvarchar(max)` instead of deprecated MSSQL `text` type
+  - `varchar` now correctly maps to `nvarchar` for Unicode support
+  - `char` now correctly maps to `nchar` for Unicode support
+  - `date` now maps to `datetime2` to work around Tiberius bulk insert DATE serialization issues
+
+### Improvements
+- Improved comments documenting intentionally excluded types from `is_mssql_type()` check
+- Updated type mapping comments to explain rationale for date->datetime2 conversion
+
 ## [0.8.6] - 2025-12-29
 
 ### Performance
