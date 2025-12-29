@@ -356,9 +356,13 @@ pub struct MigrationConfig {
     #[serde(default = "default_memory_budget_percent")]
     pub memory_budget_percent: u8,
 
-    /// Use hash-based change detection for upsert mode.
-    /// When enabled, rows are pre-filtered by comparing MD5 hashes before staging.
-    /// Only new or changed rows are transferred. If unset, upsert mode enables this by default.
+    /// Use hash-based change detection for upsert mode (default: false).
+    /// When false (default): streams all rows to PostgreSQL, which uses column-by-column
+    /// comparison in ON CONFLICT clause. Faster for most workloads (~3x speedup).
+    /// When true: pre-computes MD5 hashes and only transfers changed rows. Better for
+    /// low-bandwidth scenarios with <5% row changes.
+    /// NOTE: Switching from false to true requires a full refresh (drop_recreate or truncate)
+    /// first, as row_hash values are not populated when hash detection is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_hash_detection: Option<bool>,
 
@@ -735,10 +739,12 @@ impl MigrationConfig {
     }
 
     /// Check if hash-based change detection is enabled.
-    /// Defaults to true for all modes so row_hash column is always populated.
-    /// This allows switching to upsert mode later without re-migrating.
+    /// Defaults to false for faster upsert performance (streams all rows, lets PostgreSQL
+    /// handle comparison via column-by-column IS DISTINCT FROM in ON CONFLICT clause).
+    /// Set to true to pre-filter rows by hash before transfer (slower startup, less network
+    /// for low-change scenarios). Note: switching modes requires a full refresh first.
     pub fn use_hash_detection(&self) -> bool {
-        self.use_hash_detection.unwrap_or(true)
+        self.use_hash_detection.unwrap_or(false)
     }
 
     /// Get the row hash column name.
