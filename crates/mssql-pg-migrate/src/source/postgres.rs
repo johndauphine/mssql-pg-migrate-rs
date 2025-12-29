@@ -721,6 +721,11 @@ fn convert_pg_row_value(row: &tokio_postgres::Row, idx: usize, data_type: &str) 
             .ok()
             .map(SqlValue::Decimal)
             .unwrap_or(SqlValue::Null(SqlNullType::Decimal)),
+        "json" | "jsonb" => row
+            .try_get::<_, serde_json::Value>(idx)
+            .ok()
+            .map(|v| SqlValue::String(v.to_string()))
+            .unwrap_or(SqlValue::Null(SqlNullType::String)),
         _ => row
             .try_get::<_, String>(idx)
             .ok()
