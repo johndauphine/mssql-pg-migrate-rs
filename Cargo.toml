@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/mssql-pg-migrate", "crates/mssql-pg-migrate-cli"]
 
 [workspace.package]
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
