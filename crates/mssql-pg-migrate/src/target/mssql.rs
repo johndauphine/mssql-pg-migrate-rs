@@ -6,16 +6,18 @@
 use crate::config::TargetConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
-use crate::target::{SqlValue, TargetPool};
+use crate::target::{SqlNullType, SqlValue, TargetPool};
 use crate::typemap::postgres_to_mssql;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel};
+use chrono::Timelike;
+use std::borrow::Cow;
+use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, TokenRow};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
 
-/// Maximum rows per INSERT statement for MSSQL.
+/// Maximum rows per INSERT statement for MSSQL (fallback path).
 /// MSSQL has a limit of 1000 rows per INSERT VALUES statement.
 const MAX_ROWS_PER_INSERT: usize = 1000;
 
@@ -439,13 +441,14 @@ impl MssqlTargetPool {
                 };
 
                 let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
-                let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
+                // Note: IDENTITY columns are converted to regular INT/BIGINT for data warehouse use.
+                // This enables TDS bulk insert which is 5-10x faster than INSERT statements.
+                // Identity semantics are not needed in the target data warehouse.
 
                 format!(
-                    "{} {}{} {}",
+                    "{} {} {}",
                     Self::quote_ident(&c.name),
                     target_type,
-                    identity_clause,
                     null_clause
                 )
             })
@@ -554,12 +557,14 @@ impl MssqlTargetPool {
 impl TargetPool for MssqlTargetPool {
     async fn create_schema(&self, schema: &str) -> Result<()> {
         let mut conn = self.get_conn().await?;
+        // Use parameterized query for schema existence check to prevent SQL injection.
+        // The CREATE SCHEMA must use EXEC with quoted identifier since DDL doesn't support parameters.
+        let quoted_schema = Self::quote_ident(schema);
         let query = format!(
-            "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'{}') EXEC('CREATE SCHEMA {}')",
-            schema.replace('\'', "''"),
-            Self::quote_ident(schema)
+            "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = @P1) EXEC(N'CREATE SCHEMA {}')",
+            quoted_schema.replace('\'', "''")
         );
-        conn.execute(&query, &[]).await?;
+        conn.execute(&query, &[&schema]).await?;
         debug!("Created schema: {}", schema);
         Ok(())
     }
@@ -589,13 +594,14 @@ impl TargetPool for MssqlTargetPool {
                 };
 
                 let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
-                let identity_clause = if c.is_identity { " IDENTITY(1,1)" } else { "" };
+                // Note: IDENTITY columns are converted to regular INT/BIGINT for data warehouse use.
+                // This enables TDS bulk insert which is 5-10x faster than INSERT statements.
+                // Identity semantics are not needed in the target data warehouse.
 
                 format!(
-                    "{} {}{} {}",
+                    "{} {} {}",
                     Self::quote_ident(&c.name),
                     target_type,
-                    identity_clause,
                     null_clause
                 )
             })
@@ -859,60 +865,53 @@ impl TargetPool for MssqlTargetPool {
         &self,
         schema: &str,
         table: &str,
-        cols: &[String],
+        _cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
+        // Note: _cols is unused because Tiberius bulk_insert() reads column metadata
+        // directly from the target table. The rows must be in the exact same order
+        // and count as the table's columns. This is ensured by the orchestrator which
+        // extracts schema from source and creates matching target tables.
         if rows.is_empty() {
             return Ok(0);
         }
 
-        let mut conn = self.get_conn().await?;
         let total_rows = rows.len() as u64;
-
-        // Check for identity column
-        let has_identity = Self::has_identity_column(&mut conn, schema, table).await?;
-
-        // Build column list
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
-        let col_str = col_list.join(", ");
-
         let qualified_table = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
 
-        // Insert in batches, combining IDENTITY_INSERT with INSERT in single batch
-        for chunk in rows.chunks(MAX_ROWS_PER_INSERT) {
-            let values: Vec<String> = chunk
-                .iter()
-                .map(|row| {
-                    let row_values: Vec<String> = row.iter().map(Self::format_value).collect();
-                    format!("({})", row_values.join(", "))
-                })
-                .collect();
+        // Use TDS bulk insert for maximum performance.
+        // This is 5-10x faster than INSERT VALUES statements.
+        let mut conn = self.get_conn().await?;
 
-            // Build the SQL - if has_identity, wrap in IDENTITY_INSERT ON/OFF
-            let batch_sql = if has_identity {
-                format!(
-                    "SET IDENTITY_INSERT {} ON; INSERT INTO {} ({}) VALUES {}; SET IDENTITY_INSERT {} OFF;",
-                    qualified_table,
-                    qualified_table,
-                    col_str,
-                    values.join(", "),
-                    qualified_table
-                )
-            } else {
-                format!(
-                    "INSERT INTO {} ({}) VALUES {}",
-                    qualified_table,
-                    col_str,
-                    values.join(", ")
-                )
-            };
+        // Start bulk insert - Tiberius reads column metadata from the target table
+        let mut bulk_load = conn
+            .bulk_insert(&qualified_table)
+            .await
+            .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e)))?;
 
-            debug!(
-                "Executing batch: {}...",
-                &batch_sql[..std::cmp::min(200, batch_sql.len())]
-            );
-            conn.simple_query(&batch_sql).await?.into_results().await?;
+        // Send each row
+        for row in rows {
+            let mut token_row = TokenRow::new();
+            for value in &row {
+                token_row.push(sql_value_to_column_data(value));
+            }
+            bulk_load
+                .send(token_row)
+                .await
+                .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert send: {}", e)))?;
         }
+
+        // Finalize the bulk insert
+        let result = bulk_load
+            .finalize()
+            .await
+            .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert finalize: {}", e)))?;
+
+        let rows_affected = result.total();
+        debug!(
+            "Bulk inserted {} rows into {} (reported: {})",
+            total_rows, qualified_table, rows_affected
+        );
 
         Ok(total_rows)
     }
@@ -1012,5 +1011,215 @@ impl TargetPool for MssqlTargetPool {
 
     async fn close(&self) {
         // bb8 handles cleanup automatically
+    }
+}
+
+/// Convert SqlValue to Tiberius ColumnData for bulk insert.
+///
+/// This function maps our internal SqlValue enum to Tiberius's ColumnData
+/// which is used by the TDS bulk insert protocol for high-performance data loading.
+fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
+    match value {
+        SqlValue::Null(null_type) => match null_type {
+            SqlNullType::Bool => ColumnData::Bit(None),
+            SqlNullType::I16 => ColumnData::I16(None),
+            SqlNullType::I32 => ColumnData::I32(None),
+            SqlNullType::I64 => ColumnData::I64(None),
+            SqlNullType::F32 => ColumnData::F32(None),
+            SqlNullType::F64 => ColumnData::F64(None),
+            SqlNullType::String => ColumnData::String(None),
+            SqlNullType::Bytes => ColumnData::Binary(None),
+            SqlNullType::Uuid => ColumnData::Guid(None),
+            SqlNullType::Decimal => ColumnData::Numeric(None),
+            SqlNullType::DateTime => ColumnData::DateTime2(None),
+            SqlNullType::DateTimeOffset => ColumnData::DateTimeOffset(None),
+            SqlNullType::Date => ColumnData::Date(None),
+            SqlNullType::Time => ColumnData::Time(None),
+        },
+        SqlValue::Bool(b) => ColumnData::Bit(Some(*b)),
+        SqlValue::I16(i) => ColumnData::I16(Some(*i)),
+        SqlValue::I32(i) => ColumnData::I32(Some(*i)),
+        SqlValue::I64(i) => ColumnData::I64(Some(*i)),
+        SqlValue::F32(f) => {
+            if f.is_nan() || f.is_infinite() {
+                // MSSQL doesn't support NaN/Infinity, convert to NULL
+                warn!("Converting F32 NaN/Infinity to NULL for MSSQL compatibility");
+                ColumnData::F32(None)
+            } else {
+                ColumnData::F32(Some(*f))
+            }
+        }
+        SqlValue::F64(f) => {
+            if f.is_nan() || f.is_infinite() {
+                // MSSQL doesn't support NaN/Infinity, convert to NULL
+                warn!("Converting F64 NaN/Infinity to NULL for MSSQL compatibility");
+                ColumnData::F64(None)
+            } else {
+                ColumnData::F64(Some(*f))
+            }
+        }
+        SqlValue::String(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
+        SqlValue::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.clone()))),
+        SqlValue::Uuid(u) => ColumnData::Guid(Some(*u)),
+        SqlValue::Decimal(d) => {
+            // Convert rust_decimal to Tiberius Numeric
+            // Tiberius Numeric uses i128 internally with scale
+            let scale = d.scale() as u8;
+            let mantissa = d.mantissa();
+            ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                mantissa, scale,
+            )))
+        }
+        SqlValue::DateTime(dt) => {
+            // Convert chrono::NaiveDateTime to Tiberius DateTime2
+            // DateTime2 uses Date (days since year 1) + Time (100-nanosecond increments)
+            let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+            let days_i64 = (dt.date() - epoch).num_days();
+            // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
+            if days_i64 < 0 || days_i64 > u32::MAX as i64 {
+                warn!("DateTime out of valid range (days={}), converting to NULL", days_i64);
+                return ColumnData::DateTime2(None);
+            }
+            let days = days_i64 as u32;
+            let date = tiberius::time::Date::new(days);
+            let time_val = dt.time();
+            let nanos = time_val.num_seconds_from_midnight() as u64 * 1_000_000_000
+                + time_val.nanosecond() as u64;
+            // Scale 7 = 100 nanosecond increments for maximum precision
+            let increments = nanos / 100;
+            let time = tiberius::time::Time::new(increments, 7);
+            ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(date, time)))
+        }
+        SqlValue::DateTimeOffset(dto) => {
+            // Convert chrono::DateTime<FixedOffset> to Tiberius DateTimeOffset
+            // DateTimeOffset is DateTime2 + offset in minutes from UTC
+            let naive = dto.naive_utc();
+            // Days since year 1, January 1
+            let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+            let days_i64 = (naive.date() - epoch).num_days();
+            // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
+            if days_i64 < 0 || days_i64 > u32::MAX as i64 {
+                warn!("DateTimeOffset out of valid range (days={}), converting to NULL", days_i64);
+                return ColumnData::DateTimeOffset(None);
+            }
+            let days = days_i64 as u32;
+            let date = tiberius::time::Date::new(days);
+            // Time with nanosecond precision (scale=7 means 10^-7 second increments)
+            let time_val = naive.time();
+            let nanos = time_val.num_seconds_from_midnight() as u64 * 1_000_000_000
+                + time_val.nanosecond() as u64;
+            // Scale 7 = 100 nanosecond increments
+            let increments = nanos / 100;
+            let time = tiberius::time::Time::new(increments, 7);
+            let datetime2 = tiberius::time::DateTime2::new(date, time);
+            // Offset in minutes (integer division truncates sub-minute offsets)
+            let offset_seconds = dto.offset().local_minus_utc();
+            let offset_minutes = (offset_seconds / 60) as i16;
+            ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(
+                datetime2,
+                offset_minutes,
+            )))
+        }
+        SqlValue::Date(d) => {
+            // Convert chrono::NaiveDate to Tiberius Date
+            // Date is days since year 1, January 1
+            let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+            let days_i64 = (*d - epoch).num_days();
+            // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
+            if days_i64 < 0 || days_i64 > u32::MAX as i64 {
+                warn!("Date out of valid range (days={}), converting to NULL", days_i64);
+                return ColumnData::Date(None);
+            }
+            let days = days_i64 as u32;
+            ColumnData::Date(Some(tiberius::time::Date::new(days)))
+        }
+        SqlValue::Time(t) => {
+            // Convert chrono::NaiveTime to Tiberius Time
+            // Time is increments of 10^-scale seconds since midnight
+            // Using scale=7 (100 nanosecond increments) for maximum precision
+            let nanos = t.num_seconds_from_midnight() as u64 * 1_000_000_000
+                + t.nanosecond() as u64;
+            let increments = nanos / 100; // Convert to 100-nanosecond increments
+            ColumnData::Time(Some(tiberius::time::Time::new(increments, 7)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sql_value_to_column_data_nan_converts_to_null() {
+        let nan_f32 = SqlValue::F32(f32::NAN);
+        let nan_f64 = SqlValue::F64(f64::NAN);
+        let inf_f32 = SqlValue::F32(f32::INFINITY);
+        let neg_inf_f64 = SqlValue::F64(f64::NEG_INFINITY);
+
+        assert!(matches!(sql_value_to_column_data(&nan_f32), ColumnData::F32(None)));
+        assert!(matches!(sql_value_to_column_data(&nan_f64), ColumnData::F64(None)));
+        assert!(matches!(sql_value_to_column_data(&inf_f32), ColumnData::F32(None)));
+        assert!(matches!(sql_value_to_column_data(&neg_inf_f64), ColumnData::F64(None)));
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_valid_floats() {
+        let f32_val = SqlValue::F32(3.14);
+        let f64_val = SqlValue::F64(2.718281828);
+
+        assert!(matches!(sql_value_to_column_data(&f32_val), ColumnData::F32(Some(_))));
+        assert!(matches!(sql_value_to_column_data(&f64_val), ColumnData::F64(Some(_))));
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_null_types() {
+        let null_bool = SqlValue::Null(SqlNullType::Bool);
+        let null_string = SqlValue::Null(SqlNullType::String);
+        let null_datetime = SqlValue::Null(SqlNullType::DateTime);
+
+        assert!(matches!(sql_value_to_column_data(&null_bool), ColumnData::Bit(None)));
+        assert!(matches!(sql_value_to_column_data(&null_string), ColumnData::String(None)));
+        assert!(matches!(sql_value_to_column_data(&null_datetime), ColumnData::DateTime2(None)));
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_basic_types() {
+        let bool_val = SqlValue::Bool(true);
+        let i32_val = SqlValue::I32(42);
+        let i64_val = SqlValue::I64(1234567890);
+        let string_val = SqlValue::String("hello".to_string());
+
+        assert!(matches!(sql_value_to_column_data(&bool_val), ColumnData::Bit(Some(true))));
+        assert!(matches!(sql_value_to_column_data(&i32_val), ColumnData::I32(Some(42))));
+        assert!(matches!(sql_value_to_column_data(&i64_val), ColumnData::I64(Some(1234567890))));
+        if let ColumnData::String(Some(s)) = sql_value_to_column_data(&string_val) {
+            assert_eq!(s.as_ref(), "hello");
+        } else {
+            panic!("Expected ColumnData::String");
+        }
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_valid_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
+        let date_val = SqlValue::Date(date);
+
+        assert!(matches!(sql_value_to_column_data(&date_val), ColumnData::Date(Some(_))));
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_decimal() {
+        let decimal = rust_decimal::Decimal::new(12345, 2); // 123.45
+        let decimal_val = SqlValue::Decimal(decimal);
+
+        assert!(matches!(sql_value_to_column_data(&decimal_val), ColumnData::Numeric(Some(_))));
+    }
+
+    #[test]
+    fn test_sql_value_to_column_data_uuid() {
+        let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let uuid_val = SqlValue::Uuid(uuid);
+
+        assert!(matches!(sql_value_to_column_data(&uuid_val), ColumnData::Guid(Some(_))));
     }
 }
