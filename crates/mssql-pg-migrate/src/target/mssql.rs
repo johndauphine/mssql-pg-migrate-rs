@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::Timelike;
 use std::borrow::Cow;
-use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, TokenRow};
+use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
@@ -20,6 +20,13 @@ use tracing::{debug, info, warn};
 /// Maximum rows per INSERT statement for MSSQL (fallback path).
 /// MSSQL has a limit of 1000 rows per INSERT VALUES statement.
 const MAX_ROWS_PER_INSERT: usize = 1000;
+
+/// Maximum string length (in bytes) for TDS bulk insert.
+/// Tiberius bulk insert has a hard limit of 65535 bytes for UTF-16 encoded strings.
+/// UTF-16 uses 2 bytes per code unit for BMP characters, so approximately 32K code units.
+/// The byte-length calculation (using `c.len_utf16() * 2`) already accounts for surrogate pairs,
+/// so this constant represents the exact 65535-byte limit.
+const BULK_INSERT_STRING_LIMIT: usize = 65535;
 
 /// Connection manager for bb8 pool with tiberius for MSSQL target.
 #[derive(Clone)]
@@ -339,6 +346,73 @@ impl MssqlTargetPool {
             SqlValue::Date(d) => format!("'{}'", d.format("%Y-%m-%d")),
             SqlValue::Time(t) => format!("'{}'", t.format("%H:%M:%S%.6f")),
         }
+    }
+
+    /// Check if a row contains any string values that exceed the bulk insert limit.
+    /// Tiberius bulk insert has a 65535 byte limit for UTF-16 encoded strings.
+    fn row_has_oversized_strings(row: &[SqlValue]) -> bool {
+        for value in row {
+            if let SqlValue::String(s) = value {
+                // Calculate UTF-16 encoded byte length: len_utf16() returns code units (1 for BMP,
+                // 2 for surrogate pairs), multiplied by 2 to get bytes (2 for BMP, 4 for surrogates).
+                let utf16_len: usize = s.chars().map(|c| c.len_utf16() * 2).sum();
+                if utf16_len > BULK_INSERT_STRING_LIMIT {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Insert rows using parameterized INSERT statements (fallback for oversized strings).
+    /// Uses parameterized queries to prevent SQL injection.
+    async fn insert_rows_fallback(
+        conn: &mut PooledConnection<'_, TiberiusTargetConnectionManager>,
+        qualified_table: &str,
+        cols: &[String],
+        rows: &[Vec<SqlValue>],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_str = col_list.join(", ");
+
+        // Build parameterized query with @P1, @P2, ... placeholders
+        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("@P{}", i)).collect();
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            qualified_table,
+            col_str,
+            placeholders.join(", ")
+        );
+
+        let mut total_inserted = 0u64;
+
+        // Insert one row at a time with parameterized queries
+        // This is slower than bulk VALUES but secure against SQL injection
+        for (row_idx, row) in rows.iter().enumerate() {
+            // Convert SqlValue to boxed ToSql trait objects
+            let params: Vec<Box<dyn ToSql>> = row
+                .iter()
+                .map(sql_value_to_sql_param)
+                .collect();
+
+            // Create references for the execute call
+            let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+            conn.execute(sql.as_str(), &param_refs).await.map_err(|e| {
+                MigrateError::transfer(
+                    qualified_table,
+                    format!("fallback INSERT (row {}): {}", row_idx, e),
+                )
+            })?;
+
+            total_inserted += 1;
+        }
+
+        Ok(total_inserted)
     }
 
     /// Fetch row hashes for hash-based change detection.
@@ -868,55 +942,110 @@ impl TargetPool for MssqlTargetPool {
         &self,
         schema: &str,
         table: &str,
-        _cols: &[String],
+        cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64> {
-        // Note: _cols is unused because Tiberius bulk_insert() reads column metadata
-        // directly from the target table. The rows must be in the exact same order
-        // and count as the table's columns. This is ensured by the orchestrator which
-        // extracts schema from source and creates matching target tables.
         if rows.is_empty() {
             return Ok(0);
         }
 
-        let total_rows = rows.len() as u64;
         let qualified_table = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
 
-        // Use TDS bulk insert for maximum performance.
-        // This is 5-10x faster than INSERT VALUES statements.
-        let mut conn = self.get_conn().await?;
+        // Partition rows: bulk-insertable vs oversized strings
+        // Tiberius bulk insert has a 65535 byte limit for UTF-16 encoded strings.
+        let mut bulk_rows = Vec::with_capacity(rows.len());
+        let mut oversized_rows = Vec::new();
 
-        // Start bulk insert - Tiberius reads column metadata from the target table
-        let mut bulk_load = conn
-            .bulk_insert(&qualified_table)
-            .await
-            .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e)))?;
-
-        // Send each row
         for row in rows {
-            let mut token_row = TokenRow::new();
-            for value in &row {
-                token_row.push(sql_value_to_column_data(value));
+            if Self::row_has_oversized_strings(&row) {
+                oversized_rows.push(row);
+            } else {
+                bulk_rows.push(row);
             }
-            bulk_load
-                .send(token_row)
-                .await
-                .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert send: {}", e)))?;
         }
 
-        // Finalize the bulk insert
-        let result = bulk_load
-            .finalize()
-            .await
-            .map_err(|e| MigrateError::transfer(&qualified_table, format!("bulk insert finalize: {}", e)))?;
+        // Get a single connection for the entire chunk operation
+        let mut conn = self.get_conn().await?;
+        let mut total_inserted = 0u64;
 
-        let rows_affected = result.total();
-        debug!(
-            "Bulk inserted {} rows into {} (reported: {})",
-            total_rows, qualified_table, rows_affected
-        );
+        // If we have both bulk and oversized rows, wrap the entire operation
+        // in a transaction to ensure atomicity
+        let needs_transaction = !bulk_rows.is_empty() && !oversized_rows.is_empty();
+        if needs_transaction {
+            conn.execute("BEGIN TRANSACTION", &[]).await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("begin transaction: {}", e))
+            })?;
+        }
 
-        Ok(total_rows)
+        // Process bulk-insertable rows via TDS bulk insert (5-10x faster)
+        if !bulk_rows.is_empty() {
+            let bulk_count = bulk_rows.len() as u64;
+
+            // Start bulk insert - Tiberius reads column metadata from the target table
+            let mut bulk_load = conn
+                .bulk_insert(&qualified_table)
+                .await
+                .map_err(|e| {
+                    MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e))
+                })?;
+
+            // Send each row
+            for row in bulk_rows {
+                let mut token_row = TokenRow::new();
+                for value in &row {
+                    token_row.push(sql_value_to_column_data(value));
+                }
+                bulk_load.send(token_row).await.map_err(|e| {
+                    MigrateError::transfer(&qualified_table, format!("bulk insert send: {}", e))
+                })?;
+            }
+
+            // Finalize the bulk insert
+            let result = bulk_load.finalize().await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("bulk insert finalize: {}", e))
+            })?;
+
+            let rows_affected = result.total();
+            debug!(
+                "Bulk inserted {} rows into {} (reported: {})",
+                bulk_count, qualified_table, rows_affected
+            );
+
+            total_inserted += bulk_count;
+        }
+
+        // Fall back to parameterized INSERT statements for rows with oversized strings
+        if !oversized_rows.is_empty() {
+            let oversized_count = oversized_rows.len();
+            debug!(
+                "Falling back to INSERT for {} rows with oversized strings in {}",
+                oversized_count, qualified_table
+            );
+
+            match Self::insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows)
+                .await
+            {
+                Ok(inserted) => {
+                    total_inserted += inserted;
+                }
+                Err(e) => {
+                    // Rollback transaction if we started one
+                    if needs_transaction {
+                        let _ = conn.execute("ROLLBACK TRANSACTION", &[]).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Commit transaction if we started one
+        if needs_transaction {
+            conn.execute("COMMIT TRANSACTION", &[]).await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("commit transaction: {}", e))
+            })?;
+        }
+
+        Ok(total_inserted)
     }
 
     async fn upsert_chunk(
@@ -1014,6 +1143,34 @@ impl TargetPool for MssqlTargetPool {
 
     async fn close(&self) {
         // bb8 handles cleanup automatically
+    }
+}
+
+/// Convert SqlValue to a boxed ToSql trait object for parameterized queries.
+///
+/// This is used by the fallback INSERT path for rows with oversized strings.
+/// Using parameterized queries prevents SQL injection attacks.
+fn sql_value_to_sql_param(value: &SqlValue) -> Box<dyn ToSql> {
+    match value {
+        SqlValue::Null(_) => Box::new(Option::<String>::None),
+        SqlValue::Bool(b) => Box::new(*b),
+        SqlValue::I16(i) => Box::new(*i),
+        SqlValue::I32(i) => Box::new(*i),
+        SqlValue::I64(i) => Box::new(*i),
+        SqlValue::F32(f) => Box::new(*f),
+        SqlValue::F64(f) => Box::new(*f),
+        SqlValue::String(s) => Box::new(s.clone()),
+        SqlValue::Bytes(b) => Box::new(b.clone()),
+        SqlValue::Uuid(u) => Box::new(*u),
+        SqlValue::Decimal(d) => Box::new(*d),
+        SqlValue::DateTime(dt) => Box::new(*dt),
+        SqlValue::DateTimeOffset(dto) => Box::new(*dto),
+        SqlValue::Date(d) => {
+            // Convert Date to NaiveDateTime at midnight for MSSQL compatibility
+            let dt = d.and_hms_opt(0, 0, 0).unwrap();
+            Box::new(dt)
+        }
+        SqlValue::Time(t) => Box::new(*t),
     }
 }
 
@@ -1230,5 +1387,77 @@ mod tests {
         let uuid_val = SqlValue::Uuid(uuid);
 
         assert!(matches!(sql_value_to_column_data(&uuid_val), ColumnData::Guid(Some(_))));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_empty_row() {
+        let row: Vec<SqlValue> = vec![];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_small_strings() {
+        let row = vec![
+            SqlValue::String("hello".to_string()),
+            SqlValue::String("world".to_string()),
+            SqlValue::I32(42),
+        ];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_non_string_values() {
+        let row = vec![
+            SqlValue::I32(42),
+            SqlValue::I64(123456789),
+            SqlValue::F64(3.14159),
+            SqlValue::Bool(true),
+        ];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_at_limit() {
+        // 65535 bytes / 2 bytes per BMP char = 32767 chars (and 1 byte remainder)
+        // Actually, 65535 / 2 = 32767.5, so 32767 chars = 65534 bytes (under limit)
+        let at_limit = "a".repeat(32767); // 32767 * 2 = 65534 bytes (under limit)
+        let row = vec![SqlValue::String(at_limit)];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_over_limit() {
+        // 32768 chars * 2 bytes = 65536 bytes (over 65535 limit)
+        let over_limit = "a".repeat(32768);
+        let row = vec![SqlValue::String(over_limit)];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_with_surrogate_pairs() {
+        // Emoji characters require surrogate pairs (4 bytes each in UTF-16)
+        // 65535 / 4 = 16383.75, so 16383 emojis = 65532 bytes (under limit)
+        // 16384 emojis = 65536 bytes (over limit)
+        let under_limit = "😀".repeat(16383); // 16383 * 4 = 65532 bytes
+        let row = vec![SqlValue::String(under_limit)];
+        assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
+
+        let over_limit = "😀".repeat(16384); // 16384 * 4 = 65536 bytes
+        let row = vec![SqlValue::String(over_limit)];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
+    }
+
+    #[test]
+    fn test_row_has_oversized_strings_mixed_row() {
+        // One oversized string among normal values should trigger true
+        let normal_string = SqlValue::String("hello".to_string());
+        let oversized_string = SqlValue::String("x".repeat(40000)); // 80000 bytes
+        let row = vec![
+            SqlValue::I32(1),
+            normal_string,
+            oversized_string,
+            SqlValue::Bool(false),
+        ];
+        assert!(MssqlTargetPool::row_has_oversized_strings(&row));
     }
 }
