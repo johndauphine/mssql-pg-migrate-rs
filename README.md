@@ -12,7 +12,7 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 |------|----------|------------|
 | drop_recreate | 119s | 162,452 rows/sec |
 | truncate | ~100s | ~193,000 rows/sec |
-| upsert | ~240s | ~80,000 rows/sec |
+| upsert | ~180s | ~106,000 rows/sec |
 
 *Auto-tuned parallelism, localhost MSSQL → PostgreSQL, binary COPY protocol*
 
@@ -23,8 +23,7 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
-- **Batch hash verification** - Multi-tier verification detects differences efficiently
-- **Incremental sync** - Upsert mode uses batch hashing to sync only changed rows
+- **Incremental sync** - Upsert mode with `IS DISTINCT FROM` change detection
 - **Interactive TUI** - Terminal UI for guided migration with real-time progress
 - **Configuration wizard** - Interactive `init` command creates config files
 - **Automatic type mapping** - MSSQL to PostgreSQL type conversion
@@ -94,16 +93,6 @@ mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state resume
 mssql-pg-migrate -c config.yaml --output-json run
 ```
 
-### Verify data consistency
-
-```bash
-# Multi-tier batch hash verification (read-only)
-mssql-pg-migrate -c config.yaml verify
-
-# With custom batch sizes
-mssql-pg-migrate -c config.yaml verify --tier1-size 500000 --tier2-size 5000
-```
-
 ### Interactive TUI mode
 
 ```bash
@@ -169,17 +158,17 @@ This allows optimal performance across different hardware without manual configu
 |------|----------|
 | `drop_recreate` | Drop target tables, create fresh, bulk insert (fastest for full refresh) |
 | `truncate` | Truncate existing tables, create if missing, bulk insert |
-| `upsert` | Uses batch hashing to detect changes, syncs only modified rows (ideal for incremental sync) |
+| `upsert` | Stream to staging table, merge with `IS DISTINCT FROM` change detection (ideal for incremental sync) |
 
 ### Upsert Mode Details
 
-Upsert mode uses multi-tier batch hashing to efficiently detect differences:
+Upsert mode streams all rows to PostgreSQL and uses efficient change detection:
 
-1. **Tier 1**: NTILE partitioning compares ~1M row batches
-2. **Tier 2**: Drills into mismatched partitions with ~10K row ranges
-3. **Tier 3**: Row-level hash comparison identifies specific inserts/updates
+1. **Staging**: Rows are COPY'd to a temporary staging table
+2. **Merge**: `INSERT...ON CONFLICT DO UPDATE WHERE IS DISTINCT FROM` detects actual changes
+3. **Optimization**: PostgreSQL only writes rows where column values differ
 
-Only changed rows are transferred - no deletes are performed for safety.
+No deletes are performed for safety. The `IS DISTINCT FROM` operator handles NULL values correctly.
 
 ## Type Mapping
 
