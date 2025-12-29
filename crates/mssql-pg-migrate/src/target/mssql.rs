@@ -548,71 +548,6 @@ impl MssqlTargetPool {
         Ok(partitions)
     }
 
-    /// Execute count query with ROW_NUMBER range.
-    ///
-    /// Returns (row_count, range_hash) for update detection.
-    pub async fn execute_count_query_with_rownum(
-        &self,
-        query: &str,
-        range: &crate::verify::RowRange,
-    ) -> Result<(i64, i64)> {
-        let mut conn = self.get_conn().await?;
-        // Build query with range substitution (MSSQL uses @P1, @P2 placeholders)
-        let final_query = query
-            .replace("@P1", &range.start_row.to_string())
-            .replace("@P2", &range.end_row.to_string());
-
-        let result = conn.simple_query(&final_query).await?;
-        if let Some(row) = result.into_first_result().await?.into_iter().next() {
-            let row_count: i64 = row
-                .get::<i64, _>(0)
-                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
-            // range_hash is column 1 (optional - default to 0 if not present)
-            let range_hash: i64 = row
-                .get::<i64, _>(1)
-                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
-            return Ok((row_count, range_hash));
-        }
-        Ok((0, 0))
-    }
-
-    /// Fetch row hashes with ROW_NUMBER range for verification.
-    pub async fn fetch_row_hashes_with_rownum(
-        &self,
-        query: &str,
-        range: &crate::verify::RowRange,
-        pk_column_count: usize,
-    ) -> Result<crate::verify::CompositeRowHashMap> {
-        use crate::source::PkValue;
-        use crate::verify::{CompositePk, CompositeRowHashMap};
-
-        let mut conn = self.get_conn().await?;
-        // Build query with range substitution
-        let final_query = query
-            .replace("$1", &range.start_row.to_string())
-            .replace("$2", &range.end_row.to_string());
-
-        let result = conn.simple_query(&final_query).await?;
-        let mut hashes = CompositeRowHashMap::new();
-
-        for row in result.into_first_result().await? {
-            // Extract PK columns
-            let mut pk_values = Vec::with_capacity(pk_column_count);
-            for i in 0..pk_column_count {
-                let val: Option<&str> = row.try_get(i).ok().flatten();
-                pk_values.push(PkValue::String(val.unwrap_or("NULL").to_string()));
-            }
-            let pk = CompositePk(pk_values);
-
-            // Hash is the last column
-            let hash: Option<&str> = row.try_get(pk_column_count).ok().flatten();
-            if let Some(h) = hash {
-                hashes.insert(pk, h.to_string());
-            }
-        }
-
-        Ok(hashes)
-    }
 }
 
 #[async_trait]
@@ -990,7 +925,6 @@ impl TargetPool for MssqlTargetPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         _writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64> {
         if rows.is_empty() {
             return Ok(0);
@@ -1041,30 +975,16 @@ impl TargetPool for MssqlTargetPool {
                 .map(|c| format!("source.{}", Self::quote_ident(c)))
                 .collect();
 
-            // Build the update condition
-            let update_condition = if let Some(hash_col) = row_hash_column {
-                // Only update if hash differs
-                format!(
-                    " AND (target.{} IS NULL OR target.{} <> source.{})",
-                    Self::quote_ident(hash_col),
-                    Self::quote_ident(hash_col),
-                    Self::quote_ident(hash_col)
-                )
-            } else {
-                String::new()
-            };
-
             let merge_sql = format!(
                 r#"MERGE INTO {} AS target
                    USING (VALUES {}) AS source ({})
                    ON {}
-                   WHEN MATCHED{} THEN UPDATE SET {}
+                   WHEN MATCHED THEN UPDATE SET {}
                    WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});"#,
                 qualified_table,
                 values.join(", "),
                 col_str,
                 join_condition.join(" AND "),
-                update_condition,
                 update_cols.join(", "),
                 col_str,
                 source_cols.join(", ")
@@ -1084,29 +1004,6 @@ impl TargetPool for MssqlTargetPool {
         }
 
         Ok(total_rows)
-    }
-
-    async fn upsert_chunk_with_hash(
-        &self,
-        schema: &str,
-        table: &str,
-        cols: &[String],
-        pk_cols: &[String],
-        rows: Vec<Vec<SqlValue>>,
-        writer_id: usize,
-        row_hash_column: Option<&str>,
-    ) -> Result<u64> {
-        // Same as upsert_chunk - hash filtering is done before calling this
-        self.upsert_chunk(
-            schema,
-            table,
-            cols,
-            pk_cols,
-            rows,
-            writer_id,
-            row_hash_column,
-        )
-        .await
     }
 
     fn db_type(&self) -> &str {

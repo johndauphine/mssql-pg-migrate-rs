@@ -8,13 +8,10 @@
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
-use crate::source::Column;
 use crate::source::Table;
-use crate::target::{calculate_row_hash, SqlValue};
-use crate::verify::normalize::{is_text_column, mssql_row_hash_expr};
+use crate::target::SqlValue;
 use futures::future::try_join_all;
-use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,16 +41,6 @@ pub struct TransferJob {
 
     /// Target schema name.
     pub target_schema: String,
-
-    /// Whether to use hash-based change detection for upsert.
-    pub use_hash_detection: bool,
-
-    /// Column name for storing row hashes (when hash detection is enabled).
-    pub row_hash_column: String,
-
-    /// Whether to include text-type columns in hash computation.
-    /// When false, skips text, ntext, varchar(max), nvarchar(max), xml columns.
-    pub hash_text_columns: bool,
 }
 
 /// Statistics from a transfer job.
@@ -70,9 +57,6 @@ pub struct TransferStats {
 
     /// Total rows transferred.
     pub rows: i64,
-
-    /// Rows skipped due to hash match (unchanged).
-    pub rows_skipped: i64,
 
     /// Last primary key value processed.
     pub last_pk: Option<i64>,
@@ -228,16 +212,11 @@ impl TransferEngine {
     pub async fn execute(&self, job: TransferJob) -> Result<TransferStats> {
         let table_name = job.table.full_name();
         info!(
-            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {}{})",
+            "Starting transfer for {} (mode: {:?}, readers: {}, writers: {})",
             table_name,
             job.target_mode,
             self.config.parallel_readers,
             self.config.parallel_writers,
-            if job.use_hash_detection {
-                ", hash_detection=on"
-            } else {
-                ""
-            }
         );
 
         let start = Instant::now();
@@ -252,76 +231,6 @@ impl TransferEngine {
             .map(|c| c.data_type.clone())
             .collect();
         let pk_cols: Vec<String> = job.table.primary_key.clone();
-
-        // Hash detection setup: check if enabled and applicable
-        // Now supports both single and composite primary keys
-        // Enable for ALL modes (not just Upsert) so row_hash is populated for future upsert runs
-        // Compute and write row_hash for all modes if enabled
-        // This allows future upsert runs to use hash-based change detection
-        let use_hash = job.use_hash_detection && !job.table.primary_key.is_empty();
-
-        // Only fetch existing hashes for Upsert mode (for change filtering)
-        // For drop_recreate/truncate, the target table is empty so skip fetching
-        let fetch_hashes = use_hash && matches!(job.target_mode, TargetMode::Upsert);
-        let existing_hashes: HashMap<String, String> = if fetch_hashes {
-            match self
-                .target
-                .fetch_row_hashes(
-                    &job.target_schema,
-                    &job.table.name,
-                    &pk_cols,
-                    &job.row_hash_column,
-                    job.min_pk,
-                    job.max_pk,
-                )
-                .await
-            {
-                Ok(hashes) => {
-                    info!(
-                        "{}: fetched {} existing hashes for change detection",
-                        table_name,
-                        hashes.len()
-                    );
-                    hashes
-                }
-                Err(e) => {
-                    warn!(
-                        "{}: failed to fetch existing hashes, continuing without hash filtering: {}",
-                        table_name, e
-                    );
-                    HashMap::new()
-                }
-            }
-        } else {
-            HashMap::new()
-        };
-
-        // Build column lists for reading and writing
-        // When hash detection is enabled, we compute hash in Rust after reading
-        // and add hash column to the write columns
-        let write_columns = if use_hash {
-            let mut write_cols = columns.clone();
-            write_cols.push(job.row_hash_column.clone());
-            write_cols
-        } else {
-            columns.clone()
-        };
-
-        // Find PK column indices for hash calculation
-        let pk_indices: Vec<usize> = pk_cols
-            .iter()
-            .filter_map(|pk| columns.iter().position(|c| c == pk))
-            .collect();
-
-        // Warn if some PK columns could not be matched to read columns when hash detection is enabled
-        if use_hash && !pk_cols.is_empty() && pk_indices.len() != pk_cols.len() {
-            warn!(
-                "{}: PK column mismatch for hash calculation: {} PK columns configured, but only {} matched in read columns",
-                table_name,
-                pk_cols.len(),
-                pk_indices.len()
-            );
-        }
 
         // Determine if we can use parallel keyset pagination
         let use_keyset = job.table.has_single_pk() && is_pk_sortable(&job.table);
@@ -351,7 +260,6 @@ impl TransferEngine {
         let chunk_size = self.config.chunk_size;
         let columns_clone = columns.clone();
         let col_types_clone = col_types.clone();
-        let pk_indices_clone = pk_indices.clone();
 
         let reader_handle = tokio::spawn(async move {
             if use_keyset && num_readers > 1 {
@@ -363,8 +271,6 @@ impl TransferEngine {
                     chunk_size,
                     num_readers,
                     read_tx,
-                    use_hash,
-                    pk_indices_clone,
                 )
                 .await
             } else {
@@ -375,8 +281,6 @@ impl TransferEngine {
                     col_types_clone,
                     chunk_size,
                     read_tx,
-                    use_hash,
-                    pk_indices_clone,
                 )
                 .await
             }
@@ -391,10 +295,9 @@ impl TransferEngine {
             let target = self.target.clone();
             let schema = job.target_schema.clone();
             let table_name_clone = job.table.name.clone();
-            let write_columns_clone = write_columns.clone();
+            let columns_clone = columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
-            let row_hash_column = job.row_hash_column.clone();
 
             let handle = tokio::spawn(async move {
                 let mut local_write_time = Duration::ZERO;
@@ -407,14 +310,13 @@ impl TransferEngine {
                     let result = match target_mode {
                         TargetMode::Upsert => {
                             target
-                                .upsert_chunk_with_hash(
+                                .upsert_chunk(
                                     &schema,
                                     &table_name_clone,
-                                    &write_columns_clone,
+                                    &columns_clone,
                                     &pk_cols_clone,
                                     write_job.rows,
                                     writer_id,
-                                    Some(&row_hash_column),
                                 )
                                 .await
                         }
@@ -423,7 +325,7 @@ impl TransferEngine {
                                 .write_chunk(
                                     &schema,
                                     &table_name_clone,
-                                    &write_columns_clone,
+                                    &columns_clone,
                                     write_job.rows,
                                 )
                                 .await
@@ -462,13 +364,11 @@ impl TransferEngine {
         // 1. Range tracking for safe resume points (RangeTracker)
         // 2. Query timing aggregation
         // 3. Backpressure management between read/write stages
-        // 4. Hash-based filtering (when enabled)
         //
         // Passing write_tx directly to readers would require shared-state range
         // tracking (mutex/atomic), adding complexity for marginal latency gains.
         // The dispatcher overhead is minimal since it just forwards chunks.
         let mut total_query_time = Duration::ZERO;
-        let mut total_rows_skipped = 0i64;
 
         // Use RangeTracker for safe resume points with parallel readers.
         // This prevents data loss when chunks arrive out of order.
@@ -484,26 +384,15 @@ impl TransferEngine {
             // Only contiguous ranges from start are considered safe.
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
-            // Count all rows read for progress tracking (including those that will be skipped)
+            // Count all rows read for progress tracking
             let chunk_row_count = chunk.rows.len() as i64;
             if let Some(ref counter) = self.progress_counter {
                 counter.fetch_add(chunk_row_count, Ordering::Relaxed);
             }
 
-            // Filter rows: hashes are already computed by readers, just filter unchanged
-            let (filtered_rows, skipped) = if use_hash {
-                filter_unchanged_rows(chunk.rows, &pk_indices, &existing_hashes)
-            } else {
-                (chunk.rows, 0)
-            };
-
-            total_rows_skipped += skipped;
-
-            // Only send if we have rows to write
-            if !filtered_rows.is_empty() {
-                let write_job = WriteJob {
-                    rows: filtered_rows,
-                };
+            // Send rows to writers
+            if !chunk.rows.is_empty() {
+                let write_job = WriteJob { rows: chunk.rows };
 
                 if write_tx.send(write_job).await.is_err() {
                     // Writers have all failed
@@ -564,7 +453,6 @@ impl TransferEngine {
             .fetch_add(total_rows, Ordering::Relaxed);
 
         stats.rows = total_rows;
-        stats.rows_skipped = total_rows_skipped;
         stats.query_time = total_query_time;
         stats.write_time = total_write_time;
         stats.last_pk = last_pk;
@@ -582,135 +470,18 @@ impl TransferEngine {
             0
         };
 
-        if total_rows_skipped > 0 {
-            info!(
-                "{}: transferred {} rows, skipped {} unchanged in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-                table_name, stats.rows, stats.rows_skipped, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
-            );
-        } else {
-            info!(
-                "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-                table_name,
-                stats.rows,
-                total_elapsed,
-                rows_per_sec,
-                stats.query_time,
-                stats.write_time
-            );
-        }
+        info!(
+            "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
+            table_name,
+            stats.rows,
+            total_elapsed,
+            rows_per_sec,
+            stats.query_time,
+            stats.write_time
+        );
 
         Ok(stats)
     }
-}
-
-/// Compute indices of text-type columns to skip in hash computation.
-///
-/// When `hash_text_columns` is false, returns indices of text/ntext/varchar(max) columns.
-/// When `hash_text_columns` is true, returns empty vec (skip nothing).
-fn compute_text_skip_indices(columns: &[Column], hash_text_columns: bool) -> Vec<usize> {
-    if hash_text_columns {
-        return Vec::new();
-    }
-    columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| is_text_column(c))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Compute MD5 hashes for rows and append hash as last column.
-/// Uses rayon for parallel processing of large chunks (>1000 rows).
-///
-/// This is called by readers to pre-compute hashes before sending to dispatcher.
-///
-/// `skip_indices` contains column indices to skip (text columns when hash_text_columns is false).
-fn compute_row_hashes(
-    rows: Vec<Vec<SqlValue>>,
-    pk_indices: &[usize],
-    skip_indices: &[usize],
-) -> Vec<Vec<SqlValue>> {
-    if pk_indices.is_empty() {
-        return rows;
-    }
-
-    // Process a single row: compute hash and append
-    let add_hash = |mut row: Vec<SqlValue>| -> Vec<SqlValue> {
-        let hash = calculate_row_hash(&row, pk_indices, skip_indices);
-        row.push(SqlValue::String(hash));
-        row
-    };
-
-    // Use parallel processing for large chunks (>1000 rows)
-    if rows.len() > 1000 {
-        rows.into_par_iter().map(add_hash).collect()
-    } else {
-        rows.into_iter().map(add_hash).collect()
-    }
-}
-
-/// Filter out unchanged rows by comparing pre-computed hashes with existing hashes.
-/// Hash must already be appended as the last column of each row.
-///
-/// Returns (filtered_rows, skipped_count) where filtered_rows only contains
-/// rows that are new or have changed.
-fn filter_unchanged_rows(
-    rows: Vec<Vec<SqlValue>>,
-    pk_indices: &[usize],
-    existing_hashes: &HashMap<String, String>,
-) -> (Vec<Vec<SqlValue>>, i64) {
-    if pk_indices.is_empty() || existing_hashes.is_empty() {
-        // No filtering possible - return all rows
-        return (rows, 0);
-    }
-
-    let total = rows.len();
-
-    // Helper to extract serialized PK key from a row
-    let extract_pk_key = |row: &[SqlValue]| -> String {
-        pk_indices
-            .iter()
-            .map(|&idx| match &row[idx] {
-                SqlValue::I64(v) => v.to_string(),
-                SqlValue::I32(v) => v.to_string(),
-                SqlValue::I16(v) => v.to_string(),
-                SqlValue::String(s) => s.clone(),
-                SqlValue::Uuid(u) => u.to_string(),
-                SqlValue::Decimal(d) => d.to_string(),
-                SqlValue::Date(d) => d.to_string(),
-                SqlValue::DateTime(dt) => dt.to_string(),
-                SqlValue::DateTimeOffset(dt) => dt.to_rfc3339(),
-                SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-                SqlValue::Bytes(b) => hex::encode(b),
-                SqlValue::Time(t) => t.to_string(),
-                SqlValue::F32(f) => f.to_string(),
-                SqlValue::F64(f) => f.to_string(),
-                SqlValue::Null(_) => "NULL".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    };
-
-    // Check if a row has changed (hash is last column)
-    let is_changed = |row: &Vec<SqlValue>| -> bool {
-        // Hash is the last column
-        let hash = match row.last() {
-            Some(SqlValue::String(h)) => h.as_str(),
-            _ => return true, // No hash, include row
-        };
-
-        let pk_key = extract_pk_key(row);
-
-        match existing_hashes.get(&pk_key) {
-            Some(existing) if existing == hash => false, // Hash matches, skip
-            _ => true,                                   // New row or hash changed, include
-        }
-    };
-
-    let filtered: Vec<Vec<SqlValue>> = rows.into_iter().filter(is_changed).collect();
-
-    let skipped = (total - filtered.len()) as i64;
-    (filtered, skipped)
 }
 
 /// Split a PK range into N sub-ranges for parallel reading.
@@ -752,8 +523,6 @@ async fn read_table_chunks_parallel(
     chunk_size: usize,
     num_readers: usize,
     tx: mpsc::Sender<RowChunk>,
-    use_hash: bool,
-    pk_indices: Vec<usize>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -801,7 +570,6 @@ async fn read_table_chunks_parallel(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
-        let pk_indices = pk_indices.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
         // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
@@ -817,7 +585,6 @@ async fn read_table_chunks_parallel(
             (range_min, true)
         };
 
-        let hash_text_columns = job.hash_text_columns;
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source,
@@ -830,9 +597,6 @@ async fn read_table_chunks_parallel(
                 reader_id,
                 is_resume,
                 tx,
-                use_hash,
-                pk_indices,
-                hash_text_columns,
             )
             .await
         });
@@ -867,9 +631,6 @@ async fn read_table_chunks_parallel(
 /// `is_resume` indicates whether `start_pk` came from a resume checkpoint (true) or
 /// is a fresh range boundary (false). When resuming, the first query uses `>` to skip
 /// the already-processed row. For fresh starts, the first query uses `>=` to include it.
-///
-/// When `use_hash` is true, computes MD5 hashes for each row using rayon parallelism
-/// and appends the hash to each row before sending to the channel.
 async fn read_chunk_range(
     source: SourcePoolImpl,
     table: Table,
@@ -881,9 +642,6 @@ async fn read_chunk_range(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
-    use_hash: bool,
-    pk_indices: Vec<usize>,
-    hash_text_columns: bool,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -892,13 +650,6 @@ async fn read_chunk_range(
     let mut chunk_num = 0;
     // First chunk uses >= for fresh ranges, > for resume
     let mut is_first_chunk = !is_resume;
-
-    // Determine if we should use SQL-side hashing (MSSQL only)
-    // This avoids datetime precision mismatches between Rust and SQL hash computation
-    let use_sql_hash = use_hash && source.db_type() == "mssql";
-
-    // Compute indices of text columns to skip in Rust-side hash computation
-    let skip_indices = compute_text_skip_indices(&table.columns, hash_text_columns);
 
     loop {
         let read_start = Instant::now();
@@ -912,8 +663,6 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
-            use_sql_hash,
-            hash_text_columns,
         )
         .await?;
 
@@ -930,17 +679,6 @@ async fn read_chunk_range(
         total_rows += row_count as i64;
         chunk_num += 1;
 
-        // For MSSQL, hash is already computed in SQL and appended to each row.
-        // For PostgreSQL or when hash detection is disabled, compute in Rust if needed.
-        let rows_with_hash = if use_sql_hash {
-            // Hash already included as last column by SQL query
-            rows
-        } else if use_hash {
-            compute_row_hashes(rows, &pk_indices, &skip_indices)
-        } else {
-            rows
-        };
-
         debug!(
             "{} reader {}: read chunk {} with {} rows in {:?}",
             table_name, reader_id, chunk_num, row_count, read_time
@@ -949,7 +687,7 @@ async fn read_chunk_range(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows: rows_with_hash,
+            rows,
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
@@ -993,8 +731,6 @@ async fn read_table_chunks(
     col_types: Vec<String>,
     chunk_size: usize,
     tx: mpsc::Sender<RowChunk>,
-    use_hash: bool,
-    pk_indices: Vec<usize>,
 ) -> Result<()> {
     let table = &job.table;
     let table_name = table.full_name();
@@ -1011,13 +747,6 @@ async fn read_table_chunks(
     // First chunk uses >= for fresh ranges, > for resume
     let mut is_first_chunk = !is_resume;
 
-    // Determine if we should use SQL-side hashing (MSSQL with keyset pagination only)
-    // This avoids datetime precision mismatches between Rust and SQL hash computation
-    let use_sql_hash = use_hash && use_keyset && source.db_type() == "mssql";
-
-    // Compute indices of text columns to skip in Rust-side hash computation
-    let skip_indices = compute_text_skip_indices(&job.table.columns, job.hash_text_columns);
-
     loop {
         let read_start = Instant::now();
 
@@ -1031,8 +760,6 @@ async fn read_table_chunks(
                 max_pk,
                 chunk_size,
                 is_first_chunk,
-                use_sql_hash,
-                job.hash_text_columns,
             )
             .await?
         } else {
@@ -1061,17 +788,6 @@ async fn read_table_chunks(
         total_rows += row_count as i64;
         chunk_num += 1;
 
-        // For MSSQL with keyset pagination, hash is already computed in SQL.
-        // For PostgreSQL or offset pagination, compute in Rust if needed.
-        let rows_with_hash = if use_sql_hash {
-            // Hash already included as last column by SQL query
-            rows
-        } else if use_hash {
-            compute_row_hashes(rows, &pk_indices, &skip_indices)
-        } else {
-            rows
-        };
-
         debug!(
             "{}: read chunk {} with {} rows in {:?}",
             table_name, chunk_num, row_count, read_time
@@ -1080,7 +796,7 @@ async fn read_table_chunks(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows: rows_with_hash,
+            rows,
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
@@ -1121,10 +837,6 @@ async fn read_table_chunks(
 /// This is needed because for the first chunk of a range, `last_pk` represents the starting
 /// boundary that should be included, not a previously-read row to skip.
 /// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
-///
-/// When `use_sql_hash` is true and source is MSSQL, computes the MD5 row hash in SQL
-/// and appends it as the last column. This ensures hash consistency between transfer
-/// and verification (avoids datetime precision issues with Rust-side hashing).
 async fn read_chunk_keyset_fast(
     source: &SourcePoolImpl,
     table: &Table,
@@ -1134,15 +846,12 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
-    use_sql_hash: bool,
-    hash_text_columns: bool,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let is_postgres = source.db_type() == "postgres";
-    let is_mssql = source.db_type() == "mssql";
 
     // Build column list with appropriate quoting
-    let mut col_list = columns
+    let col_list = columns
         .iter()
         .map(|c| {
             if is_postgres {
@@ -1153,24 +862,6 @@ async fn read_chunk_keyset_fast(
         })
         .collect::<Vec<_>>()
         .join(", ");
-
-    // For MSSQL with SQL-side hashing, add the hash expression as the last column
-    // This computes the same MD5 hash that verification uses, avoiding precision mismatches
-    if use_sql_hash && is_mssql {
-        let hash_expr = mssql_row_hash_expr(&table.columns, &table.primary_key, hash_text_columns);
-        col_list.push_str(&format!(", {} AS row_hash", hash_expr));
-    }
-
-    // Build extended column/type lists for query_rows_fast when hash is included
-    let (query_columns, query_col_types): (Vec<String>, Vec<String>) = if use_sql_hash && is_mssql {
-        let mut cols: Vec<String> = columns.to_vec();
-        let mut types: Vec<String> = col_types.to_vec();
-        cols.push("row_hash".to_string());
-        types.push("varchar".to_string());
-        (cols, types)
-    } else {
-        (columns.to_vec(), col_types.to_vec())
-    };
 
     let pk_quoted = if is_postgres {
         quote_pg_ident(pk_col)
@@ -1216,9 +907,7 @@ async fn read_chunk_keyset_fast(
         query.push_str(&format!(" LIMIT {}", chunk_size));
     }
 
-    let rows = source
-        .query_rows_fast(&query, &query_columns, &query_col_types)
-        .await?;
+    let rows = source.query_rows_fast(&query, columns, col_types).await?;
 
     // Get the last PK value from the result
     let pk_idx = columns.iter().position(|c| c == pk_col);
@@ -1453,57 +1142,5 @@ mod tests {
         let mut tracker = RangeTracker::new(Some(0));
         tracker.add_range(None, Some(100));
         assert_eq!(tracker.safe_resume_point(), Some(100));
-    }
-
-    fn make_test_column(name: &str, data_type: &str, max_length: i32) -> Column {
-        Column {
-            name: name.to_string(),
-            data_type: data_type.to_string(),
-            max_length,
-            precision: 0,
-            scale: 0,
-            is_nullable: true,
-            is_identity: false,
-            ordinal_pos: 0,
-        }
-    }
-
-    #[test]
-    fn test_compute_text_skip_indices_hash_text_true() {
-        // When hash_text_columns is true, no columns should be skipped
-        let columns = vec![
-            make_test_column("id", "int", 4),
-            make_test_column("body", "text", -1),
-            make_test_column("name", "varchar", 100),
-            make_test_column("desc", "nvarchar", -1), // nvarchar(max)
-        ];
-        let result = compute_text_skip_indices(&columns, true);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_compute_text_skip_indices_hash_text_false() {
-        // When hash_text_columns is false, text columns should be skipped
-        let columns = vec![
-            make_test_column("id", "int", 4),         // index 0 - not text
-            make_test_column("body", "text", -1),     // index 1 - text
-            make_test_column("name", "varchar", 100), // index 2 - not text (has max_length)
-            make_test_column("desc", "nvarchar", -1), // index 3 - text (nvarchar(max))
-            make_test_column("data", "xml", 0),       // index 4 - text
-        ];
-        let result = compute_text_skip_indices(&columns, false);
-        assert_eq!(result, vec![1, 3, 4]);
-    }
-
-    #[test]
-    fn test_compute_text_skip_indices_no_text_columns() {
-        // When there are no text columns, should return empty
-        let columns = vec![
-            make_test_column("id", "int", 4),
-            make_test_column("name", "varchar", 100),
-            make_test_column("created", "datetime", 8),
-        ];
-        let result = compute_text_skip_indices(&columns, false);
-        assert!(result.is_empty());
     }
 }

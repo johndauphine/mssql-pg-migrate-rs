@@ -13,7 +13,6 @@ use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool};
-use crate::verify::{CompositePk, CompositeRowHashMap, RowRange};
 use std::sync::Arc;
 
 /// Enum wrapper for source pool implementations.
@@ -111,92 +110,6 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.close().await,
             Self::Postgres(p) => p.close().await,
-        }
-    }
-
-    // === Verification methods ===
-
-    /// Get total row count for a table (verification).
-    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
-        match self {
-            Self::Mssql(p) => p.get_total_row_count(query).await,
-            Self::Postgres(p) => p.get_total_row_count(query).await,
-        }
-    }
-
-    /// Execute NTILE partition query with hash.
-    ///
-    /// Returns (partition_id, row_count, partition_hash) tuples for Tier 1.
-    /// The partition_hash enables detection of updates even when row counts match.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
-        match self {
-            Self::Mssql(p) => p.execute_ntile_partition_query(query).await,
-            Self::Postgres(p) => p.execute_ntile_partition_query(query).await,
-        }
-    }
-
-    /// Execute count query with rownum range and hash.
-    ///
-    /// Returns (row_count, range_hash) for Tier 2 update detection.
-    pub async fn execute_count_query_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-    ) -> Result<(i64, i64)> {
-        match self {
-            Self::Mssql(p) => p.execute_count_query_with_rownum(query, range).await,
-            Self::Postgres(p) => p.execute_count_query_with_rownum(query, range).await,
-        }
-    }
-
-    /// Fetch row hashes with rownum range.
-    pub async fn fetch_row_hashes_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-        pk_column_count: usize,
-    ) -> Result<CompositeRowHashMap> {
-        match self {
-            Self::Mssql(p) => {
-                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
-                    .await
-            }
-            Self::Postgres(p) => {
-                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
-                    .await
-            }
-        }
-    }
-
-    /// Fetch rows for a PK range.
-    pub async fn fetch_rows_for_range(
-        &self,
-        table: &Table,
-        pk_column: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        match self {
-            Self::Mssql(p) => {
-                p.fetch_rows_for_range(table, pk_column, min_pk, max_pk)
-                    .await
-            }
-            Self::Postgres(p) => {
-                p.fetch_rows_for_range(table, pk_column, min_pk, max_pk)
-                    .await
-            }
-        }
-    }
-
-    /// Fetch specific rows by composite primary key values.
-    pub async fn fetch_rows_by_composite_pks(
-        &self,
-        table: &Table,
-        pks: &[CompositePk],
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        match self {
-            Self::Mssql(p) => p.fetch_rows_by_composite_pks(table, pks).await,
-            Self::Postgres(p) => p.fetch_rows_by_composite_pks(table, pks).await,
         }
     }
 
@@ -299,44 +212,6 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_table_unlogged(table, target_schema).await,
             Self::Postgres(p) => p.create_table_unlogged(table, target_schema).await,
-        }
-    }
-
-    /// Create a table with row hash column for change detection.
-    pub async fn create_table_with_hash(
-        &self,
-        table: &Table,
-        target_schema: &str,
-        row_hash_column: &str,
-    ) -> Result<()> {
-        match self {
-            Self::Mssql(p) => {
-                p.create_table_with_hash(table, target_schema, row_hash_column)
-                    .await
-            }
-            Self::Postgres(p) => {
-                p.create_table_with_hash(table, target_schema, row_hash_column)
-                    .await
-            }
-        }
-    }
-
-    /// Ensure the row hash column exists on the table.
-    pub async fn ensure_row_hash_column(
-        &self,
-        schema: &str,
-        table: &str,
-        row_hash_column: &str,
-    ) -> Result<bool> {
-        match self {
-            Self::Mssql(p) => {
-                p.ensure_row_hash_column(schema, table, row_hash_column)
-                    .await
-            }
-            Self::Postgres(p) => {
-                p.ensure_row_hash_column(schema, table, row_hash_column)
-                    .await
-            }
         }
     }
 
@@ -482,144 +357,14 @@ impl TargetPoolImpl {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64> {
         match self {
             Self::Mssql(p) => {
-                p.upsert_chunk(
-                    schema,
-                    table,
-                    cols,
-                    pk_cols,
-                    rows,
-                    writer_id,
-                    row_hash_column,
-                )
-                .await
-            }
-            Self::Postgres(p) => {
-                p.upsert_chunk(
-                    schema,
-                    table,
-                    cols,
-                    pk_cols,
-                    rows,
-                    writer_id,
-                    row_hash_column,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Upsert a chunk with hash-based change detection.
-    pub async fn upsert_chunk_with_hash(
-        &self,
-        schema: &str,
-        table: &str,
-        cols: &[String],
-        pk_cols: &[String],
-        rows: Vec<Vec<SqlValue>>,
-        writer_id: usize,
-        row_hash_column: Option<&str>,
-    ) -> Result<u64> {
-        match self {
-            Self::Mssql(p) => {
-                p.upsert_chunk_with_hash(
-                    schema,
-                    table,
-                    cols,
-                    pk_cols,
-                    rows,
-                    writer_id,
-                    row_hash_column,
-                )
-                .await
-            }
-            Self::Postgres(p) => {
-                p.upsert_chunk_with_hash(
-                    schema,
-                    table,
-                    cols,
-                    pk_cols,
-                    rows,
-                    writer_id,
-                    row_hash_column,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Fetch row hashes for hash-based change detection.
-    pub async fn fetch_row_hashes(
-        &self,
-        schema: &str,
-        table: &str,
-        pk_cols: &[String],
-        row_hash_col: &str,
-        min_pk: Option<i64>,
-        max_pk: Option<i64>,
-    ) -> Result<std::collections::HashMap<String, String>> {
-        match self {
-            Self::Mssql(p) => {
-                p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk)
+                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
                     .await
             }
             Self::Postgres(p) => {
-                p.fetch_row_hashes(schema, table, pk_cols, row_hash_col, min_pk, max_pk)
-                    .await
-            }
-        }
-    }
-
-    /// Get total row count from a query (for verification).
-    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
-        match self {
-            Self::Mssql(p) => p.get_total_row_count(query).await,
-            Self::Postgres(p) => p.get_total_row_count(query).await,
-        }
-    }
-
-    /// Execute NTILE partition query with hash (for verification).
-    ///
-    /// Returns (partition_id, row_count, partition_hash) tuples for Tier 1.
-    /// The partition_hash enables detection of updates even when row counts match.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
-        match self {
-            Self::Mssql(p) => p.execute_ntile_partition_query(query).await,
-            Self::Postgres(p) => p.execute_ntile_partition_query(query).await,
-        }
-    }
-
-    /// Execute count query with ROW_NUMBER range and hash (for verification).
-    ///
-    /// Returns (row_count, range_hash) for Tier 2 update detection.
-    pub async fn execute_count_query_with_rownum(
-        &self,
-        query: &str,
-        range: &crate::verify::RowRange,
-    ) -> Result<(i64, i64)> {
-        match self {
-            Self::Mssql(p) => p.execute_count_query_with_rownum(query, range).await,
-            Self::Postgres(p) => p.execute_count_query_with_rownum(query, range).await,
-        }
-    }
-
-    /// Fetch row hashes with ROW_NUMBER range (for verification).
-    pub async fn fetch_row_hashes_with_rownum(
-        &self,
-        query: &str,
-        range: &crate::verify::RowRange,
-        pk_column_count: usize,
-    ) -> Result<crate::verify::CompositeRowHashMap> {
-        match self {
-            Self::Mssql(p) => {
-                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
-                    .await
-            }
-            Self::Postgres(p) => {
-                p.fetch_row_hashes_with_rownum(query, range, pk_column_count)
+                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
                     .await
             }
         }

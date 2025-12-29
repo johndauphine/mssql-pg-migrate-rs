@@ -355,32 +355,6 @@ pub struct MigrationConfig {
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
     pub memory_budget_percent: u8,
-
-    /// Use hash-based change detection for upsert mode (default: false).
-    /// When false (default): streams all rows to PostgreSQL, which uses column-by-column
-    /// comparison in ON CONFLICT clause. Faster for most workloads (~3x speedup).
-    /// When true: pre-computes MD5 hashes and only transfers changed rows. Better for
-    /// low-bandwidth scenarios with <5% row changes.
-    /// NOTE: Switching from false to true requires a full refresh (drop_recreate or truncate)
-    /// first, as row_hash values are not populated when hash detection is disabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub use_hash_detection: Option<bool>,
-
-    /// Column name for storing row hashes in target tables (default: "row_hash").
-    /// Used when use_hash_detection is enabled.
-    #[serde(default = "default_row_hash_column")]
-    pub row_hash_column: String,
-
-    /// Include text-type columns in row hash computation (default: false for performance).
-    /// When false, skips text, ntext, varchar(max), nvarchar(max), and xml columns on MSSQL;
-    /// skips text and xml columns on PostgreSQL. This speeds up hash computation but means
-    /// changes to these columns won't be detected.
-    #[serde(default)]
-    pub hash_text_columns: bool,
-
-    /// Batch verification configuration for multi-tier sync validation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch_verify: Option<BatchVerifyConfig>,
 }
 
 impl Default for MigrationConfig {
@@ -409,57 +383,6 @@ impl Default for MigrationConfig {
             upsert_batch_size: None,
             upsert_parallel_tasks: None,
             memory_budget_percent: default_memory_budget_percent(),
-            use_hash_detection: None,
-            row_hash_column: default_row_hash_column(),
-            hash_text_columns: false,
-            batch_verify: None,
-        }
-    }
-}
-
-/// Configuration for multi-tier batch verification.
-///
-/// Batch verification uses aggregate checksums to efficiently detect
-/// differences between source and target databases without transferring
-/// all row data. Uses a 4-tier drill-down approach:
-///
-/// 1. **Tier 1 (Coarse)**: Compare checksums of ~1M row ranges
-/// 2. **Tier 2 (Fine)**: For mismatches, compare ~10K row ranges
-/// 3. **Tier 3 (Row)**: Fetch individual row hashes for comparison
-/// 4. **Tier 4 (Sync)**: Transfer only changed rows
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BatchVerifyConfig {
-    /// Tier 1 (coarse) batch size - rows per range (default: 1,000,000).
-    #[serde(default = "default_tier1_batch_size")]
-    pub tier1_batch_size: i64,
-
-    /// Tier 2 (fine) batch size - rows per range (default: 10,000).
-    #[serde(default = "default_tier2_batch_size")]
-    pub tier2_batch_size: i64,
-
-    /// Maximum ranges to verify in parallel per tier.
-    #[serde(default = "default_parallel_verify_ranges")]
-    pub parallel_verify_ranges: usize,
-}
-
-fn default_tier1_batch_size() -> i64 {
-    1_000_000
-}
-
-fn default_tier2_batch_size() -> i64 {
-    10_000
-}
-
-fn default_parallel_verify_ranges() -> usize {
-    4
-}
-
-impl Default for BatchVerifyConfig {
-    fn default() -> Self {
-        Self {
-            tier1_batch_size: default_tier1_batch_size(),
-            tier2_batch_size: default_tier2_batch_size(),
-            parallel_verify_ranges: default_parallel_verify_ranges(),
         }
     }
 }
@@ -738,20 +661,6 @@ impl MigrationConfig {
         self.upsert_parallel_tasks.unwrap_or(4)
     }
 
-    /// Check if hash-based change detection is enabled.
-    /// Defaults to false for faster upsert performance (streams all rows, lets PostgreSQL
-    /// handle comparison via column-by-column IS DISTINCT FROM in ON CONFLICT clause).
-    /// Set to true to pre-filter rows by hash before transfer (slower startup, less network
-    /// for low-change scenarios). Note: switching modes requires a full refresh first.
-    pub fn use_hash_detection(&self) -> bool {
-        self.use_hash_detection.unwrap_or(false)
-    }
-
-    /// Get the row hash column name.
-    pub fn get_row_hash_column(&self) -> &str {
-        &self.row_hash_column
-    }
-
     /// Check if a table name matches any of the given patterns.
     ///
     /// Patterns support glob wildcards:
@@ -872,8 +781,4 @@ fn default_require() -> String {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_row_hash_column() -> String {
-    "row_hash".to_string()
 }

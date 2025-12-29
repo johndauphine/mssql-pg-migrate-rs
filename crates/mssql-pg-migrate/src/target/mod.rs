@@ -9,16 +9,13 @@ mod mssql;
 pub use mssql::MssqlTargetPool;
 
 use crate::error::{MigrateError, Result};
-use crate::source::{CheckConstraint, ForeignKey, Index, PkValue, Table};
+use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
-use crate::verify::{CompositePk, CompositeRowHashMap, RowRange};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use futures::SinkExt;
-use md5::Digest;
-use md5::Md5;
 use rustls::ClientConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,7 +107,6 @@ pub trait TargetPool: Send + Sync {
 
     /// Upsert a chunk of rows.
     /// `writer_id` is used to create a unique staging table per writer to avoid conflicts.
-    /// `row_hash_column` is the configured column name for row hash detection (if present in cols).
     async fn upsert_chunk(
         &self,
         schema: &str,
@@ -119,21 +115,6 @@ pub trait TargetPool: Send + Sync {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
-    ) -> Result<u64>;
-
-    /// Upsert a chunk of rows (used when hash-based change detection pre-filtered rows).
-    /// This is identical to upsert_chunk but exists for API clarity - hash filtering
-    /// reduces network transfer, while the DB-side WHERE clause prevents unnecessary writes.
-    async fn upsert_chunk_with_hash(
-        &self,
-        schema: &str,
-        table: &str,
-        cols: &[String],
-        pk_cols: &[String],
-        rows: Vec<Vec<SqlValue>>,
-        writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64>;
 
     /// Get the database type.
@@ -180,139 +161,6 @@ pub enum SqlNullType {
     DateTimeOffset,
     Date,
     Time,
-}
-
-/// Calculate MD5 hash of non-PK column values for change detection.
-///
-/// The hash is calculated using pipe-separated values with consistent formatting:
-/// - NULL values are represented as `\N`
-/// - Floats use fixed precision to ensure hash stability
-/// - All types are converted to their string representation
-///
-/// `skip_indices` contains additional column indices to skip (e.g., text columns).
-///
-/// Returns a 32-character lowercase hex string.
-pub fn calculate_row_hash(
-    row: &[SqlValue],
-    pk_indices: &[usize],
-    skip_indices: &[usize],
-) -> String {
-    let mut hasher = Md5::new();
-    let mut first = true;
-
-    for (idx, value) in row.iter().enumerate() {
-        // Skip primary key columns - they identify the row, not the content
-        // Also skip text columns if hash_text_columns is false
-        if pk_indices.contains(&idx) || skip_indices.contains(&idx) {
-            continue;
-        }
-
-        // Use pipe as separator between values
-        if !first {
-            hasher.update(b"|");
-        }
-        first = false;
-
-        match value {
-            SqlValue::Null(_) => hasher.update(b"\\N"),
-            SqlValue::Bool(b) => hasher.update(if *b { b"t" } else { b"f" }),
-            SqlValue::I16(n) => hasher.update(n.to_string().as_bytes()),
-            SqlValue::I32(n) => hasher.update(n.to_string().as_bytes()),
-            SqlValue::I64(n) => hasher.update(n.to_string().as_bytes()),
-            SqlValue::F32(n) => hasher.update(format!("{:.6}", n).as_bytes()),
-            SqlValue::F64(n) => hasher.update(format!("{:.15}", n).as_bytes()),
-            SqlValue::String(s) => hasher.update(s.as_bytes()),
-            SqlValue::Bytes(b) => hasher.update(b),
-            SqlValue::Uuid(u) => hasher.update(u.to_string().as_bytes()),
-            SqlValue::Decimal(d) => hasher.update(d.to_string().as_bytes()),
-            SqlValue::DateTime(dt) => {
-                hasher.update(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string().as_bytes())
-            }
-            SqlValue::DateTimeOffset(dt) => hasher.update(dt.to_rfc3339().as_bytes()),
-            SqlValue::Date(d) => hasher.update(d.to_string().as_bytes()),
-            SqlValue::Time(t) => hasher.update(t.to_string().as_bytes()),
-        }
-    }
-
-    format!("{:x}", hasher.finalize())
-}
-
-/// Convert a PostgreSQL row value to SqlValue.
-///
-/// Used by fetch_rows_for_range to convert query results to a consistent type.
-fn convert_pg_value(row: &tokio_postgres::Row, idx: usize) -> SqlValue {
-    // Try each type in order of likelihood
-    // Note: PostgreSQL doesn't have column type info in Row without metadata,
-    // so we try types in a reasonable order
-
-    // Integers
-    if let Ok(v) = row.try_get::<_, i64>(idx) {
-        return SqlValue::I64(v);
-    }
-    if let Ok(v) = row.try_get::<_, i32>(idx) {
-        return SqlValue::I32(v);
-    }
-    if let Ok(v) = row.try_get::<_, i16>(idx) {
-        return SqlValue::I16(v);
-    }
-
-    // String
-    if let Ok(v) = row.try_get::<_, String>(idx) {
-        return SqlValue::String(v);
-    }
-
-    // Boolean
-    if let Ok(v) = row.try_get::<_, bool>(idx) {
-        return SqlValue::Bool(v);
-    }
-
-    // Floats
-    if let Ok(v) = row.try_get::<_, f64>(idx) {
-        return SqlValue::F64(v);
-    }
-    if let Ok(v) = row.try_get::<_, f32>(idx) {
-        return SqlValue::F32(v);
-    }
-
-    // UUID
-    if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
-        return SqlValue::Uuid(v);
-    }
-
-    // Decimal
-    if let Ok(v) = row.try_get::<_, rust_decimal::Decimal>(idx) {
-        return SqlValue::Decimal(v);
-    }
-
-    // Date/Time types
-    if let Ok(v) = row.try_get::<_, chrono::NaiveDateTime>(idx) {
-        return SqlValue::DateTime(v);
-    }
-    if let Ok(v) = row.try_get::<_, chrono::NaiveDate>(idx) {
-        return SqlValue::Date(v);
-    }
-    if let Ok(v) = row.try_get::<_, chrono::NaiveTime>(idx) {
-        return SqlValue::Time(v);
-    }
-    if let Ok(v) = row.try_get::<_, chrono::DateTime<chrono::FixedOffset>>(idx) {
-        return SqlValue::DateTimeOffset(v);
-    }
-
-    // Binary
-    if let Ok(v) = row.try_get::<_, Vec<u8>>(idx) {
-        return SqlValue::Bytes(v);
-    }
-
-    // Check for NULL - try to get as Option<String> which works for most types
-    if let Ok(None) = row.try_get::<_, Option<String>>(idx) {
-        return SqlValue::Null(SqlNullType::String);
-    }
-    if let Ok(None) = row.try_get::<_, Option<i64>>(idx) {
-        return SqlValue::Null(SqlNullType::I64);
-    }
-
-    // Default to null if we can't determine the type
-    SqlValue::Null(SqlNullType::String)
 }
 
 /// Certificate verifier that accepts any certificate.
@@ -1450,7 +1298,6 @@ impl TargetPool for PgPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
-        row_hash_column: Option<&str>,
     ) -> Result<u64> {
         use std::time::Instant;
 
@@ -1582,14 +1429,7 @@ impl TargetPool for PgPool {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(
-            schema,
-            table,
-            &staging_table,
-            cols,
-            pk_cols,
-            row_hash_column,
-        );
+        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1622,30 +1462,6 @@ impl TargetPool for PgPool {
         Ok(row_count)
     }
 
-    async fn upsert_chunk_with_hash(
-        &self,
-        schema: &str,
-        table: &str,
-        cols: &[String],
-        pk_cols: &[String],
-        rows: Vec<Vec<SqlValue>>,
-        writer_id: usize,
-        row_hash_column: Option<&str>,
-    ) -> Result<u64> {
-        // Hash filtering reduces network transfer, but we still use the DB-side
-        // WHERE clause to prevent unnecessary writes (WAL, triggers, etc.)
-        self.upsert_chunk(
-            schema,
-            table,
-            cols,
-            pk_cols,
-            rows,
-            writer_id,
-            row_hash_column,
-        )
-        .await
-    }
-
     fn db_type(&self) -> &str {
         "postgres"
     }
@@ -1666,435 +1482,6 @@ impl PgPool {
         client.simple_query("SELECT 1").await?;
         Ok(())
     }
-}
-
-// Batch verification methods
-impl PgPool {
-    /// Execute a count query and return row_count.
-    ///
-    /// Used for Tier 1/2 quick verification.
-    pub async fn execute_count_query(&self, query: &str, min_pk: i64, max_pk: i64) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "executing count query"))?;
-
-        let row = client
-            .query_one(query, &[&min_pk, &max_pk])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let row_count: i64 = row.get(0);
-
-        Ok(row_count)
-    }
-
-    /// Fetch row hashes for a PK range (Tier 3 verification).
-    ///
-    /// Returns a map of PK -> MD5 hash for comparison with source.
-    pub async fn fetch_row_hashes_for_verify(
-        &self,
-        query: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<std::collections::HashMap<i64, String>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "fetching row hashes"))?;
-
-        let rows = client
-            .query(query, &[&min_pk, &max_pk])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let mut hashes = std::collections::HashMap::new();
-        for row in rows {
-            let pk: i64 = row.get(0);
-            let hash: Option<String> = row.get(1);
-            if let Some(h) = hash {
-                hashes.insert(pk, h);
-            }
-        }
-
-        Ok(hashes)
-    }
-
-    /// Get PK boundaries (min, max, count) for a table.
-    pub async fn get_pk_bounds(&self, query: &str) -> Result<(i64, i64, i64)> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting PK bounds"))?;
-
-        let row = client
-            .query_one(query, &[])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let min_pk: Option<i64> = row.get(0);
-        let max_pk: Option<i64> = row.get(1);
-        let row_count: i64 = row.get(2);
-
-        Ok((min_pk.unwrap_or(0), max_pk.unwrap_or(0), row_count))
-    }
-
-    /// Delete rows by primary key values.
-    ///
-    /// Used for sync operations to remove rows that exist in target but not source.
-    pub async fn delete_rows_by_pks(
-        &self,
-        schema: &str,
-        table: &str,
-        pk_column: &str,
-        pks: &[i64],
-    ) -> Result<i64> {
-        if pks.is_empty() {
-            return Ok(0);
-        }
-
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(
-                e,
-                format!("getting connection for DELETE on {}.{}", schema, table),
-            )
-        })?;
-
-        let mut total_deleted = 0i64;
-
-        // Batch deletions to avoid query size limits
-        for chunk in pks.chunks(1000) {
-            // Build parameterized query
-            let params: Vec<String> = (1..=chunk.len()).map(|i| format!("${}", i)).collect();
-            let param_list = params.join(", ");
-
-            let query = format!(
-                "DELETE FROM {}.{} WHERE {} IN ({})",
-                pg_quote_ident(schema),
-                pg_quote_ident(table),
-                pg_quote_ident(pk_column),
-                param_list
-            );
-
-            // Convert PKs to references for parameter binding
-            let pk_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = chunk
-                .iter()
-                .map(|pk| pk as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            let rows_deleted = client
-                .execute_raw(&query, pk_refs)
-                .await
-                .map_err(MigrateError::Target)?;
-
-            total_deleted += rows_deleted as i64;
-        }
-
-        Ok(total_deleted)
-    }
-
-    /// Fetch rows for a PK range (for Rust-side hashing).
-    ///
-    /// Returns rows with all columns for the specified PK range, ordered by PK.
-    /// Used by verify module to compute hashes in Rust instead of SQL.
-    pub async fn fetch_rows_for_range(
-        &self,
-        schema: &str,
-        table: &str,
-        columns: &[String],
-        pk_column: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(
-                e,
-                format!(
-                    "getting connection for fetch_rows_for_range on {}.{}",
-                    schema, table
-                ),
-            )
-        })?;
-
-        // Build column list with proper quoting
-        let col_list = columns
-            .iter()
-            .map(|c| pg_quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // Cast pk_column to BIGINT for comparison with i64 parameters
-        let query = format!(
-            "SELECT {} FROM {}.{} WHERE {}::BIGINT >= $1 AND {}::BIGINT < $2 ORDER BY {}",
-            col_list,
-            pg_quote_ident(schema),
-            pg_quote_ident(table),
-            pg_quote_ident(pk_column),
-            pg_quote_ident(pk_column),
-            pg_quote_ident(pk_column)
-        );
-
-        let rows = client
-            .query(&query, &[&min_pk, &max_pk])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let mut result = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let mut values = Vec::with_capacity(columns.len());
-            for i in 0..columns.len() {
-                let value = convert_pg_value(&row, i);
-                values.push(value);
-            }
-            result.push(values);
-        }
-
-        Ok(result)
-    }
-
-    // ========================================================================
-    // Universal PK Verification Methods (ROW_NUMBER-based)
-    // ========================================================================
-
-    /// Get total row count for a table.
-    ///
-    /// Used for Tier 1 initial partitioning.
-    pub async fn get_total_row_count(&self, query: &str) -> Result<i64> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting total row count"))?;
-
-        let row = client
-            .query_one(query, &[])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let row_count: i64 = row.get(0);
-        Ok(row_count)
-    }
-
-    /// Execute NTILE partition query and return partition data with hash.
-    ///
-    /// Returns a vector of (partition_id, row_count, partition_hash) tuples for Tier 1.
-    /// The partition_hash enables detection of updates even when row counts match.
-    pub async fn execute_ntile_partition_query(&self, query: &str) -> Result<Vec<(i64, i64, i64)>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "executing NTILE partition query"))?;
-
-        let rows = client
-            .query(query, &[])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let mut partitions = Vec::new();
-        for row in rows {
-            // NTILE returns int4, COUNT returns int8, hash returns int8
-            let partition_id: i64 = row
-                .try_get::<_, i64>(0)
-                .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
-                .unwrap_or(0);
-            let row_count: i64 = row
-                .try_get::<_, i64>(1)
-                .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
-                .unwrap_or(0);
-            // partition_hash is column 2 (optional - default to 0 if not present)
-            let partition_hash: i64 = row
-                .try_get::<_, i64>(2)
-                .or_else(|_| row.try_get::<_, i32>(2).map(|v| v as i64))
-                .unwrap_or(0);
-            partitions.push((partition_id, row_count, partition_hash));
-        }
-
-        Ok(partitions)
-    }
-
-    /// Execute count query using ROW_NUMBER range (Tier 2 verification).
-    ///
-    /// Returns (row_count, range_hash) for update detection.
-    /// Used for tables with any PK type (int, uuid, string, composite).
-    pub async fn execute_count_query_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-    ) -> Result<(i64, i64)> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "executing count query with rownum"))?;
-
-        let row = client
-            .query_one(query, &[&range.start_row, &range.end_row])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let row_count: i64 = row
-            .try_get::<_, i64>(0)
-            .or_else(|_| row.try_get::<_, i32>(0).map(|v| v as i64))
-            .unwrap_or(0);
-        // range_hash is column 1 (optional - default to 0 if not present)
-        let range_hash: i64 = row
-            .try_get::<_, i64>(1)
-            .or_else(|_| row.try_get::<_, i32>(1).map(|v| v as i64))
-            .unwrap_or(0);
-        Ok((row_count, range_hash))
-    }
-
-    /// Fetch row hashes using ROW_NUMBER range with composite PK support (Tier 3).
-    ///
-    /// Returns a map of CompositePk -> MD5 hash for comparison with source.
-    /// Supports any PK type including composite keys.
-    pub async fn fetch_row_hashes_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-        pk_column_count: usize,
-    ) -> Result<CompositeRowHashMap> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "fetching row hashes with rownum"))?;
-
-        let rows = client
-            .query(query, &[&range.start_row, &range.end_row])
-            .await
-            .map_err(MigrateError::Target)?;
-
-        let mut hashes = std::collections::HashMap::new();
-        for row in rows {
-            // Extract PK columns (first pk_column_count columns)
-            let mut pk_values = Vec::with_capacity(pk_column_count);
-            for i in 0..pk_column_count {
-                let pk_value = extract_pk_value_from_pg(&row, i);
-                pk_values.push(pk_value);
-            }
-
-            // Last column is the row_hash
-            let hash_idx = pk_column_count;
-            let hash: Option<String> = row.get(hash_idx);
-
-            if let Some(h) = hash {
-                hashes.insert(CompositePk::new(pk_values), h);
-            }
-        }
-
-        Ok(hashes)
-    }
-
-    /// Delete rows by composite primary key values.
-    ///
-    /// Used for sync operations to remove rows that exist in target but not source.
-    ///
-    /// # Query Size
-    ///
-    /// Deletes are batched in chunks of 500 rows to avoid exceeding database
-    /// query size limits. For composite PKs with many columns, the OR-based
-    /// WHERE clause can still become large. Consider reducing chunk size
-    /// for very wide composite PKs.
-    pub async fn delete_rows_by_composite_pks(
-        &self,
-        schema: &str,
-        table: &str,
-        pk_columns: &[String],
-        pks: &[CompositePk],
-    ) -> Result<i64> {
-        if pks.is_empty() {
-            return Ok(0);
-        }
-
-        let client = self.pool.get().await.map_err(|e| {
-            MigrateError::pool(
-                e,
-                format!("getting connection for DELETE on {}.{}", schema, table),
-            )
-        })?;
-
-        let mut total_deleted = 0i64;
-
-        // Batch deletions to avoid query size limits
-        for chunk in pks.chunks(500) {
-            let where_clause = if pk_columns.len() == 1 {
-                // Single PK column - use IN clause
-                let pk_col = pg_quote_ident(&pk_columns[0]);
-                let pk_list = chunk
-                    .iter()
-                    .map(|pk| pk.values()[0].to_sql_literal())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{} IN ({})", pk_col, pk_list)
-            } else {
-                // Composite PK - use OR of tuple comparisons
-                let conditions: Vec<String> = chunk
-                    .iter()
-                    .map(|pk| {
-                        let parts: Vec<String> = pk_columns
-                            .iter()
-                            .zip(pk.values())
-                            .map(|(col, val)| {
-                                format!("{} = {}", pg_quote_ident(col), val.to_sql_literal())
-                            })
-                            .collect();
-                        format!("({})", parts.join(" AND "))
-                    })
-                    .collect();
-                conditions.join(" OR ")
-            };
-
-            let query = format!(
-                "DELETE FROM {}.{} WHERE {}",
-                pg_quote_ident(schema),
-                pg_quote_ident(table),
-                where_clause
-            );
-
-            let rows_deleted = client
-                .execute(&query, &[])
-                .await
-                .map_err(MigrateError::Target)?;
-
-            total_deleted += rows_deleted as i64;
-        }
-
-        Ok(total_deleted)
-    }
-}
-
-/// Extract a PkValue from a PostgreSQL row at the given index.
-fn extract_pk_value_from_pg(row: &tokio_postgres::Row, idx: usize) -> PkValue {
-    // Try integer types first
-    if let Ok(v) = row.try_get::<_, i64>(idx) {
-        return PkValue::Int(v);
-    }
-    if let Ok(v) = row.try_get::<_, i32>(idx) {
-        return PkValue::Int(v as i64);
-    }
-    // Try UUID
-    if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
-        return PkValue::Uuid(v);
-    }
-    // Fallback to string
-    if let Ok(v) = row.try_get::<_, String>(idx) {
-        return PkValue::String(v);
-    }
-    // Panic instead of silently returning empty string - this indicates a data type
-    // issue that should be investigated rather than masked
-    let col = &row.columns()[idx];
-    panic!(
-        "Failed to extract primary key value from PostgreSQL row for column '{}' (type: {:?}) at index {}",
-        col.name(),
-        col.type_(),
-        idx,
-    );
 }
 
 impl PgPool {
@@ -2763,15 +2150,13 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
 /// Build SQL to merge from staging table into target table.
 /// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
 ///
-/// If `row_hash_column` is provided and present in `cols`, uses it for efficient change detection
-/// (single column compare). Otherwise falls back to comparing all non-PK columns with IS DISTINCT FROM.
+/// Compares all non-PK columns with IS DISTINCT FROM for change detection.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
-    row_hash_column: Option<&str>,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -2803,32 +2188,20 @@ fn build_staging_merge_sql(
             pk_list
         )
     } else {
-        // Use row_hash for change detection if available (much faster than comparing all columns)
-        let hash_col_in_cols = row_hash_column.filter(|h| cols.iter().any(|c| c == *h));
-
-        let change_detection = if let Some(hash_col) = hash_col_in_cols {
-            // Single column comparison using pre-computed hash
-            format!(
-                "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                pg_quote_ident(table),
-                pg_quote_ident(hash_col),
-                pg_quote_ident(hash_col)
-            )
-        } else {
-            // Fallback: compare all non-PK columns
-            cols.iter()
-                .filter(|c| !pk_cols.contains(c))
-                .map(|c| {
-                    format!(
-                        "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                        pg_quote_ident(table),
-                        pg_quote_ident(c),
-                        pg_quote_ident(c)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        };
+        // Compare all non-PK columns for change detection
+        let change_detection = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| {
+                format!(
+                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                    pg_quote_ident(table),
+                    pg_quote_ident(c),
+                    pg_quote_ident(c)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
 
         format!(
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
@@ -2848,188 +2221,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_calculate_row_hash_basic() {
-        // Test with simple string values, PK at index 0
-        let row = vec![
-            SqlValue::I64(1), // PK - should be excluded
-            SqlValue::String("hello".to_string()),
-            SqlValue::I32(42),
-        ];
-        let pk_indices = vec![0];
-
-        let hash = calculate_row_hash(&row, &pk_indices, &[]);
-
-        // Hash should be 32 hex characters
-        assert_eq!(hash.len(), 32);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_calculate_row_hash_excludes_pk() {
-        // Two rows with same non-PK data but different PKs should have same hash
-        let row1 = vec![
-            SqlValue::I64(1), // PK
-            SqlValue::String("data".to_string()),
-        ];
-        let row2 = vec![
-            SqlValue::I64(999), // Different PK
-            SqlValue::String("data".to_string()),
-        ];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_detects_changes() {
-        // Two rows with same PK but different data should have different hashes
-        let row1 = vec![SqlValue::I64(1), SqlValue::String("value1".to_string())];
-        let row2 = vec![SqlValue::I64(1), SqlValue::String("value2".to_string())];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_null_handling() {
-        // NULL values should be handled consistently
-        let row1 = vec![SqlValue::I64(1), SqlValue::Null(SqlNullType::String)];
-        let row2 = vec![SqlValue::I64(2), SqlValue::Null(SqlNullType::String)];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        // Same data (NULL) should produce same hash
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_null_vs_empty_string() {
-        // NULL and empty string should have different hashes
-        let row1 = vec![SqlValue::I64(1), SqlValue::Null(SqlNullType::String)];
-        let row2 = vec![SqlValue::I64(1), SqlValue::String("".to_string())];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_composite_pk() {
-        // Test with composite primary key
-        let row = vec![
-            SqlValue::I64(1), // PK part 1
-            SqlValue::I64(2), // PK part 2
-            SqlValue::String("data".to_string()),
-        ];
-        let pk_indices = vec![0, 1];
-
-        let hash = calculate_row_hash(&row, &pk_indices, &[]);
-
-        assert_eq!(hash.len(), 32);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_all_types() {
-        // Test with all supported types
-        let row = vec![
-            SqlValue::I64(1), // PK
-            SqlValue::Bool(true),
-            SqlValue::I16(16),
-            SqlValue::I32(32),
-            SqlValue::I64(64),
-            SqlValue::F32(1.5),
-            SqlValue::F64(2.5),
-            SqlValue::String("text".to_string()),
-            SqlValue::Bytes(vec![1, 2, 3]),
-            SqlValue::Uuid(uuid::Uuid::nil()),
-            SqlValue::Decimal(rust_decimal::Decimal::new(12345, 2)),
-            SqlValue::Date(chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()),
-            SqlValue::Time(chrono::NaiveTime::from_hms_opt(12, 30, 45).unwrap()),
-        ];
-        let pk_indices = vec![0];
-
-        let hash = calculate_row_hash(&row, &pk_indices, &[]);
-
-        assert_eq!(hash.len(), 32);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_float_precision() {
-        // Floats should use fixed precision for hash stability
-        let row1 = vec![
-            SqlValue::I64(1),
-            SqlValue::F64(1.0 / 3.0), // 0.333333...
-        ];
-        let row2 = vec![
-            SqlValue::I64(1),
-            SqlValue::F64(1.0 / 3.0), // Same calculation
-        ];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        // Same float value should produce same hash
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_order_matters() {
-        // Column order should affect hash
-        let row1 = vec![
-            SqlValue::I64(1),
-            SqlValue::String("a".to_string()),
-            SqlValue::String("b".to_string()),
-        ];
-        let row2 = vec![
-            SqlValue::I64(1),
-            SqlValue::String("b".to_string()),
-            SqlValue::String("a".to_string()),
-        ];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row1, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[]);
-
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_calculate_row_hash_deterministic() {
-        // Same input should always produce same hash
-        let row = vec![
-            SqlValue::I64(42),
-            SqlValue::String("test".to_string()),
-            SqlValue::I32(123),
-        ];
-        let pk_indices = vec![0];
-
-        let hash1 = calculate_row_hash(&row, &pk_indices, &[]);
-        let hash2 = calculate_row_hash(&row, &pk_indices, &[]);
-        let hash3 = calculate_row_hash(&row, &pk_indices, &[]);
-
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash2, hash3);
-    }
-
-    #[test]
     fn test_build_staging_merge_sql_with_change_detection() {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        // Should always include change detection WHERE clause (fallback to column comparison)
-        let sql =
-            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, None);
+        // Should always include change detection WHERE clause
+        let sql = build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols);
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("IS DISTINCT FROM"));
         assert!(sql.contains("DO UPDATE SET"));
@@ -3044,141 +2241,8 @@ mod tests {
         let cols = vec!["id".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql =
-            build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols, None);
+        let sql = build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols);
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_with_row_hash_optimization() {
-        // When row_hash column is present, should use single column comparison
-        let cols = vec![
-            "id".to_string(),
-            "name".to_string(),
-            "value".to_string(),
-            "row_hash".to_string(),
-        ];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("row_hash"),
-        );
-        assert!(sql.contains("WHERE"));
-        // Should use row_hash for change detection
-        assert!(sql.contains(r#""row_hash" IS DISTINCT FROM EXCLUDED."row_hash""#));
-        // Should NOT compare individual columns in WHERE clause
-        assert!(!sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-        assert!(!sql.contains(r#""value" IS DISTINCT FROM EXCLUDED."value""#));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_with_custom_hash_column() {
-        // When using a custom hash column name
-        let cols = vec!["id".to_string(), "name".to_string(), "_hash".to_string()];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("_hash"),
-        );
-        // Should use custom hash column
-        assert!(sql.contains(r#""_hash" IS DISTINCT FROM EXCLUDED."_hash""#));
-        assert!(!sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_hash_column_not_in_cols() {
-        // When row_hash_column is specified but not in cols, should fallback
-        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = build_staging_merge_sql(
-            "public",
-            "users",
-            "_staging_users",
-            &cols,
-            &pk_cols,
-            Some("row_hash"), // specified but not in cols
-        );
-        // Should fallback to comparing all non-PK columns
-        assert!(sql.contains(r#""name" IS DISTINCT FROM EXCLUDED."name""#));
-        assert!(sql.contains(r#""value" IS DISTINCT FROM EXCLUDED."value""#));
-        // Should NOT reference row_hash since it's not in cols
-        assert!(!sql.contains("row_hash"));
-    }
-
-    #[test]
-    fn test_calculate_row_hash_skip_indices() {
-        // Test that skip_indices excludes columns from hash computation
-        let row = vec![
-            SqlValue::I32(1),                                // index 0 - PK
-            SqlValue::String("name".to_string()),            // index 1 - normal
-            SqlValue::String("large text body".to_string()), // index 2 - text to skip
-            SqlValue::I32(42),                               // index 3 - normal
-        ];
-        let pk_indices = vec![0];
-
-        // Hash without skipping any columns
-        let hash_all = calculate_row_hash(&row, &pk_indices, &[]);
-
-        // Hash skipping index 2 (text column)
-        let hash_skip_text = calculate_row_hash(&row, &pk_indices, &[2]);
-
-        // Hashes should be different
-        assert_ne!(hash_all, hash_skip_text);
-
-        // Hash with different text content but same skip should be same
-        let row2 = vec![
-            SqlValue::I32(1),
-            SqlValue::String("name".to_string()),
-            SqlValue::String("completely different text".to_string()), // different text
-            SqlValue::I32(42),
-        ];
-        let hash_skip_text2 = calculate_row_hash(&row2, &pk_indices, &[2]);
-        assert_eq!(hash_skip_text, hash_skip_text2); // Same because text is skipped
-    }
-
-    #[test]
-    fn test_calculate_row_hash_skip_multiple_indices() {
-        // Test skipping multiple columns
-        let row = vec![
-            SqlValue::I32(1),                      // index 0 - PK
-            SqlValue::String("text1".to_string()), // index 1 - skip
-            SqlValue::String("keep".to_string()),  // index 2 - keep
-            SqlValue::String("text2".to_string()), // index 3 - skip
-        ];
-        let pk_indices = vec![0];
-
-        let hash = calculate_row_hash(&row, &pk_indices, &[1, 3]);
-
-        // Change skipped columns - hash should stay the same
-        let row2 = vec![
-            SqlValue::I32(1),
-            SqlValue::String("different".to_string()), // changed but skipped
-            SqlValue::String("keep".to_string()),
-            SqlValue::String("also changed".to_string()), // changed but skipped
-        ];
-        let hash2 = calculate_row_hash(&row2, &pk_indices, &[1, 3]);
-        assert_eq!(hash, hash2);
-
-        // Change non-skipped column - hash should change
-        let row3 = vec![
-            SqlValue::I32(1),
-            SqlValue::String("text1".to_string()),
-            SqlValue::String("modified".to_string()), // changed and NOT skipped
-            SqlValue::String("text2".to_string()),
-        ];
-        let hash3 = calculate_row_hash(&row3, &pk_indices, &[1, 3]);
-        assert_ne!(hash, hash3);
     }
 }

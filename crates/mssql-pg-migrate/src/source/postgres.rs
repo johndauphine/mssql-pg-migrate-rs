@@ -5,15 +5,11 @@
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
-use crate::source::{
-    CheckConstraint, Column, ForeignKey, Index, Partition, PkValue, SourcePool, Table,
-};
+use crate::source::{CheckConstraint, Column, ForeignKey, Index, Partition, SourcePool, Table};
 use crate::target::SqlValue;
-use crate::verify::{CompositePk, CompositeRowHashMap, RowRange};
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustls::ClientConfig;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_postgres::Config as PgConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -324,165 +320,6 @@ impl PgSourcePool {
         }
 
         Ok(partitions)
-    }
-
-    /// Execute count and hash query using ROW_NUMBER range.
-    pub async fn execute_count_query_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-    ) -> Result<(i64, i64)> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting connection for count query"))?;
-
-        let row = client
-            .query_one(query, &[&range.start_row, &range.end_row])
-            .await?;
-
-        let row_count: i64 = row.get(0);
-        let range_hash: i64 = row.get(1);
-        Ok((row_count, range_hash))
-    }
-
-    /// Fetch row hashes using ROW_NUMBER range with composite PK support.
-    pub async fn fetch_row_hashes_with_rownum(
-        &self,
-        query: &str,
-        range: &RowRange,
-        pk_column_count: usize,
-    ) -> Result<CompositeRowHashMap> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting connection for row hashes"))?;
-
-        let rows = client
-            .query(query, &[&range.start_row, &range.end_row])
-            .await?;
-
-        let mut hashes = HashMap::new();
-        for row in rows {
-            let mut pk_values = Vec::with_capacity(pk_column_count);
-            for i in 0..pk_column_count {
-                let pk_value = extract_pk_value(&row, i);
-                pk_values.push(pk_value);
-            }
-
-            let hash_idx = pk_column_count;
-            let hash: Option<String> = row.try_get(hash_idx).ok();
-
-            if let Some(h) = hash {
-                hashes.insert(CompositePk::new(pk_values), h);
-            }
-        }
-
-        Ok(hashes)
-    }
-
-    /// Fetch rows for a specific range.
-    pub async fn fetch_rows_for_range(
-        &self,
-        table: &Table,
-        pk_column: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
-
-        let col_list = columns
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let query = format!(
-            "SELECT {} FROM {}.{} WHERE {} >= {} AND {} < {} ORDER BY {}",
-            col_list,
-            quote_ident(&table.schema),
-            quote_ident(&table.name),
-            quote_ident(pk_column),
-            min_pk,
-            quote_ident(pk_column),
-            max_pk,
-            quote_ident(pk_column)
-        );
-
-        self.query_rows_fast(&query, &columns, &col_types).await
-    }
-
-    /// Fetch specific rows by composite primary key values.
-    pub async fn fetch_rows_by_composite_pks(
-        &self,
-        table: &Table,
-        pks: &[CompositePk],
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        if pks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
-        let pk_columns = &table.primary_key;
-
-        let col_list = columns
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let order_by = pk_columns
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let mut all_rows = Vec::new();
-
-        for chunk in pks.chunks(500) {
-            let where_clause = if pk_columns.len() == 1 {
-                let pk_col = quote_ident(&pk_columns[0]);
-                let pk_list = chunk
-                    .iter()
-                    .map(|pk| pk.values()[0].to_sql_literal())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{} IN ({})", pk_col, pk_list)
-            } else {
-                let conditions: Vec<String> = chunk
-                    .iter()
-                    .map(|pk| {
-                        let parts: Vec<String> = pk_columns
-                            .iter()
-                            .zip(pk.values())
-                            .map(|(col, val)| {
-                                format!("{} = {}", quote_ident(col), val.to_sql_literal())
-                            })
-                            .collect();
-                        format!("({})", parts.join(" AND "))
-                    })
-                    .collect();
-                conditions.join(" OR ")
-            };
-
-            let query = format!(
-                "SELECT {} FROM {}.{} WHERE {} ORDER BY {}",
-                col_list,
-                quote_ident(&table.schema),
-                quote_ident(&table.name),
-                where_clause,
-                order_by
-            );
-
-            let rows = self.query_rows_fast(&query, &columns, &col_types).await?;
-            all_rows.extend(rows);
-        }
-
-        Ok(all_rows)
     }
 }
 
@@ -810,43 +647,6 @@ fn estimate_pg_column_size(col: &Column) -> i64 {
         "json" | "jsonb" => 100,
         _ => 8,
     }
-}
-
-/// Extract a PkValue from a PostgreSQL row.
-///
-/// Returns a diagnostic string for unsupported types instead of panicking,
-/// allowing the migration to continue and log a meaningful error.
-fn extract_pk_value(row: &tokio_postgres::Row, idx: usize) -> PkValue {
-    if let Ok(v) = row.try_get::<_, i64>(idx) {
-        return PkValue::Int(v);
-    }
-    if let Ok(v) = row.try_get::<_, i32>(idx) {
-        return PkValue::Int(v as i64);
-    }
-    if let Ok(v) = row.try_get::<_, i16>(idx) {
-        return PkValue::Int(v as i64);
-    }
-    if let Ok(v) = row.try_get::<_, uuid::Uuid>(idx) {
-        return PkValue::Uuid(v);
-    }
-    if let Ok(v) = row.try_get::<_, String>(idx) {
-        return PkValue::String(v);
-    }
-
-    // Fallback: return a diagnostic string instead of panicking
-    // This allows the migration to continue and log a meaningful error
-    let col_type_name = row
-        .columns()
-        .get(idx)
-        .map(|c| c.type_().name().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    warn!(
-        "Unsupported primary key type at index {} (postgres type: {})",
-        idx, col_type_name
-    );
-
-    PkValue::String(format!("UNSUPPORTED_PK_TYPE_{}_{}", idx, col_type_name))
 }
 
 /// Convert a PostgreSQL row value to SqlValue based on column type.
