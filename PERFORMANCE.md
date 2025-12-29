@@ -25,12 +25,16 @@ This document provides guidance on tuning `mssql-pg-migrate` for optimal perform
 
 ### Rust vs Go Implementation
 
+Benchmark: Votes table (10.1M rows), drop_recreate mode, 6 workers, 8 readers, 6 writers.
+
 | Metric | Go | Rust | Improvement |
 |--------|-----|------|-------------|
-| Transfer time | 1m 45s | 61.7s | 41% faster |
-| Throughput | 183K rows/s | 313K rows/s | 71% faster |
-| Finalization | 63s | 5s | 92% faster |
-| Total time | 3m 2s | 61.7s | 66% faster |
+| Run 1 | 17.0s (611K rows/s) | 15.0s (677K rows/s) | 12% faster |
+| Run 2 | 15.3s (672K rows/s) | 13.3s | 15% faster |
+| Run 3 | 17.7s (581K rows/s) | 14.2s (716K rows/s) | 20% faster |
+| **Average** | **16.7s** | **14.2s** | **~17% faster** |
+
+*Note: Go times include automatic validation step; Rust does not. Both use identical config.*
 
 ### Upsert Mode Performance
 

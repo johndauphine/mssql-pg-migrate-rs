@@ -4,12 +4,11 @@ mod pools;
 
 pub use pools::{SourcePoolImpl, TargetPoolImpl};
 
-use crate::config::{BatchVerifyConfig, Config, TableStats, TargetMode};
+use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
 use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
 use crate::transfer::{TransferConfig, TransferEngine, TransferJob};
-use crate::verify::UniversalVerifyEngine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -539,37 +538,23 @@ impl Orchestrator {
         }
 
         // Phase 3: Transfer data (skip in dry-run)
-        // For upsert mode with hash detection: use batch hashing to detect changes, only sync differences
-        // For upsert mode without hash detection: stream all rows, let PostgreSQL handle comparison
+        // For upsert mode: stream all rows, let PostgreSQL handle comparison via ON CONFLICT
         // For other modes: full transfer of all rows
         let transfer_result = if !dry_run {
             let is_upsert = matches!(self.config.migration.target_mode, TargetMode::Upsert);
-            let use_hash = self.config.migration.use_hash_detection();
 
-            if is_upsert && use_hash {
-                // Upsert with hash detection: Use batch hashing to detect and sync only changed rows
-                info!("Phase 3: Batch sync (detecting changes with batch hashing)");
-                self.emit_progress("batch_sync", tables.len(), total_rows);
-                self.batch_sync(&tables, &mut state, &cancel).await
+            if is_upsert {
+                info!("Phase 3: Upsert (streaming all rows, PostgreSQL handles comparison)");
             } else {
-                // Fast path: stream all rows, let PostgreSQL handle comparison via ON CONFLICT
-                // Used for drop_recreate, truncate, and upsert without hash detection
-                if is_upsert {
-                    info!("Phase 3: Fast upsert (streaming all rows, PostgreSQL handles comparison)");
-                } else {
-                    info!("Phase 3: Transferring data");
-                }
-                self.emit_progress("transferring", tables.len(), total_rows);
-                self.transfer_data(&tables, &mut state, &cancel).await
+                info!("Phase 3: Transferring data");
             }
+            self.emit_progress("transferring", tables.len(), total_rows);
+            self.transfer_data(&tables, &mut state, &cancel).await
         } else {
             let is_upsert = matches!(self.config.migration.target_mode, TargetMode::Upsert);
-            let use_hash = self.config.migration.use_hash_detection();
 
-            if is_upsert && use_hash {
-                info!("Phase 3: [DRY RUN] Would detect and sync changes with batch hashing");
-            } else if is_upsert {
-                info!("Phase 3: [DRY RUN] Would fast upsert (stream all, PostgreSQL compares)");
+            if is_upsert {
+                info!("Phase 3: [DRY RUN] Would upsert (stream all, PostgreSQL compares)");
             } else {
                 info!(
                     "Phase 3: [DRY RUN] Would transfer data for {} tables",
@@ -692,10 +677,6 @@ impl Orchestrator {
         // Create schema if needed
         self.target.create_schema(target_schema).await?;
 
-        // Check if hash detection is enabled (for all modes)
-        let use_hash_detection = self.config.migration.use_hash_detection();
-        let row_hash_column = self.config.migration.get_row_hash_column();
-
         match self.config.migration.target_mode {
             TargetMode::DropRecreate => {
                 // Drop and recreate all tables
@@ -704,12 +685,7 @@ impl Orchestrator {
                     info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
                     self.target.drop_table(target_schema, &table.name).await?;
 
-                    // Create table with row_hash column if hash detection is enabled
-                    if use_hash_detection {
-                        self.target
-                            .create_table_with_hash(table, target_schema, row_hash_column)
-                            .await?;
-                    } else if self.config.migration.use_unlogged_tables {
+                    if self.config.migration.use_unlogged_tables {
                         self.target
                             .create_table_unlogged(table, target_schema)
                             .await?;
@@ -728,12 +704,6 @@ impl Orchestrator {
                         self.target
                             .truncate_table(target_schema, &table.name)
                             .await?;
-                        // Ensure row_hash column exists if hash detection is enabled
-                        if use_hash_detection {
-                            self.target
-                                .ensure_row_hash_column(target_schema, &table.name, row_hash_column)
-                                .await?;
-                        }
                         // Set to UNLOGGED for faster writes if configured
                         if self.config.migration.use_unlogged_tables {
                             self.target
@@ -741,12 +711,7 @@ impl Orchestrator {
                                 .await?;
                         }
                     } else {
-                        // Create table with row_hash column if hash detection is enabled
-                        if use_hash_detection {
-                            self.target
-                                .create_table_with_hash(table, target_schema, row_hash_column)
-                                .await?;
-                        } else if self.config.migration.use_unlogged_tables {
+                        if self.config.migration.use_unlogged_tables {
                             self.target
                                 .create_table_unlogged(table, target_schema)
                                 .await?;
@@ -764,13 +729,6 @@ impl Orchestrator {
             }
             TargetMode::Upsert => {
                 // For upsert, ensure tables exist and drop non-PK indexes for performance
-                if use_hash_detection {
-                    info!(
-                        "Hash-based change detection enabled (column: {})",
-                        row_hash_column
-                    );
-                }
-
                 for (i, table) in tables.iter().enumerate() {
                     let table_name = table.full_name();
                     info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
@@ -781,12 +739,7 @@ impl Orchestrator {
                     }
 
                     if !self.target.table_exists(target_schema, &table.name).await? {
-                        if use_hash_detection {
-                            // Create table with row_hash column for change detection
-                            self.target
-                                .create_table_with_hash(table, target_schema, row_hash_column)
-                                .await?;
-                        } else if self.config.migration.use_unlogged_tables {
+                        if self.config.migration.use_unlogged_tables {
                             self.target
                                 .create_table_unlogged(table, target_schema)
                                 .await?;
@@ -795,20 +748,6 @@ impl Orchestrator {
                         }
                         self.target.create_primary_key(table, target_schema).await?;
                     } else {
-                        // Table exists - ensure hash column exists if using hash detection
-                        if use_hash_detection {
-                            let added = self
-                                .target
-                                .ensure_row_hash_column(target_schema, &table.name, row_hash_column)
-                                .await?;
-                            if added {
-                                debug!(
-                                    "Added {} column to existing table {}",
-                                    row_hash_column, table_name
-                                );
-                            }
-                        }
-
                         // Drop non-PK indexes for faster upserts (only recreated if create_indexes is enabled)
                         let dropped = self
                             .target
@@ -999,13 +938,6 @@ impl Orchestrator {
                                 resume_from_pk: None, // Partitions don't support resume yet
                                 target_mode: self.config.migration.target_mode.clone(),
                                 target_schema: self.config.target.schema.clone(),
-                                use_hash_detection: self.config.migration.use_hash_detection(),
-                                row_hash_column: self
-                                    .config
-                                    .migration
-                                    .get_row_hash_column()
-                                    .to_string(),
-                                hash_text_columns: self.config.migration.hash_text_columns,
                             };
 
                             let engine_clone = engine.clone();
@@ -1050,9 +982,6 @@ impl Orchestrator {
                 resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
                 target_mode: self.config.migration.target_mode.clone(),
                 target_schema: self.config.target.schema.clone(),
-                use_hash_detection: self.config.migration.use_hash_detection(),
-                row_hash_column: self.config.migration.get_row_hash_column().to_string(),
-                hash_text_columns: self.config.migration.hash_text_columns,
             };
 
             let engine_clone = engine.clone();
@@ -1370,127 +1299,6 @@ impl Orchestrator {
         }
 
         Ok(results)
-    }
-
-    /// Batch sync for upsert mode - uses multi-tier batch hashing to detect and sync differences.
-    ///
-    /// This is the primary sync mechanism for upsert mode:
-    /// 1. Uses batch hashing to identify rows that differ between source and target
-    /// 2. Only fetches and syncs the rows that have changed
-    /// 3. Performs inserts and updates only (no deletes for safety)
-    async fn batch_sync(
-        &self,
-        tables: &[Table],
-        state: &mut MigrationState,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        let source_schema = &self.config.source.schema;
-        let target_schema = &self.config.target.schema;
-
-        // Create verify engine with default batch sizes
-        let verify_config = BatchVerifyConfig {
-            tier1_batch_size: 1_000_000,
-            tier2_batch_size: 10_000,
-            parallel_verify_ranges: 4,
-        };
-
-        let engine = UniversalVerifyEngine::new(
-            self.source.clone(),
-            self.target.clone(),
-            verify_config,
-            self.config.migration.get_row_hash_column().to_string(),
-            self.config.migration.hash_text_columns,
-        );
-
-        let mut total_synced = 0i64;
-        let mut tables_success = 0usize;
-        let mut tables_failed = 0usize;
-
-        for table in tables {
-            if cancel.is_cancelled() {
-                info!("Batch sync cancelled");
-                break;
-            }
-
-            let table_name = table.full_name();
-
-            // Skip tables without primary key
-            if table.primary_key.is_empty() {
-                debug!("Skipping batch sync for {} (no primary key)", table.name);
-                if let Some(ts) = state.tables.get_mut(&table_name) {
-                    ts.status = TaskStatus::Completed;
-                    ts.completed_at = Some(Utc::now());
-                }
-                tables_success += 1;
-                continue;
-            }
-
-            // Mark as in progress
-            if let Some(ts) = state.tables.get_mut(&table_name) {
-                ts.status = TaskStatus::InProgress;
-            }
-
-            // Verify and sync the table
-            match engine
-                .verify_and_sync_table(table, source_schema, target_schema)
-                .await
-            {
-                Ok((result, stats)) => {
-                    let synced = stats.rows_inserted + stats.rows_updated;
-                    if synced > 0 {
-                        info!(
-                            "Batch sync {}: {} inserts, {} updates",
-                            table.name, stats.rows_inserted, stats.rows_updated
-                        );
-                        total_synced += synced;
-                    } else if !result.is_in_sync() {
-                        debug!(
-                            "Batch sync {}: {} deletes skipped (safety)",
-                            table.name, result.rows_to_delete
-                        );
-                    } else {
-                        debug!("Batch sync {}: already in sync", table.name);
-                    }
-
-                    // Update state
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Completed;
-                        ts.rows_transferred = synced;
-                        ts.completed_at = Some(Utc::now());
-                    }
-                    tables_success += 1;
-                }
-                Err(e) => {
-                    warn!("Batch sync failed for {}: {}", table.name, e);
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Failed;
-                        ts.error = Some(e.to_string());
-                    }
-                    tables_failed += 1;
-                }
-            }
-
-            // Save state after each table
-            self.save_state(state)?;
-        }
-
-        if total_synced > 0 {
-            info!(
-                "Batch sync complete: {} rows synced across {} tables",
-                total_synced, tables_success
-            );
-        } else {
-            info!("Batch sync complete: all {} tables in sync", tables_success);
-        }
-
-        if tables_failed > 0 {
-            return Err(MigrateError::Transfer {
-                table: format!("{} tables", tables_failed),
-                message: "One or more tables failed during batch sync".into(),
-            });
-        }
-
-        Ok(())
     }
 }
 

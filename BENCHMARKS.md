@@ -60,14 +60,15 @@ The Rust implementation achieves comparable or better performance:
 | drop_recreate | ~140K | 141K | Comparable |
 | upsert | ~75K | 80K | Comparable |
 
-## Bottlenecks
+## Implemented Optimizations
 
-1. **Single connection:** Currently uses single source/target connection per table
-2. **Upsert limitation:** Cannot use COPY protocol for upsert operations
-3. **Sequential tables:** Tables processed one at a time (workers=1)
+Since initial benchmarks, the following optimizations have been added:
 
-## Future Optimizations
+- [x] Parallel table processing with multiple workers (up to 8)
+- [x] Connection pooling for concurrent reads (bb8/deadpool)
+- [x] Binary COPY format for reduced serialization overhead
+- [x] Parallel readers/writers per table (up to 16 readers, 12 writers)
+- [x] UNLOGGED tables option for ~65% throughput boost
+- [x] Staging table approach for upsert (2-3x faster than row-by-row)
 
-- [ ] Parallel table processing with multiple workers
-- [ ] Connection pooling for concurrent reads
-- [ ] Binary COPY format for reduced serialization overhead
+See PERFORMANCE.md for current tuning recommendations.

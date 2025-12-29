@@ -92,17 +92,6 @@ enum Commands {
     /// Validate row counts between source and target
     Validate,
 
-    /// Verify data consistency using multi-tier batch hashing (read-only)
-    Verify {
-        /// Tier 1 (coarse) batch size in rows (default: 1000000)
-        #[arg(long, default_value = "1000000")]
-        tier1_size: i64,
-
-        /// Tier 2 (fine) batch size in rows (default: 10000)
-        #[arg(long, default_value = "10000")]
-        tier2_size: i64,
-    },
-
     /// Test database connections
     HealthCheck,
 
@@ -302,93 +291,6 @@ async fn run() -> Result<(), MigrateError> {
             println!("Validation completed successfully");
         }
 
-        Commands::Verify {
-            tier1_size,
-            tier2_size,
-        } => {
-            use mssql_pg_migrate::{BatchVerifyConfig, VerifyEngine};
-
-            let orchestrator = Orchestrator::new(config.clone()).await?;
-
-            // Extract schema from source (already filtered by orchestrator.extract_schema())
-            let source_schema = &config.source.schema;
-            let target_schema = &config.target.schema;
-            let tables = orchestrator.extract_schema().await?;
-
-            // Create verify config from migration config or defaults
-            let batch_config = config.migration.batch_verify.as_ref();
-            let verify_config = BatchVerifyConfig {
-                tier1_batch_size: tier1_size,
-                tier2_batch_size: tier2_size,
-                parallel_verify_ranges: batch_config.map_or(4, |c| c.parallel_verify_ranges),
-            };
-
-            // Get connection pools from orchestrator
-            let source = orchestrator.source_pool();
-            let target = orchestrator.target_pool();
-
-            println!("Starting multi-tier verification (read-only)...\n");
-
-            let mut total_result = mssql_pg_migrate::VerifyResult::new();
-            let start = std::time::Instant::now();
-
-            let engine = VerifyEngine::new(
-                source,
-                target,
-                verify_config,
-                config.migration.row_hash_column.clone(),
-                config.migration.hash_text_columns,
-            );
-
-            for table in &tables {
-                match engine
-                    .verify_table(table, source_schema, target_schema)
-                    .await
-                {
-                    Ok(result) => {
-                        print_verify_result(&result);
-                        total_result.add_table(result);
-                    }
-                    Err(e) => {
-                        println!("  ✗ Error verifying {}: {}", table.name, e);
-                    }
-                }
-            }
-
-            total_result.duration_ms = start.elapsed().as_millis() as u64;
-
-            println!("\nVerification Summary:");
-            println!("  Tables checked: {}", total_result.tables_checked);
-            println!("  Tables in sync: {}", total_result.tables_in_sync);
-            println!(
-                "  Tables with differences: {}",
-                total_result.tables_with_differences
-            );
-            if total_result.tables_skipped > 0 {
-                println!("  Tables skipped: {}", total_result.tables_skipped);
-            }
-            println!(
-                "  Total rows to insert: {}",
-                total_result.total_rows_to_insert
-            );
-            println!(
-                "  Total rows to update: {}",
-                total_result.total_rows_to_update
-            );
-            println!(
-                "  Total rows to delete: {}",
-                total_result.total_rows_to_delete
-            );
-            println!(
-                "  Duration: {:.2}s",
-                total_result.duration_ms as f64 / 1000.0
-            );
-
-            if cli.output_json {
-                println!("\n{}", serde_json::to_string_pretty(&total_result)?);
-            }
-        }
-
         Commands::HealthCheck => {
             let orchestrator = Orchestrator::new(config).await?;
             let result = orchestrator.health_check().await?;
@@ -461,34 +363,6 @@ fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Print verification result for a single table.
-fn print_verify_result(result: &mssql_pg_migrate::TableVerifyResult) {
-    let status = if result.skipped {
-        "⊘ Skipped"
-    } else if result.is_in_sync() {
-        "✓ In sync"
-    } else {
-        "✗ Differs"
-    };
-    if result.skipped {
-        println!(
-            "  {} {} ({})",
-            status,
-            result.table_name,
-            result.skip_reason.as_deref().unwrap_or("unknown reason")
-        );
-    } else {
-        println!(
-            "  {} {} (insert: {}, update: {}, delete: {})",
-            status,
-            result.table_name,
-            result.rows_to_insert,
-            result.rows_to_update,
-            result.rows_to_delete
-        );
-    }
 }
 
 /// Setup signal handlers for graceful shutdown.
