@@ -193,10 +193,14 @@ mod tests {
     use super::*;
 
     fn make_column(name: &str, data_type: &str) -> Column {
+        make_column_with_length(name, data_type, 0)
+    }
+
+    fn make_column_with_length(name: &str, data_type: &str, max_length: i32) -> Column {
         Column {
             name: name.to_string(),
             data_type: data_type.to_string(),
-            max_length: 0,
+            max_length,
             precision: 0,
             scale: 0,
             is_nullable: true,
@@ -293,5 +297,49 @@ mod tests {
         assert!(expr_without_text.contains("[name]"));
         assert!(!expr_without_text.contains("[body]"));
         assert!(!expr_without_text.contains("[notes]"));
+    }
+
+    #[test]
+    fn test_is_text_column_direct_text_types() {
+        // Direct text types should be detected regardless of max_length
+        assert!(is_text_column(&make_column("body", "text")));
+        assert!(is_text_column(&make_column("body", "ntext")));
+        assert!(is_text_column(&make_column("body", "xml")));
+        assert!(is_text_column(&make_column("body", "TEXT"))); // case insensitive
+    }
+
+    #[test]
+    fn test_is_text_column_nvarchar_max_via_max_length() {
+        // This is the key fix: nvarchar with max_length=-1 should be detected
+        assert!(is_text_column(&make_column_with_length("body", "nvarchar", -1)));
+        assert!(is_text_column(&make_column_with_length("body", "varchar", -1)));
+        assert!(is_text_column(&make_column_with_length("body", "NVARCHAR", -1))); // case insensitive
+    }
+
+    #[test]
+    fn test_is_text_column_nvarchar_with_size_not_text() {
+        // nvarchar with a specific size should NOT be detected as text
+        assert!(!is_text_column(&make_column_with_length("name", "nvarchar", 100)));
+        assert!(!is_text_column(&make_column_with_length("name", "varchar", 255)));
+        assert!(!is_text_column(&make_column_with_length("name", "nvarchar", 50)));
+    }
+
+    #[test]
+    fn test_is_text_column_type_string_with_max() {
+        // Handle if type string already includes size annotation
+        assert!(is_text_column(&make_column("body", "nvarchar(max)")));
+        assert!(is_text_column(&make_column("body", "varchar(max)")));
+        assert!(is_text_column(&make_column("body", "nvarchar(-1)")));
+        assert!(is_text_column(&make_column("body", "varchar(-1)")));
+    }
+
+    #[test]
+    fn test_is_text_column_non_text_types() {
+        // Non-text types should not be detected
+        assert!(!is_text_column(&make_column("id", "int")));
+        assert!(!is_text_column(&make_column("created", "datetime")));
+        assert!(!is_text_column(&make_column("amount", "decimal")));
+        assert!(!is_text_column(&make_column("data", "varbinary"))); // binary, not text
+        assert!(!is_text_column(&make_column_with_length("data", "varbinary", -1))); // even varbinary(max)
     }
 }
