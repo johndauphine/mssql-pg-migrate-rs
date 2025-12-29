@@ -38,17 +38,20 @@ Benchmark: Votes table (10.1M rows), drop_recreate mode, 6 workers, 8 readers, 6
 
 ### Upsert Mode Performance
 
-Upsert mode (`target_mode: upsert`) uses a staging table approach for optimal performance:
+Upsert mode (`target_mode: upsert`) uses a staging table approach with `IS DISTINCT FROM` change detection:
 
 | Approach | Chunk Size | Throughput |
 |----------|-----------|------------|
 | Row-by-row INSERT...ON CONFLICT | N/A | 59K rows/sec |
-| Staging table + 123K chunk (auto) | 123K | 113K rows/sec |
+| Staging table + 123K chunk | 123K | 113K rows/sec |
 | Staging table + 25K chunk | 25K | 157K rows/sec |
 | Staging table + 50K chunk | 50K | 154K rows/sec |
-| **Staging table + 50K (optimized auto)** | 50K | **126-157K rows/sec** |
+| **Staging table + 50K (default)** | 50K | **106-157K rows/sec** |
 
-**Key insight**: Smaller chunks (25K-75K) perform better for upsert due to reduced lock contention on the target table during MERGE operations.
+**Key insights**:
+- Smaller chunks (25K-75K) perform better due to reduced lock contention during MERGE
+- `IS DISTINCT FROM` handles NULL values correctly and requires no pre-computation
+- PostgreSQL optimizes away unchanged rows at the storage level
 
 ## Key Findings
 
@@ -175,7 +178,7 @@ migration:
   max_pg_connections: 36
 ```
 
-**Note**: Upsert mode uses a staging table approach: rows are COPY'd to a temp table, then merged into the target with `INSERT...ON CONFLICT DO UPDATE`. This is 2-3x faster than row-by-row upserts.
+**Note**: Upsert mode uses a staging table approach: rows are COPY'd to a temp table, then merged into the target with `INSERT...ON CONFLICT DO UPDATE WHERE col IS DISTINCT FROM EXCLUDED.col`. This is 2-3x faster than row-by-row upserts and only updates rows where values actually changed.
 
 ## Troubleshooting
 
