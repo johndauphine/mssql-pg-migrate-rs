@@ -30,19 +30,19 @@
 |------|----------|------------|-------|
 | truncate | 104s | 185,680 rows/sec | Fastest - COPY protocol, no DDL |
 | drop_recreate | 136.6s | 141,323 rows/sec | COPY protocol + table creation |
-| upsert | 242.5s | 79,627 rows/sec | INSERT...ON CONFLICT overhead |
+| upsert | ~180s | ~106,000 rows/sec | Staging table + IS DISTINCT FROM |
 
 ### Key Implementation Details
 
 - **COPY Protocol:** `truncate` and `drop_recreate` use PostgreSQL COPY protocol for bulk inserts
-- **Upsert:** Uses `INSERT...ON CONFLICT DO UPDATE` (COPY doesn't support upsert semantics)
+- **Upsert:** Streams to staging table via COPY, then merges with `INSERT...ON CONFLICT DO UPDATE WHERE IS DISTINCT FROM`
 - **Read-ahead pipeline:** Concurrent reading/writing with tokio channels
 
 ### Observations
 
 1. **truncate is fastest** - No DDL operations, just TRUNCATE + COPY
 2. **drop_recreate** - Includes table creation time, still very fast with COPY
-3. **upsert is slowest** - ON CONFLICT DO UPDATE adds significant overhead for change detection
+3. **upsert is competitive** - Staging table approach with `IS DISTINCT FROM` achieves ~57% of truncate speed
 
 ### Resource Usage
 
@@ -58,7 +58,7 @@ The Rust implementation achieves comparable or better performance:
 |------|---------------|-----------------|-------|
 | truncate | ~180K | 185K | Comparable |
 | drop_recreate | ~140K | 141K | Comparable |
-| upsert | ~75K | 80K | Comparable |
+| upsert | ~75K | ~106K | Rust ~40% faster (staging table optimization) |
 
 ## Implemented Optimizations
 
@@ -70,5 +70,6 @@ Since initial benchmarks, the following optimizations have been added:
 - [x] Parallel readers/writers per table (up to 16 readers, 12 writers)
 - [x] UNLOGGED tables option for ~65% throughput boost
 - [x] Staging table approach for upsert (2-3x faster than row-by-row)
+- [x] `IS DISTINCT FROM` change detection (no pre-computation overhead)
 
 See PERFORMANCE.md for current tuning recommendations.
