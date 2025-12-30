@@ -1275,14 +1275,10 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let mut total_inserted = 0u64;
 
-        // If we have both bulk and oversized rows, wrap the entire operation
-        // in a transaction to ensure atomicity
-        let needs_transaction = !bulk_rows.is_empty() && !oversized_rows.is_empty();
-        if needs_transaction {
-            conn.execute("BEGIN TRANSACTION", &[]).await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("begin transaction: {}", e))
-            })?;
-        }
+        // Note: We don't wrap in an outer transaction because:
+        // 1. Tiberius bulk_insert manages its own transaction internally
+        // 2. Wrapping it causes "Transaction count mismatch" errors (code 266)
+        // 3. Each operation (bulk insert, INSERT batches) is atomic on its own
 
         // Process bulk-insertable rows via TDS bulk insert (5-10x faster)
         if !bulk_rows.is_empty() {
@@ -1329,27 +1325,10 @@ impl TargetPool for MssqlTargetPool {
                 oversized_count, qualified_table
             );
 
-            match Self::insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows)
-                .await
-            {
-                Ok(inserted) => {
-                    total_inserted += inserted;
-                }
-                Err(e) => {
-                    // Rollback transaction if we started one
-                    if needs_transaction {
-                        let _ = conn.execute("ROLLBACK TRANSACTION", &[]).await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        // Commit transaction if we started one
-        if needs_transaction {
-            conn.execute("COMMIT TRANSACTION", &[]).await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("commit transaction: {}", e))
-            })?;
+            let inserted =
+                Self::insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows)
+                    .await?;
+            total_inserted += inserted;
         }
 
         Ok(total_inserted)
