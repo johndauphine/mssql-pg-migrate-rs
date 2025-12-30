@@ -643,6 +643,7 @@ impl MssqlTargetPool {
 
     /// Insert rows using parameterized INSERT statements (fallback for oversized strings).
     /// Uses parameterized queries to prevent SQL injection.
+    /// Batches multiple rows per INSERT for better performance (up to MSSQL's 2100 param limit).
     async fn insert_rows_fallback(
         conn: &mut PooledConnection<'_, TiberiusTargetConnectionManager>,
         qualified_table: &str,
@@ -656,38 +657,63 @@ impl MssqlTargetPool {
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
 
-        // Build parameterized query with @P1, @P2, ... placeholders
-        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("@P{}", i)).collect();
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            qualified_table,
-            col_str,
-            placeholders.join(", ")
-        );
+        // MSSQL has a 2100 parameter limit per query
+        // Calculate how many rows we can fit per batch
+        let cols_per_row = cols.len();
+        let max_rows_per_batch = if cols_per_row > 0 {
+            (2100 / cols_per_row).max(1) // At least 1 row per batch
+        } else {
+            rows.len()
+        };
 
         let mut total_inserted = 0u64;
 
-        // Insert one row at a time with parameterized queries
-        // This is slower than bulk VALUES but secure against SQL injection
-        for (row_idx, row) in rows.iter().enumerate() {
-            // Convert SqlValue to boxed ToSql trait objects
-            let params: Vec<Box<dyn ToSql>> = row
+        // Process rows in batches
+        for batch in rows.chunks(max_rows_per_batch) {
+            // Build multi-row VALUES clause: VALUES (@P1, @P2), (@P3, @P4), ...
+            let mut value_groups = Vec::with_capacity(batch.len());
+            let mut param_idx = 1;
+
+            for _ in batch.iter() {
+                let placeholders: Vec<String> = (0..cols_per_row)
+                    .map(|_| {
+                        let p = format!("@P{}", param_idx);
+                        param_idx += 1;
+                        p
+                    })
+                    .collect();
+                value_groups.push(format!("({})", placeholders.join(", ")));
+            }
+
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                qualified_table,
+                col_str,
+                value_groups.join(", ")
+            );
+
+            // Flatten all row values into a single params vector
+            let params: Vec<Box<dyn ToSql>> = batch
                 .iter()
-                .map(sql_value_to_sql_param)
+                .flat_map(|row| row.iter().map(sql_value_to_sql_param))
                 .collect();
 
-            // Create references for the execute call
             let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
             conn.execute(sql.as_str(), &param_refs).await.map_err(|e| {
                 MigrateError::transfer(
                     qualified_table,
-                    format!("fallback INSERT (row {}): {}", row_idx, e),
+                    format!("batched INSERT ({} rows): {}", batch.len(), e),
                 )
             })?;
 
-            total_inserted += 1;
+            total_inserted += batch.len() as u64;
         }
+
+        debug!(
+            "Inserted {} rows via batched INSERT fallback (batch size: {})",
+            total_inserted, max_rows_per_batch
+        );
 
         Ok(total_inserted)
     }
@@ -1958,6 +1984,37 @@ mod tests {
 
         assert_eq!(bulk_rows.len(), 0);
         assert_eq!(oversized_rows.len(), 0);
+    }
+
+    #[test]
+    fn test_batched_insert_batch_size_calculation() {
+        // MSSQL has a 2100 parameter limit per query
+        // Test that batch size is correctly calculated based on column count
+
+        // 10 columns -> 2100 / 10 = 210 rows per batch
+        let cols_10 = 10;
+        let max_rows_10 = (2100 / cols_10).max(1);
+        assert_eq!(max_rows_10, 210);
+
+        // 100 columns -> 2100 / 100 = 21 rows per batch
+        let cols_100 = 100;
+        let max_rows_100 = (2100 / cols_100).max(1);
+        assert_eq!(max_rows_100, 21);
+
+        // 3 columns -> 2100 / 3 = 700 rows per batch
+        let cols_3 = 3;
+        let max_rows_3 = (2100 / cols_3).max(1);
+        assert_eq!(max_rows_3, 700);
+
+        // 2100 columns -> 2100 / 2100 = 1 row per batch
+        let cols_2100 = 2100;
+        let max_rows_2100 = (2100 / cols_2100).max(1);
+        assert_eq!(max_rows_2100, 1);
+
+        // 3000 columns -> 2100 / 3000 = 0, but max(1) ensures at least 1
+        let cols_3000 = 3000;
+        let max_rows_3000 = (2100 / cols_3000).max(1);
+        assert_eq!(max_rows_3000, 1);
     }
 
     #[test]

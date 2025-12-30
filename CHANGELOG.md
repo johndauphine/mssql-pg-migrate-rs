@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.10] - 2025-12-29
+
+### Performance
+- **Batched INSERT Fallback** - Oversized string fallback now uses multi-row INSERT statements instead of single-row
+  - Batches up to 2100/columns rows per INSERT (MSSQL parameter limit)
+  - Expected 10-20x improvement for tables with many oversized strings (e.g., SO2013 Posts.Body)
+  - Example: 10-column table → 210 rows per batch; 3-column table → 700 rows per batch
+
+### Tests
+- Added unit test for batch size calculation logic
+
 ## [0.8.9] - 2025-12-29
 
 ### Performance
