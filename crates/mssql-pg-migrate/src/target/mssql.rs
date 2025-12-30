@@ -991,15 +991,43 @@ impl TargetPool for MssqlTargetPool {
             })
             .collect();
 
+        // Build PRIMARY KEY CLUSTERED constraint if table has a primary key.
+        // Creating clustered PK during table creation is much faster than adding it
+        // after data load, as data is inserted directly into sorted B-tree structure
+        // rather than requiring a massive index rebuild.
+        let pk_constraint = if !table.primary_key.is_empty() {
+            let pk_cols: Vec<String> = table
+                .primary_key
+                .iter()
+                .map(|c| Self::quote_ident(c))
+                .collect();
+            let pk_name = format!("PK_{}", table.name);
+            format!(
+                ",\n    CONSTRAINT {} PRIMARY KEY CLUSTERED ({})",
+                Self::quote_ident(&pk_name),
+                pk_cols.join(", ")
+            )
+        } else {
+            String::new()
+        };
+
         let ddl = format!(
-            "CREATE TABLE {}.{} (\n    {}\n)",
+            "CREATE TABLE {}.{} (\n    {}{}\n)",
             Self::quote_ident(target_schema),
             Self::quote_ident(&table.name),
-            col_defs.join(",\n    ")
+            col_defs.join(",\n    "),
+            pk_constraint
         );
 
         conn.execute(&ddl, &[]).await?;
-        debug!("Created table: {}.{}", target_schema, table.name);
+        if !table.primary_key.is_empty() {
+            debug!(
+                "Created table with clustered PK: {}.{}",
+                target_schema, table.name
+            );
+        } else {
+            debug!("Created table: {}.{}", target_schema, table.name);
+        }
         Ok(())
     }
 
@@ -1052,12 +1080,30 @@ impl TargetPool for MssqlTargetPool {
         }
 
         let mut conn = self.get_conn().await?;
+
+        // Check if primary key already exists (created during table creation for clustered PK optimization)
+        let pk_name = format!("PK_{}", table.name);
+        let check_query = format!(
+            "SELECT 1 FROM sys.key_constraints WHERE name = '{}' AND parent_object_id = OBJECT_ID('{}.{}')",
+            pk_name.replace('\'', "''"),
+            target_schema.replace('\'', "''"),
+            table.name.replace('\'', "''")
+        );
+        let result = conn.query(&check_query, &[]).await?;
+        if result.into_first_result().await?.first().is_some() {
+            debug!(
+                "Primary key already exists on {}.{} (created with table)",
+                target_schema, table.name
+            );
+            return Ok(());
+        }
+
+        // PK doesn't exist, create it (fallback for tables without clustered PK)
         let pk_cols: Vec<String> = table
             .primary_key
             .iter()
             .map(|c| Self::quote_ident(c))
             .collect();
-        let pk_name = format!("PK_{}_{}", target_schema, table.name);
 
         let query = format!(
             "ALTER TABLE {}.{} ADD CONSTRAINT {} PRIMARY KEY ({})",

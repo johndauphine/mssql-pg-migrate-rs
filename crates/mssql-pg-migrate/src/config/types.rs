@@ -114,7 +114,8 @@ impl Config {
     pub fn with_auto_tuning(mut self) -> Self {
         let resources = SystemResources::detect();
         resources.log();
-        self.migration = self.migration.with_auto_tuning(&resources, None);
+        let target_type = DatabaseType::parse(&self.target.r#type);
+        self.migration = self.migration.with_auto_tuning(&resources, None, target_type);
         self
     }
 
@@ -145,10 +146,11 @@ impl Config {
             total_rows
         );
 
+        let target_type = DatabaseType::parse(&self.target.r#type);
         self.migration = self
             .migration
             .clone()
-            .with_auto_tuning(&resources, Some(avg_row_size));
+            .with_auto_tuning(&resources, Some(avg_row_size), target_type);
     }
 }
 
@@ -404,10 +406,14 @@ impl MigrationConfig {
     ///
     /// If `actual_row_size` is provided, it will be used instead of the default estimate.
     /// This should be the weighted average row size calculated from actual table metadata.
+    ///
+    /// If `target_type` is MSSQL, uses conservative parallelism settings due to TABLOCK
+    /// bulk insert serialization (more writers = more contention, not more throughput).
     pub fn with_auto_tuning(
         mut self,
         resources: &SystemResources,
         actual_row_size: Option<usize>,
+        target_type: Option<DatabaseType>,
     ) -> Self {
         let ram_gb = resources.total_memory_gb;
         let cores = resources.cpu_cores;
@@ -447,18 +453,38 @@ impl MigrationConfig {
         }
         let workers = self.workers.unwrap();
 
-        // Parallel readers: scale with cores, target 12-14 for optimal throughput.
-        // Benchmarking shows diminishing returns beyond 14 readers.
+        // Parallel readers: conservative scaling based on cores.
+        // Formula: cores/4 clamped to 2-4 for optimal throughput without overwhelming source.
         if self.parallel_readers.is_none() {
-            let readers = cores.max(8).min(16);
+            let readers = (cores / 4).max(2).min(4);
             self.parallel_readers = Some(readers);
+            info!(
+                "  ParallelReaders: {} (auto: cores/4 clamped 2-4, {} cores)",
+                readers, cores
+            );
         }
 
-        // Parallel writers: target 8-10 for optimal throughput.
-        // Benchmarking shows this balances write parallelism with connection pressure.
+        // Parallel writers: depends on target database type.
+        // MSSQL targets: fixed at 2 due to TABLOCK bulk insert serialization.
+        //   - TABLOCK acquires exclusive table lock, serializing all writers
+        //   - More writers = more lock contention overhead, not more throughput
+        // PostgreSQL targets: cores/4 clamped to 2-4, COPY handles parallelism well.
         if self.write_ahead_writers.is_none() {
-            let writers = (cores * 2 / 3).max(6).min(12);
+            let is_mssql_target = matches!(target_type, Some(DatabaseType::Mssql));
+            let writers = if is_mssql_target {
+                2 // Fixed for MSSQL due to TABLOCK serialization
+            } else {
+                (cores / 4).max(2).min(4)
+            };
             self.write_ahead_writers = Some(writers);
+            if is_mssql_target {
+                info!("  WriteAheadWriters: {} (auto: fixed 2 for MSSQL TABLOCK)", writers);
+            } else {
+                info!(
+                    "  WriteAheadWriters: {} (auto: cores/4 clamped 2-4, {} cores)",
+                    writers, cores
+                );
+            }
         }
 
         // Max partitions: scale with cores
