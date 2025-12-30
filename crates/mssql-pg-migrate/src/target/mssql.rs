@@ -1001,7 +1001,7 @@ impl TargetPool for MssqlTargetPool {
                 .iter()
                 .map(|c| Self::quote_ident(c))
                 .collect();
-            let pk_name = format!("PK_{}", table.name);
+            let pk_name = format!("PK_{}_{}", target_schema, table.name);
             format!(
                 ",\n    CONSTRAINT {} PRIMARY KEY CLUSTERED ({})",
                 Self::quote_ident(&pk_name),
@@ -1080,16 +1080,16 @@ impl TargetPool for MssqlTargetPool {
         }
 
         let mut conn = self.get_conn().await?;
+        let pk_name = format!("PK_{}_{}", target_schema, table.name);
 
         // Check if primary key already exists (created during table creation for clustered PK optimization)
-        let pk_name = format!("PK_{}", table.name);
-        let check_query = format!(
-            "SELECT 1 FROM sys.key_constraints WHERE name = '{}' AND parent_object_id = OBJECT_ID('{}.{}')",
-            pk_name.replace('\'', "''"),
-            target_schema.replace('\'', "''"),
-            table.name.replace('\'', "''")
-        );
-        let result = conn.query(&check_query, &[]).await?;
+        // Use parameterized query to prevent SQL injection
+        let check_query = r#"SELECT 1 FROM sys.key_constraints
+            WHERE name = @P1
+            AND parent_object_id = OBJECT_ID(QUOTENAME(@P2) + '.' + QUOTENAME(@P3))"#;
+        let result = conn
+            .query(check_query, &[&pk_name, &target_schema, &table.name])
+            .await?;
         if result.into_first_result().await?.first().is_some() {
             debug!(
                 "Primary key already exists on {}.{} (created with table)",
