@@ -643,6 +643,7 @@ impl MssqlTargetPool {
 
     /// Insert rows using parameterized INSERT statements (fallback for oversized strings).
     /// Uses parameterized queries to prevent SQL injection.
+    /// Batches multiple rows per INSERT for better performance (up to MSSQL's 2100 param limit).
     async fn insert_rows_fallback(
         conn: &mut PooledConnection<'_, TiberiusTargetConnectionManager>,
         qualified_table: &str,
@@ -656,38 +657,67 @@ impl MssqlTargetPool {
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
 
-        // Build parameterized query with @P1, @P2, ... placeholders
-        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("@P{}", i)).collect();
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            qualified_table,
-            col_str,
-            placeholders.join(", ")
-        );
+        // MSSQL has two limits for INSERT...VALUES:
+        // 1. 2100 parameters per query
+        // 2. 1000 rows per VALUES clause
+        let cols_per_row = cols.len();
+        if cols_per_row == 0 {
+            return Err(MigrateError::transfer(
+                qualified_table,
+                "Cannot insert rows with zero columns".to_string(),
+            ));
+        }
+
+        let max_rows_per_batch = (2100 / cols_per_row).min(1000).max(1);
 
         let mut total_inserted = 0u64;
 
-        // Insert one row at a time with parameterized queries
-        // This is slower than bulk VALUES but secure against SQL injection
-        for (row_idx, row) in rows.iter().enumerate() {
-            // Convert SqlValue to boxed ToSql trait objects
-            let params: Vec<Box<dyn ToSql>> = row
+        // Process rows in batches
+        for batch in rows.chunks(max_rows_per_batch) {
+            // Build multi-row VALUES clause: VALUES (@P1, @P2), (@P3, @P4), ...
+            let mut value_groups = Vec::with_capacity(batch.len());
+            let mut param_idx = 1;
+
+            for _ in batch.iter() {
+                let placeholders: Vec<String> = (0..cols_per_row)
+                    .map(|_| {
+                        let p = format!("@P{}", param_idx);
+                        param_idx += 1;
+                        p
+                    })
+                    .collect();
+                value_groups.push(format!("({})", placeholders.join(", ")));
+            }
+
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                qualified_table,
+                col_str,
+                value_groups.join(", ")
+            );
+
+            // Flatten all row values into a single params vector
+            let params: Vec<Box<dyn ToSql>> = batch
                 .iter()
-                .map(sql_value_to_sql_param)
+                .flat_map(|row| row.iter().map(sql_value_to_sql_param))
                 .collect();
 
-            // Create references for the execute call
             let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
             conn.execute(sql.as_str(), &param_refs).await.map_err(|e| {
                 MigrateError::transfer(
                     qualified_table,
-                    format!("fallback INSERT (row {}): {}", row_idx, e),
+                    format!("batched INSERT ({} rows): {}", batch.len(), e),
                 )
             })?;
 
-            total_inserted += 1;
+            total_inserted += batch.len() as u64;
         }
+
+        debug!(
+            "Inserted {} rows via batched INSERT fallback (batch size: {})",
+            total_inserted, max_rows_per_batch
+        );
 
         Ok(total_inserted)
     }
@@ -1245,14 +1275,10 @@ impl TargetPool for MssqlTargetPool {
         let mut conn = self.get_conn().await?;
         let mut total_inserted = 0u64;
 
-        // If we have both bulk and oversized rows, wrap the entire operation
-        // in a transaction to ensure atomicity
-        let needs_transaction = !bulk_rows.is_empty() && !oversized_rows.is_empty();
-        if needs_transaction {
-            conn.execute("BEGIN TRANSACTION", &[]).await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("begin transaction: {}", e))
-            })?;
-        }
+        // Note: We don't wrap in an outer transaction because:
+        // 1. Tiberius bulk_insert manages its own transaction internally
+        // 2. Wrapping it causes "Transaction count mismatch" errors (code 266)
+        // 3. Each operation (bulk insert, INSERT batches) is atomic on its own
 
         // Process bulk-insertable rows via TDS bulk insert (5-10x faster)
         if !bulk_rows.is_empty() {
@@ -1299,27 +1325,10 @@ impl TargetPool for MssqlTargetPool {
                 oversized_count, qualified_table
             );
 
-            match Self::insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows)
-                .await
-            {
-                Ok(inserted) => {
-                    total_inserted += inserted;
-                }
-                Err(e) => {
-                    // Rollback transaction if we started one
-                    if needs_transaction {
-                        let _ = conn.execute("ROLLBACK TRANSACTION", &[]).await;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        // Commit transaction if we started one
-        if needs_transaction {
-            conn.execute("COMMIT TRANSACTION", &[]).await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("commit transaction: {}", e))
-            })?;
+            let inserted =
+                Self::insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows)
+                    .await?;
+            total_inserted += inserted;
         }
 
         Ok(total_inserted)
@@ -1958,6 +1967,49 @@ mod tests {
 
         assert_eq!(bulk_rows.len(), 0);
         assert_eq!(oversized_rows.len(), 0);
+    }
+
+    #[test]
+    fn test_batched_insert_batch_size_calculation() {
+        // MSSQL has two limits:
+        // 1. 2100 parameters per query
+        // 2. 1000 rows per VALUES clause
+        // Batch size = min(2100/cols, 1000).max(1)
+
+        // 10 columns -> min(2100/10, 1000) = min(210, 1000) = 210
+        let cols_10 = 10;
+        let max_rows_10 = (2100 / cols_10).min(1000).max(1);
+        assert_eq!(max_rows_10, 210);
+
+        // 100 columns -> min(2100/100, 1000) = min(21, 1000) = 21
+        let cols_100 = 100;
+        let max_rows_100 = (2100 / cols_100).min(1000).max(1);
+        assert_eq!(max_rows_100, 21);
+
+        // 3 columns -> min(2100/3, 1000) = min(700, 1000) = 700
+        let cols_3 = 3;
+        let max_rows_3 = (2100 / cols_3).min(1000).max(1);
+        assert_eq!(max_rows_3, 700);
+
+        // 2 columns -> min(2100/2, 1000) = min(1050, 1000) = 1000 (capped!)
+        let cols_2 = 2;
+        let max_rows_2 = (2100 / cols_2).min(1000).max(1);
+        assert_eq!(max_rows_2, 1000);
+
+        // 1 column -> min(2100/1, 1000) = min(2100, 1000) = 1000 (capped!)
+        let cols_1 = 1;
+        let max_rows_1 = (2100 / cols_1).min(1000).max(1);
+        assert_eq!(max_rows_1, 1000);
+
+        // 2100 columns -> min(2100/2100, 1000) = min(1, 1000) = 1
+        let cols_2100 = 2100;
+        let max_rows_2100 = (2100 / cols_2100).min(1000).max(1);
+        assert_eq!(max_rows_2100, 1);
+
+        // 3000 columns -> min(2100/3000, 1000) = min(0, 1000) -> max(1) = 1
+        let cols_3000 = 3000;
+        let max_rows_3000 = (2100 / cols_3000).min(1000).max(1);
+        assert_eq!(max_rows_3000, 1);
     }
 
     #[test]
