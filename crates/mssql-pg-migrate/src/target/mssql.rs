@@ -1098,7 +1098,9 @@ impl TargetPool for MssqlTargetPool {
             return Ok(());
         }
 
-        // PK doesn't exist, create it (fallback for tables without clustered PK)
+        // PK doesn't exist, create it.
+        // This is a fallback for tables where the primary key constraint was not created during
+        // table creation (e.g., tables created by older versions of this tool or by external processes).
         let pk_cols: Vec<String> = table
             .primary_key
             .iter()
