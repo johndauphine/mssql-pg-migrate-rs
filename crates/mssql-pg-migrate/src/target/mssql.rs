@@ -657,14 +657,18 @@ impl MssqlTargetPool {
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
 
-        // MSSQL has a 2100 parameter limit per query
-        // Calculate how many rows we can fit per batch
+        // MSSQL has two limits for INSERT...VALUES:
+        // 1. 2100 parameters per query
+        // 2. 1000 rows per VALUES clause
         let cols_per_row = cols.len();
-        let max_rows_per_batch = if cols_per_row > 0 {
-            (2100 / cols_per_row).max(1) // At least 1 row per batch
-        } else {
-            rows.len()
-        };
+        if cols_per_row == 0 {
+            return Err(MigrateError::transfer(
+                qualified_table,
+                "Cannot insert rows with zero columns".to_string(),
+            ));
+        }
+
+        let max_rows_per_batch = (2100 / cols_per_row).min(1000).max(1);
 
         let mut total_inserted = 0u64;
 
@@ -1988,32 +1992,44 @@ mod tests {
 
     #[test]
     fn test_batched_insert_batch_size_calculation() {
-        // MSSQL has a 2100 parameter limit per query
-        // Test that batch size is correctly calculated based on column count
+        // MSSQL has two limits:
+        // 1. 2100 parameters per query
+        // 2. 1000 rows per VALUES clause
+        // Batch size = min(2100/cols, 1000).max(1)
 
-        // 10 columns -> 2100 / 10 = 210 rows per batch
+        // 10 columns -> min(2100/10, 1000) = min(210, 1000) = 210
         let cols_10 = 10;
-        let max_rows_10 = (2100 / cols_10).max(1);
+        let max_rows_10 = (2100 / cols_10).min(1000).max(1);
         assert_eq!(max_rows_10, 210);
 
-        // 100 columns -> 2100 / 100 = 21 rows per batch
+        // 100 columns -> min(2100/100, 1000) = min(21, 1000) = 21
         let cols_100 = 100;
-        let max_rows_100 = (2100 / cols_100).max(1);
+        let max_rows_100 = (2100 / cols_100).min(1000).max(1);
         assert_eq!(max_rows_100, 21);
 
-        // 3 columns -> 2100 / 3 = 700 rows per batch
+        // 3 columns -> min(2100/3, 1000) = min(700, 1000) = 700
         let cols_3 = 3;
-        let max_rows_3 = (2100 / cols_3).max(1);
+        let max_rows_3 = (2100 / cols_3).min(1000).max(1);
         assert_eq!(max_rows_3, 700);
 
-        // 2100 columns -> 2100 / 2100 = 1 row per batch
+        // 2 columns -> min(2100/2, 1000) = min(1050, 1000) = 1000 (capped!)
+        let cols_2 = 2;
+        let max_rows_2 = (2100 / cols_2).min(1000).max(1);
+        assert_eq!(max_rows_2, 1000);
+
+        // 1 column -> min(2100/1, 1000) = min(2100, 1000) = 1000 (capped!)
+        let cols_1 = 1;
+        let max_rows_1 = (2100 / cols_1).min(1000).max(1);
+        assert_eq!(max_rows_1, 1000);
+
+        // 2100 columns -> min(2100/2100, 1000) = min(1, 1000) = 1
         let cols_2100 = 2100;
-        let max_rows_2100 = (2100 / cols_2100).max(1);
+        let max_rows_2100 = (2100 / cols_2100).min(1000).max(1);
         assert_eq!(max_rows_2100, 1);
 
-        // 3000 columns -> 2100 / 3000 = 0, but max(1) ensures at least 1
+        // 3000 columns -> min(2100/3000, 1000) = min(0, 1000) -> max(1) = 1
         let cols_3000 = 3000;
-        let max_rows_3000 = (2100 / cols_3000).max(1);
+        let max_rows_3000 = (2100 / cols_3000).min(1000).max(1);
         assert_eq!(max_rows_3000, 1);
     }
 
