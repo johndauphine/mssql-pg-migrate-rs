@@ -107,6 +107,8 @@ pub trait TargetPool: Send + Sync {
 
     /// Upsert a chunk of rows.
     /// `writer_id` is used to create a unique staging table per writer to avoid conflicts.
+    /// `partition_id` is used to create partition-specific staging tables when intra-table
+    /// partitioning is enabled, avoiding collisions between parallel partition jobs.
     async fn upsert_chunk(
         &self,
         schema: &str,
@@ -115,6 +117,7 @@ pub trait TargetPool: Send + Sync {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
+        partition_id: Option<i32>,
     ) -> Result<u64>;
 
     /// Get the database type.
@@ -1298,6 +1301,7 @@ impl TargetPool for PgPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
+        partition_id: Option<i32>,
     ) -> Result<u64> {
         use std::time::Instant;
 
@@ -1315,7 +1319,12 @@ impl TargetPool for PgPool {
         // Use per-writer staging table to avoid conflicts between parallel writers.
         // Each writer gets its own staging table that persists for the session,
         // reducing catalog churn while avoiding race conditions.
-        let staging_table = format!("_staging_{}_{}_{}", schema, table, writer_id);
+        // When intra-table partitioning is enabled, include partition_id to avoid
+        // collisions between parallel partition jobs.
+        let staging_table = match partition_id {
+            Some(pid) => format!("_staging_{}_{}_p{}_{}", schema, table, pid, writer_id),
+            None => format!("_staging_{}_{}_{}", schema, table, writer_id),
+        };
 
         let client = self
             .pool

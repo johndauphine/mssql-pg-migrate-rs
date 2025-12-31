@@ -357,14 +357,15 @@ impl TargetPoolImpl {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
+        partition_id: Option<i32>,
     ) -> Result<u64> {
         match self {
             Self::Mssql(p) => {
-                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
+                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
                     .await
             }
             Self::Postgres(p) => {
-                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id)
+                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
                     .await
             }
         }
