@@ -8,6 +8,7 @@ mod mssql;
 
 pub use mssql::MssqlTargetPool;
 
+use crate::config::AuthMethod;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::typemap::mssql_to_postgres;
@@ -236,8 +237,31 @@ impl PgPool {
         pg_config.host(&config.host);
         pg_config.port(config.port);
         pg_config.dbname(&config.database);
-        pg_config.user(&config.user);
-        pg_config.password(&config.password);
+
+        // Authentication method
+        match config.auth {
+            AuthMethod::Kerberos => {
+                // For Kerberos/GSSAPI, we still need a username but not a password
+                // The actual authentication happens via the Kerberos ticket cache
+                if !config.user.is_empty() {
+                    pg_config.user(&config.user);
+                }
+                // Note: tokio-postgres doesn't have native GSSAPI support
+                // For GSSAPI authentication, users should use a connection proxy
+                // or compile PostgreSQL client with GSSAPI support
+                warn!(
+                    "Kerberos/GSSAPI authentication requested for PostgreSQL target. \
+                     Note: tokio-postgres doesn't have native GSSAPI support. \
+                     For GSSAPI auth, ensure your Kerberos ticket cache is valid \
+                     and consider using a connection proxy (pgpool-II, pgBouncer) \
+                     with GSSAPI support. gssencmode={}", config.gssencmode
+                );
+            }
+            AuthMethod::Password => {
+                pg_config.user(&config.user);
+                pg_config.password(&config.password);
+            }
+        }
 
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -276,8 +300,9 @@ impl PgPool {
         client.simple_query("SELECT 1").await?;
 
         info!(
-            "Connected to PostgreSQL: {}:{}/{}",
-            config.host, config.port, config.database
+            "Connected to PostgreSQL target: {}:{}/{} (auth={})",
+            config.host, config.port, config.database,
+            if config.auth == AuthMethod::Kerberos { "kerberos" } else { "password" }
         );
 
         Ok(Self {

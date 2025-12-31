@@ -1,5 +1,6 @@
 //! Configuration validation.
 
+use super::types::AuthMethod;
 use super::Config;
 use crate::error::{MigrateError, Result};
 
@@ -12,8 +13,11 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.source.database.is_empty() {
         return Err(MigrateError::Config("source.database is required".into()));
     }
-    if config.source.user.is_empty() {
-        return Err(MigrateError::Config("source.user is required".into()));
+    // User is required for password auth, optional for Kerberos
+    if config.source.auth == AuthMethod::Password && config.source.user.is_empty() {
+        return Err(MigrateError::Config(
+            "source.user is required for password authentication".into(),
+        ));
     }
     let source_type = config.source.r#type.to_lowercase();
     if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
@@ -23,6 +27,11 @@ pub fn validate(config: &Config) -> Result<()> {
         )));
     }
 
+    // Validate source gssencmode for PostgreSQL
+    if source_type == "postgres" || source_type == "postgresql" {
+        validate_gssencmode(&config.source.gssencmode, "source.gssencmode")?;
+    }
+
     // Target validation
     if config.target.host.is_empty() {
         return Err(MigrateError::Config("target.host is required".into()));
@@ -30,8 +39,11 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.target.database.is_empty() {
         return Err(MigrateError::Config("target.database is required".into()));
     }
-    if config.target.user.is_empty() {
-        return Err(MigrateError::Config("target.user is required".into()));
+    // User is required for password auth, optional for Kerberos
+    if config.target.auth == AuthMethod::Password && config.target.user.is_empty() {
+        return Err(MigrateError::Config(
+            "target.user is required for password authentication".into(),
+        ));
     }
     let target_type = config.target.r#type.to_lowercase();
     if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
@@ -39,6 +51,11 @@ pub fn validate(config: &Config) -> Result<()> {
             "target.type must be 'mssql' or 'postgres', got '{}'",
             config.target.r#type
         )));
+    }
+
+    // Validate target gssencmode for PostgreSQL
+    if target_type == "postgres" || target_type == "postgresql" {
+        validate_gssencmode(&config.target.gssencmode, "target.gssencmode")?;
     }
 
     // Cannot migrate to the same database AND schema (but same database with different schemas is allowed)
@@ -116,6 +133,17 @@ fn validate_nonzero_option(value: Option<usize>, field_name: &str) -> Result<()>
     Ok(())
 }
 
+/// Validate PostgreSQL gssencmode setting.
+fn validate_gssencmode(mode: &str, field_name: &str) -> Result<()> {
+    match mode.to_lowercase().as_str() {
+        "disable" | "prefer" | "require" => Ok(()),
+        _ => Err(MigrateError::Config(format!(
+            "{} must be 'disable', 'prefer', or 'require', got '{}'",
+            field_name, mode
+        ))),
+    }
+}
+
 /// Validate a table name pattern for SQL injection prevention.
 ///
 /// Allowed characters:
@@ -163,6 +191,13 @@ mod tests {
                 schema: "dbo".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
+                ssl_mode: "require".to_string(),
+                auth: AuthMethod::Password,
+                krb5_conf: None,
+                keytab: None,
+                realm: None,
+                spn: None,
+                gssencmode: "prefer".to_string(),
             },
             target: TargetConfig {
                 r#type: "postgres".to_string(),
@@ -173,6 +208,14 @@ mod tests {
                 password: "password".to_string(),
                 schema: "public".to_string(),
                 ssl_mode: "disable".to_string(),
+                encrypt: true,
+                trust_server_cert: false,
+                auth: AuthMethod::Password,
+                krb5_conf: None,
+                keytab: None,
+                realm: None,
+                spn: None,
+                gssencmode: "prefer".to_string(),
             },
             migration: MigrationConfig::default(),
         }

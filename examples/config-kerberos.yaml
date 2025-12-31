@@ -1,0 +1,48 @@
+# SQL Server to PostgreSQL migration with Kerberos authentication
+#
+# No passwords required - uses Kerberos tickets
+#
+# Prerequisites:
+#   1. Install krb5-user (Linux) or configure Kerberos (Windows/macOS)
+#   2. Create keytab: ktutil or extract from AD
+#   3. Or run: kinit svc_migrate@CORP.EXAMPLE.COM
+#
+# Platform Support:
+#   - MSSQL Kerberos: Windows only (via SSPI). On other platforms, falls back to password auth.
+#   - PostgreSQL GSSAPI: Requires libpq with GSSAPI support or a connection proxy.
+#
+# Usage:
+#   ./mssql-pg-migrate -c examples/config-kerberos.yaml run
+
+source:
+  type: mssql
+  host: sqlserver.corp.example.com
+  port: 1433
+  database: SourceDatabase
+  schema: dbo
+  auth: kerberos
+  user: svc_migrate@CORP.EXAMPLE.COM
+  # Optional: specify keytab file instead of using credential cache
+  # keytab: /etc/mssql-migrate.keytab
+  realm: CORP.EXAMPLE.COM
+  encrypt: true
+  trust_server_cert: false
+
+target:
+  type: postgres
+  host: postgres.corp.example.com
+  port: 5432
+  database: target_db
+  schema: public
+  auth: kerberos
+  user: svc_migrate@CORP.EXAMPLE.COM
+  gssencmode: require
+  ssl_mode: disable  # SSL disabled when using GSSAPI encryption
+
+migration:
+  workers: 8
+  chunk_size: 200000
+  create_indexes: true
+  create_foreign_keys: true
+  create_check_constraints: true
+  target_mode: drop_recreate
