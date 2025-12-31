@@ -1,0 +1,67 @@
+# SQL Server to PostgreSQL migration with Kerberos authentication (MSSQL only)
+#
+# ============================================================================
+# IMPORTANT: PLATFORM LIMITATIONS (Rust Implementation)
+# ============================================================================
+#
+# MSSQL Kerberos Authentication:
+#   - WINDOWS ONLY: The tiberius driver only supports Kerberos via Windows SSPI
+#     (Security Support Provider Interface). This means:
+#     * Windows client -> Windows SQL Server: WORKS (via SSPI)
+#     * Linux/macOS client -> Windows SQL Server: NOT SUPPORTED
+#   - On non-Windows platforms, you MUST provide user/password as the tool
+#     will fall back to SQL Server authentication.
+#   - NOTE: The Go implementation (mssql-pg-migrate) has full cross-platform
+#     Kerberos support via the go-mssqldb krb5 authenticator.
+#
+# PostgreSQL GSSAPI Authentication:
+#   - NOT SUPPORTED: tokio-postgres does not have native GSSAPI support
+#   - You must use password authentication for PostgreSQL connections
+#   - For GSSAPI with PostgreSQL, consider using the Go version of this tool
+#
+# If you need cross-platform Kerberos or PostgreSQL GSSAPI, use the Go version:
+# https://github.com/johndauphine/mssql-pg-migrate
+#
+# ============================================================================
+#
+# Prerequisites (Windows only):
+#   1. Ensure the Windows client is domain-joined or has Kerberos configured
+#   2. Run as a user with a valid Kerberos ticket, or use runas /netonly
+#
+# Usage:
+#   ./mssql-pg-migrate -c examples/config-kerberos.yaml run
+
+source:
+  type: mssql
+  host: sqlserver.corp.example.com
+  port: 1433
+  database: SourceDatabase
+  schema: dbo
+  auth: kerberos
+  # On Windows: user is optional (uses current Windows identity via SSPI)
+  # On non-Windows: user AND password are REQUIRED (falls back to SQL auth)
+  user: svc_migrate@CORP.EXAMPLE.COM
+  password: ""  # Required on non-Windows, ignored on Windows with Kerberos
+  realm: CORP.EXAMPLE.COM
+  encrypt: true
+  trust_server_cert: false
+
+target:
+  type: postgres
+  host: postgres.corp.example.com
+  port: 5432
+  database: target_db
+  schema: public
+  # PostgreSQL MUST use password auth (GSSAPI not supported in this implementation)
+  auth: password
+  user: migrate_user
+  password: ${PG_PASSWORD}
+  ssl_mode: require
+
+migration:
+  workers: 8
+  chunk_size: 200000
+  create_indexes: true
+  create_foreign_keys: true
+  create_check_constraints: true
+  target_mode: drop_recreate

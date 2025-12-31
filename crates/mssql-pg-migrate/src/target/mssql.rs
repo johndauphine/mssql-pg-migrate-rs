@@ -3,7 +3,7 @@
 //! This module implements `TargetPool` for MSSQL, enabling MSSQL
 //! to be used as a target database for bidirectional migrations.
 
-use crate::config::TargetConfig;
+use crate::config::{AuthMethod as ConfigAuthMethod, TargetConfig};
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::target::{SqlNullType, SqlValue, TargetPool};
@@ -48,19 +48,57 @@ impl TiberiusTargetConnectionManager {
         config.host(&self.config.host);
         config.port(self.config.port);
         config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            &self.config.user,
-            &self.config.password,
-        ));
 
-        // Map ssl_mode to MSSQL encryption settings
-        match self.config.ssl_mode.to_lowercase().as_str() {
-            "disable" => {
-                config.encryption(EncryptionLevel::NotSupported);
+        // Authentication method
+        match self.config.auth {
+            ConfigAuthMethod::Kerberos => {
+                // Kerberos/Integrated authentication
+                // On Windows, this uses SSPI which supports Kerberos
+                // On other platforms, tiberius doesn't have native Kerberos support
+                #[cfg(windows)]
+                {
+                    config.authentication(AuthMethod::Integrated);
+                    info!(
+                        "Using Windows Integrated Authentication for MSSQL target (Kerberos/NTLM via SSPI)"
+                    );
+                }
+                #[cfg(not(windows))]
+                {
+                    warn!(
+                        "Kerberos authentication for MSSQL is only supported on Windows via SSPI. \
+                         On other platforms, use password authentication or configure a proxy. \
+                         Falling back to password authentication."
+                    );
+                    config.authentication(AuthMethod::sql_server(
+                        &self.config.user,
+                        &self.config.password,
+                    ));
+                }
             }
-            _ => {
+            ConfigAuthMethod::Password => {
+                config.authentication(AuthMethod::sql_server(
+                    &self.config.user,
+                    &self.config.password,
+                ));
+            }
+        }
+
+        // Encryption settings - prefer new encrypt/trust_server_cert fields, fall back to ssl_mode
+        if self.config.encrypt {
+            if self.config.trust_server_cert {
                 config.trust_cert();
-                config.encryption(EncryptionLevel::Required);
+            }
+            config.encryption(EncryptionLevel::Required);
+        } else {
+            // Check ssl_mode for backwards compatibility
+            match self.config.ssl_mode.to_lowercase().as_str() {
+                "disable" => {
+                    config.encryption(EncryptionLevel::NotSupported);
+                }
+                _ => {
+                    config.trust_cert();
+                    config.encryption(EncryptionLevel::Required);
+                }
             }
         }
 

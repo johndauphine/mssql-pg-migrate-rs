@@ -11,7 +11,7 @@ mod types;
 pub use postgres::PgSourcePool;
 pub use types::*;
 
-use crate::config::SourceConfig;
+use crate::config::{AuthMethod as ConfigAuthMethod, SourceConfig};
 use crate::error::{MigrateError, Result};
 use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use chrono::NaiveDateTime;
 use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Trait for source database operations.
@@ -71,10 +71,40 @@ impl TiberiusConnectionManager {
         config.host(&self.config.host);
         config.port(self.config.port);
         config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            &self.config.user,
-            &self.config.password,
-        ));
+
+        // Authentication method
+        match self.config.auth {
+            ConfigAuthMethod::Kerberos => {
+                // Kerberos/Integrated authentication
+                // On Windows, this uses SSPI which supports Kerberos
+                // On other platforms, tiberius doesn't have native Kerberos support
+                #[cfg(windows)]
+                {
+                    config.authentication(AuthMethod::Integrated);
+                    info!(
+                        "Using Windows Integrated Authentication for MSSQL (Kerberos/NTLM via SSPI)"
+                    );
+                }
+                #[cfg(not(windows))]
+                {
+                    warn!(
+                        "Kerberos authentication for MSSQL is only supported on Windows via SSPI. \
+                         On other platforms, use password authentication or configure a proxy. \
+                         Falling back to password authentication."
+                    );
+                    config.authentication(AuthMethod::sql_server(
+                        &self.config.user,
+                        &self.config.password,
+                    ));
+                }
+            }
+            ConfigAuthMethod::Password => {
+                config.authentication(AuthMethod::sql_server(
+                    &self.config.user,
+                    &self.config.password,
+                ));
+            }
+        }
 
         // Encryption settings
         if self.config.encrypt {
