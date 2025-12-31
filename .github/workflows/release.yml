@@ -1,11 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [created]
-
-permissions:
-  contents: write
+  push:
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,24 +16,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mssql-pg-migrate-linux-x86_64
+            name: linux-x64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: mssql-pg-migrate-linux-aarch64
-          # macOS
+            name: linux-arm64
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact: mssql-pg-migrate-darwin-x86_64
+            name: darwin-x64
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: mssql-pg-migrate-darwin-aarch64
-          # Windows
+            name: darwin-arm64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: mssql-pg-migrate-windows-x86_64.exe
+            name: windows-x64
+            ext: .exe
 
     steps:
       - name: Checkout
@@ -47,7 +44,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -57,25 +54,52 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare binary (Unix)
+        if: matrix.os != 'windows-latest'
         run: |
-          cp target/${{ matrix.target }}/release/mssql-pg-migrate ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/mssql-pg-migrate mssql-pg-migrate-${{ matrix.name }}
+          chmod +x mssql-pg-migrate-${{ matrix.name }}
 
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
+      - name: Prepare binary (Windows)
+        if: matrix.os == 'windows-latest'
         run: |
-          cp target/${{ matrix.target }}/release/mssql-pg-migrate.exe ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/mssql-pg-migrate.exe mssql-pg-migrate-${{ matrix.name }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: mssql-pg-migrate-${{ matrix.name }}
+          path: mssql-pg-migrate-${{ matrix.name }}${{ matrix.ext }}
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v1
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: ${{ matrix.artifact }}
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -name 'mssql-pg-migrate-*' -exec cp {} release/ \;
+          cd release
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
