@@ -154,28 +154,17 @@ impl Config {
     }
 }
 
-/// Authentication method for database connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMethod {
-    /// Password authentication (default).
-    #[default]
-    Password,
-    /// Kerberos/GSSAPI authentication.
-    Kerberos,
-}
-
-/// Source database (MSSQL or PostgreSQL) configuration.
+/// Source database (MSSQL) configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
-    /// Database type ("mssql" or "postgres").
+    /// Database type (always "mssql" for now).
     #[serde(default = "default_mssql")]
     pub r#type: String,
 
     /// Database host.
     pub host: String,
 
-    /// Database port (default: 1433 for MSSQL, 5432 for PostgreSQL).
+    /// Database port (default: 1433).
     #[serde(default = "default_mssql_port")]
     pub port: u16,
 
@@ -183,59 +172,28 @@ pub struct SourceConfig {
     pub database: String,
 
     /// Username.
-    #[serde(default)]
     pub user: String,
 
-    /// Password (not required for Kerberos auth).
-    #[serde(default)]
+    /// Password.
     pub password: String,
 
-    /// Source schema (default: "dbo" for MSSQL, "public" for PostgreSQL).
+    /// Source schema (default: "dbo").
     #[serde(default = "default_dbo_schema")]
     pub schema: String,
 
-    /// Encrypt connection (default: true). MSSQL only.
+    /// Encrypt connection (default: true).
     #[serde(default = "default_true")]
     pub encrypt: bool,
 
-    /// Trust server certificate (default: false). MSSQL only.
+    /// Trust server certificate (default: false).
     #[serde(default)]
     pub trust_server_cert: bool,
-
-    /// SSL mode for PostgreSQL (default: "require").
-    #[serde(default = "default_require")]
-    pub ssl_mode: String,
-
-    // === Kerberos authentication fields ===
-    /// Authentication method: "password" (default) or "kerberos".
-    #[serde(default)]
-    pub auth: AuthMethod,
-
-    /// Path to krb5.conf file (optional, uses system default if not specified).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub krb5_conf: Option<String>,
-
-    /// Path to keytab file (optional, uses credential cache if not specified).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keytab: Option<String>,
-
-    /// Kerberos realm (optional, auto-detected from krb5.conf).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realm: Option<String>,
-
-    /// Service Principal Name for MSSQL (optional, defaults to MSSQLSvc/host:port).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spn: Option<String>,
-
-    /// PostgreSQL GSSAPI encryption mode: "disable", "prefer", "require" (default: "prefer").
-    #[serde(default = "default_prefer")]
-    pub gssencmode: String,
 }
 
 impl fmt::Debug for SourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("SourceConfig");
-        s.field("type", &self.r#type)
+        f.debug_struct("SourceConfig")
+            .field("type", &self.r#type)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("database", &self.database)
@@ -244,40 +202,21 @@ impl fmt::Debug for SourceConfig {
             .field("schema", &self.schema)
             .field("encrypt", &self.encrypt)
             .field("trust_server_cert", &self.trust_server_cert)
-            .field("ssl_mode", &self.ssl_mode)
-            .field("auth", &self.auth);
-
-        // Only show Kerberos fields if using Kerberos auth
-        if self.auth == AuthMethod::Kerberos {
-            if let Some(ref krb5) = self.krb5_conf {
-                s.field("krb5_conf", krb5);
-            }
-            if self.keytab.is_some() {
-                s.field("keytab", &"[SET]");
-            }
-            if let Some(ref realm) = self.realm {
-                s.field("realm", realm);
-            }
-            if let Some(ref spn) = self.spn {
-                s.field("spn", spn);
-            }
-            s.field("gssencmode", &self.gssencmode);
-        }
-        s.finish()
+            .finish()
     }
 }
 
-/// Target database (PostgreSQL or MSSQL) configuration.
+/// Target database (PostgreSQL) configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TargetConfig {
-    /// Database type ("postgres" or "mssql").
+    /// Database type (always "postgres" for now).
     #[serde(default = "default_postgres")]
     pub r#type: String,
 
     /// Database host.
     pub host: String,
 
-    /// Database port (default: 5432 for PostgreSQL, 1433 for MSSQL).
+    /// Database port (default: 5432).
     #[serde(default = "default_pg_port")]
     pub port: u16,
 
@@ -285,59 +224,24 @@ pub struct TargetConfig {
     pub database: String,
 
     /// Username.
-    #[serde(default)]
     pub user: String,
 
-    /// Password (not required for Kerberos auth).
-    #[serde(default)]
+    /// Password.
     pub password: String,
 
-    /// Target schema (default: "public" for PostgreSQL, "dbo" for MSSQL).
+    /// Target schema (default: "public").
     #[serde(default = "default_public_schema")]
     pub schema: String,
 
-    /// SSL mode for PostgreSQL (default: "require").
+    /// SSL mode (default: "require").
     #[serde(default = "default_require")]
     pub ssl_mode: String,
-
-    /// Encrypt connection (default: true). MSSQL only.
-    #[serde(default = "default_true")]
-    pub encrypt: bool,
-
-    /// Trust server certificate (default: false). MSSQL only.
-    #[serde(default)]
-    pub trust_server_cert: bool,
-
-    // === Kerberos authentication fields ===
-    /// Authentication method: "password" (default) or "kerberos".
-    #[serde(default)]
-    pub auth: AuthMethod,
-
-    /// Path to krb5.conf file (optional, uses system default if not specified).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub krb5_conf: Option<String>,
-
-    /// Path to keytab file (optional, uses credential cache if not specified).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keytab: Option<String>,
-
-    /// Kerberos realm (optional, auto-detected from krb5.conf).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub realm: Option<String>,
-
-    /// Service Principal Name for MSSQL (optional, defaults to MSSQLSvc/host:port).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spn: Option<String>,
-
-    /// PostgreSQL GSSAPI encryption mode: "disable", "prefer", "require" (default: "prefer").
-    #[serde(default = "default_prefer")]
-    pub gssencmode: String,
 }
 
 impl fmt::Debug for TargetConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut s = f.debug_struct("TargetConfig");
-        s.field("type", &self.r#type)
+        f.debug_struct("TargetConfig")
+            .field("type", &self.r#type)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("database", &self.database)
@@ -345,27 +249,7 @@ impl fmt::Debug for TargetConfig {
             .field("password", &"[REDACTED]")
             .field("schema", &self.schema)
             .field("ssl_mode", &self.ssl_mode)
-            .field("encrypt", &self.encrypt)
-            .field("trust_server_cert", &self.trust_server_cert)
-            .field("auth", &self.auth);
-
-        // Only show Kerberos fields if using Kerberos auth
-        if self.auth == AuthMethod::Kerberos {
-            if let Some(ref krb5) = self.krb5_conf {
-                s.field("krb5_conf", krb5);
-            }
-            if self.keytab.is_some() {
-                s.field("keytab", &"[SET]");
-            }
-            if let Some(ref realm) = self.realm {
-                s.field("realm", realm);
-            }
-            if let Some(ref spn) = self.spn {
-                s.field("spn", spn);
-            }
-            s.field("gssencmode", &self.gssencmode);
-        }
-        s.finish()
+            .finish()
     }
 }
 
@@ -919,10 +803,6 @@ fn default_public_schema() -> String {
 
 fn default_require() -> String {
     "require".to_string()
-}
-
-fn default_prefer() -> String {
-    "prefer".to_string()
 }
 
 fn default_true() -> bool {

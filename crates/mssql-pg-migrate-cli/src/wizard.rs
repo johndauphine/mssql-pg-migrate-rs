@@ -215,13 +215,6 @@ fn prompt_source_config(existing: Option<&SourceConfig>) -> WizardResult<SourceC
         schema,
         encrypt,
         trust_server_cert,
-        ssl_mode: "require".to_string(),
-        auth: mssql_pg_migrate::config::AuthMethod::Password,
-        krb5_conf: None,
-        keytab: None,
-        realm: None,
-        spn: None,
-        gssencmode: "prefer".to_string(),
     })
 }
 
@@ -287,14 +280,6 @@ fn prompt_target_config(existing: Option<&TargetConfig>) -> WizardResult<TargetC
         password,
         schema,
         ssl_mode: ssl_modes[ssl_mode_idx].to_string(),
-        encrypt: true,
-        trust_server_cert: false,
-        auth: mssql_pg_migrate::config::AuthMethod::Password,
-        krb5_conf: None,
-        keytab: None,
-        realm: None,
-        spn: None,
-        gssencmode: "prefer".to_string(),
     })
 }
 

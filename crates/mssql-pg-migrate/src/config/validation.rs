@@ -1,6 +1,5 @@
 //! Configuration validation.
 
-use super::types::AuthMethod;
 use super::Config;
 use crate::error::{MigrateError, Result};
 
@@ -13,44 +12,15 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.source.database.is_empty() {
         return Err(MigrateError::Config("source.database is required".into()));
     }
-    // User is required for password auth, optional for Kerberos
-    if config.source.auth == AuthMethod::Password && config.source.user.is_empty() {
-        return Err(MigrateError::Config(
-            "source.user is required for password authentication".into(),
-        ));
+    if config.source.user.is_empty() {
+        return Err(MigrateError::Config("source.user is required".into()));
     }
     let source_type = config.source.r#type.to_lowercase();
-
-    // MSSQL Kerberos on non-Windows falls back to password auth, so require credentials
-    #[cfg(not(windows))]
-    if config.source.auth == AuthMethod::Kerberos && source_type == "mssql" {
-        if config.source.user.is_empty() || config.source.password.is_empty() {
-            return Err(MigrateError::Config(
-                "source.user and source.password are required for MSSQL Kerberos on non-Windows \
-                 (Kerberos via SSPI is only supported on Windows; will fall back to password auth)"
-                    .into(),
-            ));
-        }
-    }
     if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
         return Err(MigrateError::Config(format!(
             "source.type must be 'mssql' or 'postgres', got '{}'",
             config.source.r#type
         )));
-    }
-
-    // Validate source gssencmode for PostgreSQL
-    if source_type == "postgres" || source_type == "postgresql" {
-        validate_gssencmode(&config.source.gssencmode, "source.gssencmode")?;
-
-        // PostgreSQL Kerberos/GSSAPI is not natively supported by tokio-postgres
-        if config.source.auth == AuthMethod::Kerberos {
-            return Err(MigrateError::Config(
-                "PostgreSQL Kerberos/GSSAPI authentication is not supported (tokio-postgres lacks native GSSAPI). \
-                 Use password authentication, or configure a GSSAPI-capable connection proxy (e.g., pgbouncer with auth_type=gss)"
-                    .into(),
-            ));
-        }
     }
 
     // Target validation
@@ -60,44 +30,15 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.target.database.is_empty() {
         return Err(MigrateError::Config("target.database is required".into()));
     }
-    // User is required for password auth, optional for Kerberos
-    if config.target.auth == AuthMethod::Password && config.target.user.is_empty() {
-        return Err(MigrateError::Config(
-            "target.user is required for password authentication".into(),
-        ));
+    if config.target.user.is_empty() {
+        return Err(MigrateError::Config("target.user is required".into()));
     }
     let target_type = config.target.r#type.to_lowercase();
-
-    // MSSQL Kerberos on non-Windows falls back to password auth, so require credentials
-    #[cfg(not(windows))]
-    if config.target.auth == AuthMethod::Kerberos && target_type == "mssql" {
-        if config.target.user.is_empty() || config.target.password.is_empty() {
-            return Err(MigrateError::Config(
-                "target.user and target.password are required for MSSQL Kerberos on non-Windows \
-                 (Kerberos via SSPI is only supported on Windows; will fall back to password auth)"
-                    .into(),
-            ));
-        }
-    }
     if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
         return Err(MigrateError::Config(format!(
             "target.type must be 'mssql' or 'postgres', got '{}'",
             config.target.r#type
         )));
-    }
-
-    // Validate target gssencmode for PostgreSQL
-    if target_type == "postgres" || target_type == "postgresql" {
-        validate_gssencmode(&config.target.gssencmode, "target.gssencmode")?;
-
-        // PostgreSQL Kerberos/GSSAPI is not natively supported by tokio-postgres
-        if config.target.auth == AuthMethod::Kerberos {
-            return Err(MigrateError::Config(
-                "PostgreSQL Kerberos/GSSAPI authentication is not supported (tokio-postgres lacks native GSSAPI). \
-                 Use password authentication, or configure a GSSAPI-capable connection proxy (e.g., pgbouncer with auth_type=gss)"
-                    .into(),
-            ));
-        }
     }
 
     // Cannot migrate to the same database AND schema (but same database with different schemas is allowed)
@@ -175,17 +116,6 @@ fn validate_nonzero_option(value: Option<usize>, field_name: &str) -> Result<()>
     Ok(())
 }
 
-/// Validate PostgreSQL gssencmode setting.
-fn validate_gssencmode(mode: &str, field_name: &str) -> Result<()> {
-    match mode.to_lowercase().as_str() {
-        "disable" | "prefer" | "require" => Ok(()),
-        _ => Err(MigrateError::Config(format!(
-            "{} must be 'disable', 'prefer', or 'require', got '{}'",
-            field_name, mode
-        ))),
-    }
-}
-
 /// Validate a table name pattern for SQL injection prevention.
 ///
 /// Allowed characters:
@@ -233,13 +163,6 @@ mod tests {
                 schema: "dbo".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
-                ssl_mode: "require".to_string(),
-                auth: AuthMethod::Password,
-                krb5_conf: None,
-                keytab: None,
-                realm: None,
-                spn: None,
-                gssencmode: "prefer".to_string(),
             },
             target: TargetConfig {
                 r#type: "postgres".to_string(),
@@ -250,14 +173,6 @@ mod tests {
                 password: "password".to_string(),
                 schema: "public".to_string(),
                 ssl_mode: "disable".to_string(),
-                encrypt: true,
-                trust_server_cert: false,
-                auth: AuthMethod::Password,
-                krb5_conf: None,
-                keytab: None,
-                realm: None,
-                spn: None,
-                gssencmode: "prefer".to_string(),
             },
             migration: MigrationConfig::default(),
         }

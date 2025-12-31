@@ -3,7 +3,7 @@
 //! This module implements `SourcePool` for PostgreSQL, enabling PostgreSQL
 //! to be used as a source database for bidirectional migrations.
 
-use crate::config::{AuthMethod, SourceConfig};
+use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, Column, ForeignKey, Index, Partition, SourcePool, Table};
 use crate::target::SqlValue;
@@ -27,38 +27,17 @@ impl PgSourcePool {
         pg_config.host(&config.host);
         pg_config.port(config.port);
         pg_config.dbname(&config.database);
-
-        // Authentication method
-        match config.auth {
-            AuthMethod::Kerberos => {
-                // For Kerberos/GSSAPI, we still need a username but not a password
-                // The actual authentication happens via the Kerberos ticket cache
-                if !config.user.is_empty() {
-                    pg_config.user(&config.user);
-                }
-                // Note: tokio-postgres doesn't have native GSSAPI support
-                // For GSSAPI authentication, users should use a connection proxy
-                // or compile PostgreSQL client with GSSAPI support
-                warn!(
-                    "Kerberos/GSSAPI authentication requested for PostgreSQL source. \
-                     Note: tokio-postgres doesn't have native GSSAPI support. \
-                     For GSSAPI auth, ensure your Kerberos ticket cache is valid \
-                     and consider using a connection proxy (pgpool-II, pgBouncer) \
-                     with GSSAPI support. gssencmode={}", config.gssencmode
-                );
-            }
-            AuthMethod::Password => {
-                pg_config.user(&config.user);
-                pg_config.password(&config.password);
-            }
-        }
+        pg_config.user(&config.user);
+        pg_config.password(&config.password);
 
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
 
-        // Use ssl_mode from config
-        let ssl_mode = &config.ssl_mode;
+        // TODO: Add ssl_mode to SourceConfig for consistency with TargetConfig.
+        // Currently defaults to "require" which enables TLS but doesn't verify certificates.
+        // Users who need stricter security should use "verify-full" when this is configurable.
+        let ssl_mode = "require";
         let pool = match ssl_mode.to_lowercase().as_str() {
             "disable" => {
                 warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
@@ -88,9 +67,8 @@ impl PgSourcePool {
         client.simple_query("SELECT 1").await?;
 
         info!(
-            "Connected to PostgreSQL source: {}:{}/{} (auth={})",
-            config.host, config.port, config.database,
-            if config.auth == AuthMethod::Kerberos { "kerberos" } else { "password" }
+            "Connected to PostgreSQL source: {}:{}/{}",
+            config.host, config.port, config.database
         );
 
         Ok(Self { pool })
