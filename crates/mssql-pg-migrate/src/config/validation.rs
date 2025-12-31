@@ -20,6 +20,18 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
     let source_type = config.source.r#type.to_lowercase();
+
+    // MSSQL Kerberos on non-Windows falls back to password auth, so require credentials
+    #[cfg(not(windows))]
+    if config.source.auth == AuthMethod::Kerberos && source_type == "mssql" {
+        if config.source.user.is_empty() || config.source.password.is_empty() {
+            return Err(MigrateError::Config(
+                "source.user and source.password are required for MSSQL Kerberos on non-Windows \
+                 (Kerberos via SSPI is only supported on Windows; will fall back to password auth)"
+                    .into(),
+            ));
+        }
+    }
     if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
         return Err(MigrateError::Config(format!(
             "source.type must be 'mssql' or 'postgres', got '{}'",
@@ -30,6 +42,15 @@ pub fn validate(config: &Config) -> Result<()> {
     // Validate source gssencmode for PostgreSQL
     if source_type == "postgres" || source_type == "postgresql" {
         validate_gssencmode(&config.source.gssencmode, "source.gssencmode")?;
+
+        // PostgreSQL Kerberos/GSSAPI is not natively supported by tokio-postgres
+        if config.source.auth == AuthMethod::Kerberos {
+            return Err(MigrateError::Config(
+                "PostgreSQL Kerberos/GSSAPI authentication is not supported (tokio-postgres lacks native GSSAPI). \
+                 Use password authentication, or configure a GSSAPI-capable connection proxy (e.g., pgbouncer with auth_type=gss)"
+                    .into(),
+            ));
+        }
     }
 
     // Target validation
@@ -46,6 +67,18 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
     let target_type = config.target.r#type.to_lowercase();
+
+    // MSSQL Kerberos on non-Windows falls back to password auth, so require credentials
+    #[cfg(not(windows))]
+    if config.target.auth == AuthMethod::Kerberos && target_type == "mssql" {
+        if config.target.user.is_empty() || config.target.password.is_empty() {
+            return Err(MigrateError::Config(
+                "target.user and target.password are required for MSSQL Kerberos on non-Windows \
+                 (Kerberos via SSPI is only supported on Windows; will fall back to password auth)"
+                    .into(),
+            ));
+        }
+    }
     if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
         return Err(MigrateError::Config(format!(
             "target.type must be 'mssql' or 'postgres', got '{}'",
@@ -56,6 +89,15 @@ pub fn validate(config: &Config) -> Result<()> {
     // Validate target gssencmode for PostgreSQL
     if target_type == "postgres" || target_type == "postgresql" {
         validate_gssencmode(&config.target.gssencmode, "target.gssencmode")?;
+
+        // PostgreSQL Kerberos/GSSAPI is not natively supported by tokio-postgres
+        if config.target.auth == AuthMethod::Kerberos {
+            return Err(MigrateError::Config(
+                "PostgreSQL Kerberos/GSSAPI authentication is not supported (tokio-postgres lacks native GSSAPI). \
+                 Use password authentication, or configure a GSSAPI-capable connection proxy (e.g., pgbouncer with auth_type=gss)"
+                    .into(),
+            ));
+        }
     }
 
     // Cannot migrate to the same database AND schema (but same database with different schemas is allowed)

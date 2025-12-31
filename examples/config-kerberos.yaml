@@ -1,4 +1,4 @@
-# SQL Server to PostgreSQL migration with Kerberos authentication
+# SQL Server to PostgreSQL migration with Kerberos authentication (MSSQL only)
 #
 # ============================================================================
 # IMPORTANT: PLATFORM LIMITATIONS (Rust Implementation)
@@ -7,28 +7,26 @@
 # MSSQL Kerberos Authentication:
 #   - WINDOWS ONLY: The tiberius driver only supports Kerberos via Windows SSPI
 #     (Security Support Provider Interface). This means:
-#     * Windows client → Windows SQL Server: WORKS (via SSPI)
-#     * Linux/macOS client → Windows SQL Server: NOT SUPPORTED
-#   - On non-Windows platforms, the tool will log a warning and fall back to
-#     password authentication. You must provide user/password in the config.
+#     * Windows client -> Windows SQL Server: WORKS (via SSPI)
+#     * Linux/macOS client -> Windows SQL Server: NOT SUPPORTED
+#   - On non-Windows platforms, you MUST provide user/password as the tool
+#     will fall back to SQL Server authentication.
 #   - NOTE: The Go implementation (mssql-pg-migrate) has full cross-platform
 #     Kerberos support via the go-mssqldb krb5 authenticator.
 #
 # PostgreSQL GSSAPI Authentication:
-#   - LIMITED: tokio-postgres does not have native GSSAPI support
-#   - Workaround: Use a connection proxy like pgbouncer with GSSAPI, or
-#     use libpq-based tools for the PostgreSQL connection
-#   - The gssencmode config option is accepted but may require external setup
+#   - NOT SUPPORTED: tokio-postgres does not have native GSSAPI support
+#   - You must use password authentication for PostgreSQL connections
+#   - For GSSAPI with PostgreSQL, consider using the Go version of this tool
 #
-# If you need cross-platform Kerberos support, consider using the Go version
-# of this tool instead.
+# If you need cross-platform Kerberos or PostgreSQL GSSAPI, use the Go version:
+# https://github.com/johndauphine/mssql-pg-migrate
 #
 # ============================================================================
 #
-# Prerequisites (Windows only for MSSQL):
+# Prerequisites (Windows only):
 #   1. Ensure the Windows client is domain-joined or has Kerberos configured
 #   2. Run as a user with a valid Kerberos ticket, or use runas /netonly
-#   3. For PostgreSQL GSSAPI: configure external proxy or use password auth
 #
 # Usage:
 #   ./mssql-pg-migrate -c examples/config-kerberos.yaml run
@@ -40,9 +38,10 @@ source:
   database: SourceDatabase
   schema: dbo
   auth: kerberos
+  # On Windows: user is optional (uses current Windows identity via SSPI)
+  # On non-Windows: user AND password are REQUIRED (falls back to SQL auth)
   user: svc_migrate@CORP.EXAMPLE.COM
-  # Optional: specify keytab file instead of using credential cache
-  # keytab: /etc/mssql-migrate.keytab
+  password: ""  # Required on non-Windows, ignored on Windows with Kerberos
   realm: CORP.EXAMPLE.COM
   encrypt: true
   trust_server_cert: false
@@ -53,10 +52,11 @@ target:
   port: 5432
   database: target_db
   schema: public
-  auth: kerberos
-  user: svc_migrate@CORP.EXAMPLE.COM
-  gssencmode: require
-  ssl_mode: disable  # SSL disabled when using GSSAPI encryption
+  # PostgreSQL MUST use password auth (GSSAPI not supported in this implementation)
+  auth: password
+  user: migrate_user
+  password: ${PG_PASSWORD}
+  ssl_mode: require
 
 migration:
   workers: 8
