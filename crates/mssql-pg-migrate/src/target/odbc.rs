@@ -47,7 +47,8 @@ const MAX_ROWS_PER_INSERT: usize = 1000;
 /// Number of INSERT statements to batch into a single execute call.
 /// Multiple INSERT statements separated by semicolons are sent as one batch,
 /// reducing round-trip overhead significantly.
-const STATEMENTS_PER_EXECUTE: usize = 10;
+/// With 1000 rows per INSERT, this means up to 100K rows per execute.
+const STATEMENTS_PER_EXECUTE: usize = 100;
 
 /// Maximum number of retry attempts for deadlock errors.
 const DEADLOCK_MAX_RETRIES: u32 = 5;
