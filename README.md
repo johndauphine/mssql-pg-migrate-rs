@@ -23,7 +23,7 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
-- **Incremental sync** - Upsert mode with `IS DISTINCT FROM` change detection
+- **Incremental sync** - Upsert mode with `INSERT...ON CONFLICT DO UPDATE`
 - **Interactive TUI** - Terminal UI for guided migration with real-time progress
 - **Configuration wizard** - Interactive `init` command creates config files
 - **Automatic type mapping** - MSSQL to PostgreSQL type conversion
@@ -158,17 +158,17 @@ This allows optimal performance across different hardware without manual configu
 |------|----------|
 | `drop_recreate` | Drop target tables, create fresh, bulk insert (fastest for full refresh) |
 | `truncate` | Truncate existing tables, create if missing, bulk insert |
-| `upsert` | Stream to staging table, merge with `IS DISTINCT FROM` change detection (ideal for incremental sync) |
+| `upsert` | Stream to staging table, merge with `INSERT...ON CONFLICT DO UPDATE` (ideal for incremental sync) |
 
 ### Upsert Mode Details
 
-Upsert mode streams all rows to PostgreSQL and uses efficient change detection:
+Upsert mode streams all rows to PostgreSQL:
 
-1. **Staging**: Rows are COPY'd to a temporary staging table
-2. **Merge**: `INSERT...ON CONFLICT DO UPDATE WHERE IS DISTINCT FROM` detects actual changes
-3. **Optimization**: PostgreSQL only writes rows where column values differ
+1. **Staging**: Rows are COPY'd to a temporary staging table using binary protocol
+2. **Merge**: `INSERT...ON CONFLICT DO UPDATE SET` upserts rows efficiently
+3. **Optimization**: PostgreSQL's MVCC handles unchanged rows efficiently
 
-No deletes are performed for safety. The `IS DISTINCT FROM` operator handles NULL values correctly.
+No deletes are performed for safety. Tables require a primary key for upsert mode.
 
 ## Type Mapping
 

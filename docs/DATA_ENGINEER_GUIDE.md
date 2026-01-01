@@ -19,8 +19,8 @@ A comprehensive technical reference for data engineers using mssql-pg-migrate-rs
 
 mssql-pg-migrate-rs is a production-ready data migration tool designed for:
 
-- **High throughput**: 160K-193K rows/sec for bulk operations, ~106K rows/sec for upsert
-- **Incremental sync**: Efficient change detection using PostgreSQL's `IS DISTINCT FROM`
+- **High throughput**: 160K-200K rows/sec for bulk and upsert operations
+- **Incremental sync**: Efficient `INSERT...ON CONFLICT DO UPDATE` for upserts
 - **Headless operation**: Ideal for Kubernetes, Airflow DAGs, and CI/CD pipelines
 - **Resume capability**: JSON state files enable safe restart after interruption
 - **Memory safety**: Auto-tuning prevents OOM conditions
@@ -122,9 +122,9 @@ Each partition processed by parallel readers with keyset pagination
 | **Schema Preserved** | No | Yes | Yes |
 | **Data Preservation** | None | None | Existing data kept |
 | **Transfer Type** | Full copy | Full copy | Streaming upsert |
-| **Change Detection** | N/A | N/A | `IS DISTINCT FROM` |
+| **Change Detection** | N/A | N/A | `ON CONFLICT DO UPDATE` |
 | **Deletes Performed** | N/A | N/A | No (safety) |
-| **Speed** | Fastest | Fastest | Fast (~106K rows/sec) |
+| **Speed** | Fastest | Fastest | Fast (~200K rows/sec) |
 | **Network Usage** | Full dataset | Full dataset | Full dataset (filtered at target) |
 
 ### DROP_RECREATE Mode
@@ -189,14 +189,14 @@ migration:
 
 **Behavior**:
 1. Validates primary key exists on all tables
-2. Streams all rows to PostgreSQL via staging table
-3. Uses `INSERT...ON CONFLICT DO UPDATE` with `IS DISTINCT FROM` for change detection
-4. Only updates rows where column values actually differ
+2. Streams all rows to PostgreSQL via staging table using binary COPY
+3. Uses `INSERT...ON CONFLICT DO UPDATE SET` for efficient upserts
+4. PostgreSQL's MVCC handles unchanged rows efficiently
 5. Does NOT delete rows (safety feature)
 
-**How Change Detection Works**:
+**How Upsert Works**:
 
-The tool uses PostgreSQL's `IS DISTINCT FROM` operator for NULL-safe column comparison:
+The tool uses PostgreSQL's `INSERT...ON CONFLICT DO UPDATE` for efficient upserts:
 
 ```sql
 INSERT INTO target_table (pk, col1, col2, ...)
@@ -205,19 +205,16 @@ ON CONFLICT (pk) DO UPDATE SET
   col1 = EXCLUDED.col1,
   col2 = EXCLUDED.col2,
   ...
-WHERE target_table.col1 IS DISTINCT FROM EXCLUDED.col1
-   OR target_table.col2 IS DISTINCT FROM EXCLUDED.col2
-   ...
 ```
 
 This approach:
-- Streams all source rows (no pre-filtering overhead)
-- Lets PostgreSQL efficiently detect which rows actually changed
-- Only writes to disk when values differ (reduces I/O)
-- Handles NULL values correctly (`NULL IS DISTINCT FROM NULL` = false)
+- Streams all source rows using binary COPY protocol (fast)
+- Uses staging tables for batched merge operations
+- PostgreSQL's MVCC handles unchanged rows efficiently at storage level
+- Parallel partition processing for large tables
 
 **Advantages**:
-- Fast (~106K rows/sec) - no pre-computation overhead
+- Fast (~200K rows/sec) - parallel staging and merge
 - Preserves existing target data
 - Suitable for append-heavy workloads
 - Safe (no deletes without explicit request)

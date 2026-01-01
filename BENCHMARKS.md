@@ -30,19 +30,19 @@
 |------|----------|------------|-------|
 | truncate | 104s | 185,680 rows/sec | Fastest - COPY protocol, no DDL |
 | drop_recreate | 136.6s | 141,323 rows/sec | COPY protocol + table creation |
-| upsert | ~180s | ~106,000 rows/sec | Staging table + IS DISTINCT FROM |
+| upsert | ~96s | ~200,000 rows/sec | Staging table + ON CONFLICT DO UPDATE |
 
 ### Key Implementation Details
 
 - **COPY Protocol:** `truncate` and `drop_recreate` use PostgreSQL COPY protocol for bulk inserts
-- **Upsert:** Streams to staging table via COPY, then merges with `INSERT...ON CONFLICT DO UPDATE WHERE IS DISTINCT FROM`
+- **Upsert:** Streams to staging table via binary COPY, then merges with `INSERT...ON CONFLICT DO UPDATE SET`
 - **Read-ahead pipeline:** Concurrent reading/writing with tokio channels
 
 ### Observations
 
 1. **truncate is fastest** - No DDL operations, just TRUNCATE + COPY
 2. **drop_recreate** - Includes table creation time, still very fast with COPY
-3. **upsert is competitive** - Staging table approach with `IS DISTINCT FROM` achieves ~57% of truncate speed
+3. **upsert is competitive** - Staging table + parallel partitioning achieves excellent throughput
 
 ### Resource Usage
 
@@ -70,6 +70,6 @@ Since initial benchmarks, the following optimizations have been added:
 - [x] Parallel readers/writers per table (up to 16 readers, 12 writers)
 - [x] UNLOGGED tables option for ~65% throughput boost
 - [x] Staging table approach for upsert (2-3x faster than row-by-row)
-- [x] `IS DISTINCT FROM` change detection (no pre-computation overhead)
+- [x] Efficient `INSERT...ON CONFLICT DO UPDATE SET` for upserts
 
 See PERFORMANCE.md for current tuning recommendations.

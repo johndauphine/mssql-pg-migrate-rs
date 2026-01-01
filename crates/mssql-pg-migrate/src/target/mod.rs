@@ -2212,9 +2212,7 @@ fn pg_staging_table_name(
 }
 
 /// Build SQL to merge from staging table into target table.
-/// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
-///
-/// Compares all non-PK columns with IS DISTINCT FROM for change detection.
+/// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE SET.
 fn build_staging_merge_sql(
     schema: &str,
     table: &str,
@@ -2252,30 +2250,18 @@ fn build_staging_merge_sql(
             pk_list
         )
     } else {
-        // Compare all non-PK columns for change detection
-        let change_detection = cols
-            .iter()
-            .filter(|c| !pk_cols.contains(c))
-            .map(|c| {
-                format!(
-                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
-                    pg_quote_ident(table),
-                    pg_quote_ident(c),
-                    pg_quote_ident(c)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
-
+        // Simple DO UPDATE SET without change detection.
+        // Previous approach used IS DISTINCT FROM for each column, which is expensive
+        // for tables with large TEXT/BYTEA columns (e.g., Posts.Body).
+        // PostgreSQL's MVCC handles unchanged rows efficiently anyway.
         format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
             pg_qualify_table(schema, table),
             col_list,
             col_list,
             pg_quote_ident(staging_table),
             pk_list,
-            update_cols.join(", "),
-            change_detection
+            update_cols.join(", ")
         )
     }
 }
@@ -2285,18 +2271,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_staging_merge_sql_with_change_detection() {
+    fn test_build_staging_merge_sql() {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        // Should always include change detection WHERE clause
         let sql = build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols);
-        assert!(sql.contains("WHERE"));
-        assert!(sql.contains("IS DISTINCT FROM"));
         assert!(sql.contains("DO UPDATE SET"));
-        // Should compare name and value columns
-        assert!(sql.contains(r#""name" IS DISTINCT FROM"#));
-        assert!(sql.contains(r#""value" IS DISTINCT FROM"#));
+        // Should update name and value columns
+        assert!(sql.contains(r#""name" = EXCLUDED."name""#));
+        assert!(sql.contains(r#""value" = EXCLUDED."value""#));
+        // Should not use expensive change detection
+        assert!(!sql.contains("IS DISTINCT FROM"));
+        assert!(!sql.contains("WHERE"));
     }
 
     #[test]
