@@ -44,6 +44,11 @@ const MAX_PARAMS_PER_BATCH: usize = 2100;
 /// Maximum rows per INSERT VALUES clause (MSSQL limit is 1000).
 const MAX_ROWS_PER_INSERT: usize = 1000;
 
+/// Number of INSERT statements to batch into a single execute call.
+/// Multiple INSERT statements separated by semicolons are sent as one batch,
+/// reducing round-trip overhead significantly.
+const STATEMENTS_PER_EXECUTE: usize = 10;
+
 /// Maximum number of retry attempts for deadlock errors.
 const DEADLOCK_MAX_RETRIES: u32 = 5;
 
@@ -606,10 +611,15 @@ impl OdbcMssqlTargetPool {
         }
     }
 
-    /// Insert rows using batched INSERT statements.
+    /// Insert rows using multi-statement batched INSERT.
     ///
-    /// ODBC doesn't support TDS bulk insert, so we use parameterized batch INSERT.
-    /// This is slower than TDS bulk insert but still reasonably performant.
+    /// ODBC doesn't support TDS bulk insert, so we use batched INSERT statements.
+    /// To reduce round-trip overhead, multiple INSERT statements are combined
+    /// into a single execute call (separated by semicolons).
+    ///
+    /// Performance optimization: Instead of executing each INSERT individually,
+    /// we batch STATEMENTS_PER_EXECUTE INSERT statements together, reducing
+    /// network round-trips by ~10x.
     async fn insert_batch(
         &self,
         schema: &str,
@@ -637,17 +647,19 @@ impl OdbcMssqlTargetPool {
             ));
         }
 
-        let max_rows_per_batch = (MAX_PARAMS_PER_BATCH / cols_per_row)
+        let max_rows_per_insert = (MAX_PARAMS_PER_BATCH / cols_per_row)
             .min(MAX_ROWS_PER_INSERT)
             .max(1);
 
         let mut total_inserted = 0u64;
 
-        // Process rows in batches
-        for batch in rows.chunks(max_rows_per_batch) {
-            // Build multi-row VALUES clause
-            let mut value_groups = Vec::with_capacity(batch.len());
+        // Build individual INSERT statements
+        let mut insert_statements: Vec<String> = Vec::new();
+        let mut rows_in_current_batch = 0usize;
 
+        for batch in rows.chunks(max_rows_per_insert) {
+            // Build multi-row VALUES clause for this INSERT
+            let mut value_groups = Vec::with_capacity(batch.len());
             for row in batch {
                 let values: Vec<String> = row.iter().map(sql_value_to_sql_literal).collect();
                 value_groups.push(format!("({})", values.join(", ")));
@@ -659,19 +671,40 @@ impl OdbcMssqlTargetPool {
                 col_str,
                 value_groups.join(", ")
             );
+            insert_statements.push(sql);
+            rows_in_current_batch += batch.len();
 
-            conn.execute(&sql, ()).map_err(|e| {
+            // Execute when we have enough statements or this is the last batch
+            if insert_statements.len() >= STATEMENTS_PER_EXECUTE {
+                let batch_sql = insert_statements.join(";\n");
+                conn.execute(&batch_sql, ()).map_err(|e| {
+                    MigrateError::transfer(
+                        &qualified_table,
+                        format!("multi-statement INSERT ({} rows, {} statements): {}",
+                               rows_in_current_batch, insert_statements.len(), e),
+                    )
+                })?;
+                total_inserted += rows_in_current_batch as u64;
+                insert_statements.clear();
+                rows_in_current_batch = 0;
+            }
+        }
+
+        // Execute any remaining statements
+        if !insert_statements.is_empty() {
+            let batch_sql = insert_statements.join(";\n");
+            conn.execute(&batch_sql, ()).map_err(|e| {
                 MigrateError::transfer(
                     &qualified_table,
-                    format!("batch INSERT ({} rows): {}", batch.len(), e),
+                    format!("multi-statement INSERT ({} rows, {} statements): {}",
+                           rows_in_current_batch, insert_statements.len(), e),
                 )
             })?;
-
-            total_inserted += batch.len() as u64;
+            total_inserted += rows_in_current_batch as u64;
         }
 
         debug!(
-            "Inserted {} rows into {} via ODBC batched INSERT",
+            "Inserted {} rows into {} via ODBC multi-statement INSERT",
             total_inserted, qualified_table
         );
 
@@ -1034,7 +1067,7 @@ impl TargetPool for OdbcMssqlTargetPool {
         let staging_table = self.ensure_staging_table(schema, table, writer_id, partition_id)?;
         let staging_time = staging_start.elapsed();
 
-        // 2. Insert rows into staging table using batch INSERT
+        // 2. Insert rows into staging table using multi-statement batch INSERT
         let insert_start = Instant::now();
         let conn = self.get_connection()?;
 
@@ -1042,11 +1075,14 @@ impl TargetPool for OdbcMssqlTargetPool {
         let col_str = col_list.join(", ");
 
         let cols_per_row = cols.len();
-        let max_rows_per_batch = (MAX_PARAMS_PER_BATCH / cols_per_row)
+        let max_rows_per_insert = (MAX_PARAMS_PER_BATCH / cols_per_row)
             .min(MAX_ROWS_PER_INSERT)
             .max(1);
 
-        for batch in rows.chunks(max_rows_per_batch) {
+        // Build individual INSERT statements and batch them
+        let mut insert_statements: Vec<String> = Vec::new();
+
+        for batch in rows.chunks(max_rows_per_insert) {
             let mut value_groups = Vec::with_capacity(batch.len());
 
             for row in batch {
@@ -1060,9 +1096,23 @@ impl TargetPool for OdbcMssqlTargetPool {
                 col_str,
                 value_groups.join(", ")
             );
+            insert_statements.push(sql);
 
-            conn.execute(&sql, ()).map_err(|e| {
-                MigrateError::transfer(&staging_table, format!("staging INSERT: {}", e))
+            // Execute when we have enough statements
+            if insert_statements.len() >= STATEMENTS_PER_EXECUTE {
+                let batch_sql = insert_statements.join(";\n");
+                conn.execute(&batch_sql, ()).map_err(|e| {
+                    MigrateError::transfer(&staging_table, format!("staging multi-INSERT: {}", e))
+                })?;
+                insert_statements.clear();
+            }
+        }
+
+        // Execute remaining statements
+        if !insert_statements.is_empty() {
+            let batch_sql = insert_statements.join(";\n");
+            conn.execute(&batch_sql, ()).map_err(|e| {
+                MigrateError::transfer(&staging_table, format!("staging multi-INSERT: {}", e))
             })?;
         }
         let insert_time = insert_start.elapsed();

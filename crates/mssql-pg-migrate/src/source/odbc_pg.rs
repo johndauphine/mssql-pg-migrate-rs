@@ -16,6 +16,11 @@
 //! ```sh
 //! kinit user@REALM
 //! ```
+//!
+//! **Performance Notes:**
+//! This implementation uses a connection-per-operation model with a semaphore
+//! to limit concurrent connections. Each parallel reader gets its own ODBC
+//! connection, enabling true parallel reads from the source database.
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
@@ -26,17 +31,21 @@ use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
 use odbc_api::{buffers::TextRowSet, ConnectionOptions, Cursor, Environment, ResultSetMetadata};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
 /// ODBC-based PostgreSQL source pool.
+///
+/// Uses a semaphore to limit concurrent connections while allowing
+/// true parallel operations. Each operation creates its own ODBC connection,
+/// enabling parallel readers to work concurrently.
 pub struct OdbcPgSourcePool {
     env: Arc<Environment>,
     connection_string: String,
     #[allow(dead_code)]
     config: SourceConfig,
-    /// Mutex to serialize ODBC operations (ODBC is not thread-safe)
-    conn_mutex: Mutex<()>,
+    /// Semaphore to limit concurrent ODBC connections
+    conn_semaphore: Arc<Semaphore>,
 }
 
 /// Escape a SQL string literal value to prevent SQL injection.
@@ -61,11 +70,15 @@ impl OdbcPgSourcePool {
     /// - The connection to the database fails
     /// - The ODBC driver is not installed
     pub async fn new(config: SourceConfig) -> Result<Self> {
-        Self::with_max_connections(config, 8).await
+        Self::with_max_connections(config, 16).await
     }
 
     /// Create a new ODBC-based PostgreSQL source pool with specified max connections.
-    pub async fn with_max_connections(config: SourceConfig, _max_size: u32) -> Result<Self> {
+    ///
+    /// The `max_size` parameter controls how many concurrent ODBC connections
+    /// can be active at once. This enables true parallel reads when using
+    /// multiple parallel readers.
+    pub async fn with_max_connections(config: SourceConfig, max_size: u32) -> Result<Self> {
         use crate::config::AuthMethod;
 
         // Create ODBC environment
@@ -149,15 +162,15 @@ impl OdbcPgSourcePool {
         }
 
         info!(
-            "Connected to PostgreSQL via ODBC ({}): {}:{}/{}",
-            auth_desc, config.host, config.port, config.database
+            "Connected to PostgreSQL via ODBC ({}): {}:{}/{} (max {} connections)",
+            auth_desc, config.host, config.port, config.database, max_size
         );
 
         Ok(Self {
             env: Arc::new(env),
             connection_string,
             config,
-            conn_mutex: Mutex::new(()),
+            conn_semaphore: Arc::new(Semaphore::new(max_size as usize)),
         })
     }
 
@@ -280,19 +293,28 @@ impl OdbcPgSourcePool {
     }
 
     /// Async version of query_rows_fast.
+    ///
+    /// Acquires a semaphore permit to limit concurrent connections,
+    /// enabling true parallel reads across multiple callers.
     pub async fn query_rows_fast(
         &self,
         sql: &str,
         _columns: &[String],
         col_types: &[String],
     ) -> Result<Vec<Vec<SqlValue>>> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
         self.query_rows_fast_sync(sql, col_types)
     }
 
     /// Async version of get_max_pk.
+    ///
+    /// Acquires a semaphore permit to limit concurrent connections.
     pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
         self.get_max_pk_sync(schema, table, pk_col)
     }
 
@@ -420,7 +442,9 @@ impl OdbcPgSourcePool {
 #[async_trait]
 impl SourcePool for OdbcPgSourcePool {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         let schema_lit = escape_sql_string(schema);
 
@@ -511,7 +535,9 @@ impl SourcePool for OdbcPgSourcePool {
         table: &Table,
         num_partitions: usize,
     ) -> Result<Vec<Partition>> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         if table.primary_key.is_empty() {
             return Err(MigrateError::NoPrimaryKey(table.full_name()));
@@ -584,7 +610,9 @@ impl SourcePool for OdbcPgSourcePool {
     }
 
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         let schema_lit = escape_sql_string(&table.schema);
         let table_lit = escape_sql_string(&table.name);
@@ -639,7 +667,9 @@ impl SourcePool for OdbcPgSourcePool {
     }
 
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         let schema_lit = escape_sql_string(&table.schema);
         let table_lit = escape_sql_string(&table.name);
@@ -717,7 +747,9 @@ impl SourcePool for OdbcPgSourcePool {
     }
 
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         let schema_lit = escape_sql_string(&table.schema);
         let table_lit = escape_sql_string(&table.name);
@@ -749,7 +781,9 @@ impl SourcePool for OdbcPgSourcePool {
     }
 
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
-        let _lock = self.conn_mutex.lock().await;
+        let _permit = self.conn_semaphore.acquire().await.map_err(|e| {
+            MigrateError::pool_msg(format!("Failed to acquire connection permit: {}", e), "ODBC semaphore")
+        })?;
 
         let schema_ident = escape_pg_ident(schema);
         let table_ident = escape_pg_ident(table);
