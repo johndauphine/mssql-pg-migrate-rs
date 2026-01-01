@@ -1,0 +1,37 @@
+# Upsert benchmark configuration for Rust
+# Database: StackOverflow2010 (~19.3M rows)
+
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: StackOverflow2010
+  user: sa
+  password: "YourStrong@Passw0rd"
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow
+  user: postgres
+  password: "PostgresPassword123"
+  schema: public
+  ssl_mode: disable
+
+migration:
+  target_mode: upsert
+  # workers is now auto-tuned if too low for partition jobs
+  workers: 6
+  chunk_size: 50000
+  parallel_readers: 8
+  parallel_writers: 8
+  max_mssql_connections: 50
+  max_pg_connections: 40
+  use_unlogged_tables: false
+  # Enable intra-table partitioning (match Airflow settings)
+  large_table_threshold: 1000000
+  max_partitions: 8
