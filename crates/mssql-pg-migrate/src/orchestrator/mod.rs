@@ -818,7 +818,37 @@ impl Orchestrator {
         state: &mut MigrationState,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let workers = self.config.migration.get_workers();
+        // Calculate total expected jobs for auto-tuning workers
+        let total_jobs: usize = tables.iter().map(|t| self.partition_count(t)).sum();
+        let configured_workers = self.config.migration.get_workers();
+
+        // Cap workers at connection pool limits to avoid exhausting connections
+        // Use the smaller pool as the limit (each job needs both source and target connections)
+        let max_by_connections = self
+            .config
+            .migration
+            .get_max_pg_connections()
+            .min(self.config.migration.get_max_mssql_connections());
+
+        // Auto-tune workers: ensure we have enough permits to spawn all jobs without blocking
+        // If workers < total_jobs, the semaphore would block job spawning, serializing tables
+        // But cap at connection pool limits to avoid exhausting database connections
+        let workers = if total_jobs > configured_workers {
+            let auto_tuned = total_jobs.min(max_by_connections);
+            if auto_tuned > configured_workers {
+                info!(
+                    "Auto-tuning workers: {} -> {} (for {} partition jobs, capped by {} max connections)",
+                    configured_workers,
+                    auto_tuned,
+                    total_jobs,
+                    max_by_connections
+                );
+            }
+            auto_tuned
+        } else {
+            configured_workers.min(max_by_connections)
+        };
+
         let semaphore = Arc::new(Semaphore::new(workers));
 
         // Create progress tracker
@@ -925,9 +955,10 @@ impl Orchestrator {
                         progress.emit("transferring", Some(table_name.clone()), Some("started"));
 
                         // Create a job for each partition
+                        // IMPORTANT: Acquire semaphore INSIDE the spawned task, not before spawning.
+                        // This allows all partition jobs to be spawned immediately, with the
+                        // semaphore controlling concurrent execution rather than blocking spawning.
                         for partition in partitions {
-                            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
                             // No adjustment needed: the transfer engine now uses >= for first chunk,
                             // which correctly includes the partition's min_pk boundary.
                             let job = TransferJob {
@@ -941,12 +972,15 @@ impl Orchestrator {
                             };
 
                             let engine_clone = engine.clone();
+                            let semaphore_clone = semaphore.clone();
                             let partition_name =
                                 format!("{}:p{}", table_name, partition.partition_id);
 
                             join_set.spawn(async move {
+                                // Acquire permit inside the task - this allows all jobs to be
+                                // spawned immediately while controlling concurrent execution
+                                let _permit = semaphore_clone.acquire_owned().await.unwrap();
                                 let result = engine_clone.execute(job).await;
-                                drop(permit);
                                 (partition_name, result)
                             });
                         }
@@ -963,8 +997,6 @@ impl Orchestrator {
             }
 
             // Single job for small tables or partition failures
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
             // Update state
             if let Some(ts) = state.tables.get_mut(&table_name) {
                 ts.status = TaskStatus::InProgress;
@@ -985,11 +1017,13 @@ impl Orchestrator {
             };
 
             let engine_clone = engine.clone();
+            let semaphore_clone = semaphore.clone();
             let job_name = table_name.clone();
 
             join_set.spawn(async move {
+                // Acquire permit inside the task for consistent behavior with partitioned tables
+                let _permit = semaphore_clone.acquire_owned().await.unwrap();
                 let result = engine_clone.execute(job).await;
-                drop(permit);
                 (job_name, result)
             });
         }
