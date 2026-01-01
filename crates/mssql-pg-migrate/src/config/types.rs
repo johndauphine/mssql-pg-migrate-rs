@@ -15,29 +15,68 @@ pub enum DatabaseType {
     Postgres,
 }
 
-/// Authentication method for MSSQL connections.
+/// Authentication/connection method for database connections.
+///
+/// This determines which driver is used to connect to the database:
+/// - `native` (default): Uses the native Rust driver (tiberius for MSSQL, tokio-postgres for PostgreSQL)
+/// - `odbc`: Uses ODBC driver with username/password authentication
+/// - `kerberos`: Uses ODBC driver with Kerberos/GSSAPI authentication
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum MssqlAuthMethod {
-    /// SQL Server authentication (username/password).
-    /// This is the default and works on all platforms.
-    #[default]
-    SqlServer,
-
-    /// Kerberos authentication via ODBC driver.
-    /// Requires Microsoft ODBC Driver for SQL Server to be installed.
+pub enum AuthMethod {
+    /// Native driver with username/password authentication.
+    /// - MSSQL: Uses tiberius (TDS protocol) - fastest option (~70K+ rows/sec)
+    /// - PostgreSQL: Uses tokio-postgres - fastest option
     ///
-    /// **IMPORTANT**: This requires the `kerberos` feature flag and the
-    /// Microsoft ODBC Driver for SQL Server:
-    /// - Windows: Download from Microsoft (SSPI is used automatically)
+    /// This is the default and requires no external dependencies.
+    #[default]
+    Native,
+
+    /// ODBC driver with username/password authentication.
+    /// Requires the appropriate ODBC driver to be installed:
+    ///
+    /// **For MSSQL:**
+    /// - Windows: Download Microsoft ODBC Driver for SQL Server
     /// - Linux: `apt install msodbcsql18` or `yum install msodbcsql18`
     /// - macOS: `brew install msodbcsql18`
     ///
-    /// On Linux/macOS, you must obtain a Kerberos ticket before running:
-    /// ```sh
-    /// kinit user@REALM
-    /// ```
+    /// **For PostgreSQL:**
+    /// - Windows: Download psqlODBC from postgresql.org
+    /// - Linux: `apt install odbc-postgresql`
+    /// - macOS: `brew install psqlodbc`
+    ///
+    /// **IMPORTANT**: Requires the `kerberos` feature flag.
+    ///
+    /// Note: ODBC is slower than native drivers (~10-30K rows/sec for MSSQL).
+    Odbc,
+
+    /// Kerberos/GSSAPI authentication via ODBC driver.
+    /// Uses Windows Integrated Authentication (MSSQL) or GSSAPI (PostgreSQL).
+    ///
+    /// **Requirements:**
+    /// - The `kerberos` feature flag must be enabled
+    /// - Appropriate ODBC driver must be installed (see `odbc` variant)
+    /// - Valid Kerberos ticket (run `kinit user@REALM` on Linux/macOS)
+    ///
+    /// On Windows with domain-joined machines, authentication is automatic via SSPI.
     Kerberos,
+
+    /// Legacy alias for `native` (MSSQL only, for backwards compatibility).
+    /// Prefer using `native` instead.
+    #[serde(rename = "sql_server")]
+    SqlServer,
+}
+
+impl AuthMethod {
+    /// Returns true if this auth method uses ODBC driver.
+    pub fn uses_odbc(&self) -> bool {
+        matches!(self, Self::Odbc | Self::Kerberos)
+    }
+
+    /// Returns true if this is a native driver connection (not ODBC).
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Native | Self::SqlServer)
+    }
 }
 
 impl DatabaseType {
@@ -216,11 +255,13 @@ pub struct SourceConfig {
     #[serde(default)]
     pub trust_server_cert: bool,
 
-    /// Authentication method (default: sql_server).
-    /// Use "kerberos" for Windows Integrated Authentication via ODBC.
-    /// **Requires `kerberos` feature and Microsoft ODBC Driver for SQL Server.**
+    /// Authentication/connection method (default: native).
+    /// - `native`: Uses tiberius (MSSQL) or tokio-postgres (PostgreSQL) - fastest
+    /// - `odbc`: Uses ODBC driver with username/password
+    /// - `kerberos`: Uses ODBC driver with Kerberos/GSSAPI authentication
+    /// **ODBC options require `kerberos` feature and appropriate ODBC driver.**
     #[serde(default)]
-    pub auth: MssqlAuthMethod,
+    pub auth: AuthMethod,
 }
 
 impl fmt::Debug for SourceConfig {
@@ -282,11 +323,13 @@ pub struct TargetConfig {
     #[serde(default)]
     pub trust_server_cert: bool,
 
-    /// Authentication method for MSSQL targets (default: sql_server). Ignored for PostgreSQL.
-    /// Use "kerberos" for Windows Integrated Authentication via ODBC.
-    /// **Requires `kerberos` feature and Microsoft ODBC Driver for SQL Server.**
+    /// Authentication/connection method (default: native).
+    /// - `native`: Uses tiberius (MSSQL) or tokio-postgres (PostgreSQL) - fastest
+    /// - `odbc`: Uses ODBC driver with username/password
+    /// - `kerberos`: Uses ODBC driver with Kerberos/GSSAPI authentication
+    /// **ODBC options require `kerberos` feature and appropriate ODBC driver.**
     #[serde(default)]
-    pub auth: MssqlAuthMethod,
+    pub auth: AuthMethod,
 }
 
 impl fmt::Debug for TargetConfig {

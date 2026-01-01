@@ -10,10 +10,16 @@ mod mssql;
 #[cfg(feature = "kerberos")]
 mod odbc;
 
+#[cfg(feature = "kerberos")]
+mod odbc_pg;
+
 pub use mssql::MssqlTargetPool;
 
 #[cfg(feature = "kerberos")]
 pub use odbc::{check_odbc_available, OdbcMssqlTargetPool};
+
+#[cfg(feature = "kerberos")]
+pub use odbc_pg::OdbcPgTargetPool;
 
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};

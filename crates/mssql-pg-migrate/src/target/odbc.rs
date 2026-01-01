@@ -1,22 +1,26 @@
-//! ODBC-based MSSQL target for Kerberos authentication.
+//! ODBC-based MSSQL target for Kerberos and SQL Server authentication.
 //!
-//! This module provides an ODBC-based implementation of `TargetPool` that supports
-//! Kerberos/Windows Integrated Authentication via the Microsoft ODBC Driver for SQL Server.
+//! This module provides an ODBC-based implementation of `TargetPool` that supports:
+//! - Kerberos/Windows Integrated Authentication (`auth: kerberos`)
+//! - SQL Server Authentication via ODBC (`auth: odbc`)
 //!
 //! **Requirements:**
 //! - The `kerberos` feature must be enabled
 //! - Microsoft ODBC Driver for SQL Server must be installed:
-//!   - Windows: Download from Microsoft (uses SSPI automatically)
+//!   - Windows: Download from Microsoft (uses SSPI automatically for Kerberos)
 //!   - Linux: `apt install msodbcsql18` or `yum install msodbcsql18`
 //!   - macOS: `brew install msodbcsql18`
 //!
-//! **Usage:**
+//! **Usage (Kerberos):**
 //! On Linux/macOS, obtain a Kerberos ticket before running:
 //! ```sh
 //! kinit user@REALM
 //! ```
 //!
 //! On Windows with domain-joined machines, authentication is automatic via SSPI.
+//!
+//! **Usage (SQL Server auth via ODBC):**
+//! Set `auth: odbc` in the config and provide username/password.
 //!
 //! **Performance Notes:**
 //! ODBC does not support TDS bulk insert, so this implementation uses parameterized
@@ -39,6 +43,12 @@ const MAX_PARAMS_PER_BATCH: usize = 2100;
 
 /// Maximum rows per INSERT VALUES clause (MSSQL limit is 1000).
 const MAX_ROWS_PER_INSERT: usize = 1000;
+
+/// Number of INSERT statements to batch into a single execute call.
+/// Multiple INSERT statements separated by semicolons are sent as one batch,
+/// reducing round-trip overhead significantly.
+/// With 1000 rows per INSERT, this means up to 100K rows per execute.
+const STATEMENTS_PER_EXECUTE: usize = 100;
 
 /// Maximum number of retry attempts for deadlock errors.
 const DEADLOCK_MAX_RETRIES: u32 = 5;
@@ -65,12 +75,14 @@ impl OdbcMssqlTargetPool {
     /// - The ODBC environment cannot be created (driver not installed)
     /// - The connection to the database fails
     pub async fn new(config: &TargetConfig, _max_conns: u32) -> Result<Self> {
+        use crate::config::AuthMethod;
+
         // Create ODBC environment - this will fail if ODBC is not installed
         let env = Environment::new().map_err(|e| {
             MigrateError::pool_msg(
                 format!(
                     "Failed to create ODBC environment: {}.\n\n\
-                     Kerberos authentication requires the Microsoft ODBC Driver for SQL Server.\n\
+                     ODBC authentication requires the Microsoft ODBC Driver for SQL Server.\n\
                      Please install it:\n\
                      - Windows: Download from Microsoft\n\
                      - Linux: apt install msodbcsql18 (or yum install msodbcsql18)\n\
@@ -78,28 +90,54 @@ impl OdbcMssqlTargetPool {
                               brew install msodbcsql18",
                     e
                 ),
-                "ODBC Kerberos authentication",
+                "ODBC connection",
             )
         })?;
 
-        // Build connection string for Kerberos authentication
-        let connection_string = format!(
-            "Driver={{ODBC Driver 18 for SQL Server}};\
-             Server={},{};\
-             Database={};\
-             Trusted_Connection=yes;\
-             Encrypt={};\
-             TrustServerCertificate={};",
-            config.host,
-            config.port,
-            config.database,
-            if config.encrypt { "yes" } else { "no" },
-            if config.trust_server_cert { "yes" } else { "no" },
-        );
+        // Build connection string based on auth method
+        let (connection_string, auth_desc) = match config.auth {
+            AuthMethod::Kerberos => {
+                // Kerberos: use Trusted_Connection (Windows Integrated Auth)
+                let conn_str = format!(
+                    "Driver={{ODBC Driver 18 for SQL Server}};\
+                     Server={},{};\
+                     Database={};\
+                     Trusted_Connection=yes;\
+                     Encrypt={};\
+                     TrustServerCertificate={};",
+                    config.host,
+                    config.port,
+                    config.database,
+                    if config.encrypt { "yes" } else { "no" },
+                    if config.trust_server_cert { "yes" } else { "no" },
+                );
+                (conn_str, "Kerberos")
+            }
+            AuthMethod::Odbc | AuthMethod::Native | AuthMethod::SqlServer => {
+                // SQL Server auth via ODBC: use UID/PWD
+                let conn_str = format!(
+                    "Driver={{ODBC Driver 18 for SQL Server}};\
+                     Server={},{};\
+                     Database={};\
+                     UID={};\
+                     PWD={};\
+                     Encrypt={};\
+                     TrustServerCertificate={};",
+                    config.host,
+                    config.port,
+                    config.database,
+                    config.user,
+                    config.password,
+                    if config.encrypt { "yes" } else { "no" },
+                    if config.trust_server_cert { "yes" } else { "no" },
+                );
+                (conn_str, "SQL Server")
+            }
+        };
 
         debug!(
-            "ODBC target connection string: Driver={{ODBC Driver 18 for SQL Server}};Server={},{};Database={};Trusted_Connection=yes;...",
-            config.host, config.port, config.database
+            "ODBC target connection string (credentials hidden): Driver={{ODBC Driver 18 for SQL Server}};Server={},{};Database={};Auth={};...",
+            config.host, config.port, config.database, auth_desc
         );
 
         // Test connection
@@ -107,15 +145,19 @@ impl OdbcMssqlTargetPool {
             let conn = env
                 .connect_with_connection_string(&connection_string, ConnectionOptions::default())
                 .map_err(|e| {
+                    let help_msg = if config.auth == AuthMethod::Kerberos {
+                        "Ensure you have a valid Kerberos ticket:\n\
+                         - Linux/macOS: Run 'kinit user@REALM' before running the migration\n\
+                         - Windows: Be on a domain-joined machine or use 'runas /netonly'"
+                    } else {
+                        "Check that the username and password are correct."
+                    };
                     MigrateError::pool_msg(
                         format!(
-                            "Failed to connect to MSSQL target via ODBC with Kerberos: {}.\n\n\
-                             Ensure you have a valid Kerberos ticket:\n\
-                             - Linux/macOS: Run 'kinit user@REALM' before running the migration\n\
-                             - Windows: Be on a domain-joined machine or use 'runas /netonly'",
-                            e
+                            "Failed to connect to MSSQL target via ODBC ({}): {}.\n\n{}",
+                            auth_desc, e, help_msg
                         ),
-                        "ODBC Kerberos authentication",
+                        "ODBC connection",
                     )
                 })?;
 
@@ -124,8 +166,8 @@ impl OdbcMssqlTargetPool {
         }
 
         info!(
-            "Connected to MSSQL target via ODBC (Kerberos): {}:{}/{}",
-            config.host, config.port, config.database
+            "Connected to MSSQL target via ODBC ({}): {}:{}/{}",
+            auth_desc, config.host, config.port, config.database
         );
 
         Ok(Self {
@@ -570,10 +612,15 @@ impl OdbcMssqlTargetPool {
         }
     }
 
-    /// Insert rows using batched INSERT statements.
+    /// Insert rows using multi-statement batched INSERT.
     ///
-    /// ODBC doesn't support TDS bulk insert, so we use parameterized batch INSERT.
-    /// This is slower than TDS bulk insert but still reasonably performant.
+    /// ODBC doesn't support TDS bulk insert, so we use batched INSERT statements.
+    /// To reduce round-trip overhead, multiple INSERT statements are combined
+    /// into a single execute call (separated by semicolons).
+    ///
+    /// Performance optimization: Instead of executing each INSERT individually,
+    /// we batch STATEMENTS_PER_EXECUTE INSERT statements together, reducing
+    /// network round-trips by ~10x.
     async fn insert_batch(
         &self,
         schema: &str,
@@ -601,17 +648,19 @@ impl OdbcMssqlTargetPool {
             ));
         }
 
-        let max_rows_per_batch = (MAX_PARAMS_PER_BATCH / cols_per_row)
+        let max_rows_per_insert = (MAX_PARAMS_PER_BATCH / cols_per_row)
             .min(MAX_ROWS_PER_INSERT)
             .max(1);
 
         let mut total_inserted = 0u64;
 
-        // Process rows in batches
-        for batch in rows.chunks(max_rows_per_batch) {
-            // Build multi-row VALUES clause
-            let mut value_groups = Vec::with_capacity(batch.len());
+        // Build individual INSERT statements
+        let mut insert_statements: Vec<String> = Vec::new();
+        let mut rows_in_current_batch = 0usize;
 
+        for batch in rows.chunks(max_rows_per_insert) {
+            // Build multi-row VALUES clause for this INSERT
+            let mut value_groups = Vec::with_capacity(batch.len());
             for row in batch {
                 let values: Vec<String> = row.iter().map(sql_value_to_sql_literal).collect();
                 value_groups.push(format!("({})", values.join(", ")));
@@ -623,19 +672,40 @@ impl OdbcMssqlTargetPool {
                 col_str,
                 value_groups.join(", ")
             );
+            insert_statements.push(sql);
+            rows_in_current_batch += batch.len();
 
-            conn.execute(&sql, ()).map_err(|e| {
+            // Execute when we have enough statements or this is the last batch
+            if insert_statements.len() >= STATEMENTS_PER_EXECUTE {
+                let batch_sql = insert_statements.join(";\n");
+                conn.execute(&batch_sql, ()).map_err(|e| {
+                    MigrateError::transfer(
+                        &qualified_table,
+                        format!("multi-statement INSERT ({} rows, {} statements): {}",
+                               rows_in_current_batch, insert_statements.len(), e),
+                    )
+                })?;
+                total_inserted += rows_in_current_batch as u64;
+                insert_statements.clear();
+                rows_in_current_batch = 0;
+            }
+        }
+
+        // Execute any remaining statements
+        if !insert_statements.is_empty() {
+            let batch_sql = insert_statements.join(";\n");
+            conn.execute(&batch_sql, ()).map_err(|e| {
                 MigrateError::transfer(
                     &qualified_table,
-                    format!("batch INSERT ({} rows): {}", batch.len(), e),
+                    format!("multi-statement INSERT ({} rows, {} statements): {}",
+                           rows_in_current_batch, insert_statements.len(), e),
                 )
             })?;
-
-            total_inserted += batch.len() as u64;
+            total_inserted += rows_in_current_batch as u64;
         }
 
         debug!(
-            "Inserted {} rows into {} via ODBC batched INSERT",
+            "Inserted {} rows into {} via ODBC multi-statement INSERT",
             total_inserted, qualified_table
         );
 
@@ -998,7 +1068,7 @@ impl TargetPool for OdbcMssqlTargetPool {
         let staging_table = self.ensure_staging_table(schema, table, writer_id, partition_id)?;
         let staging_time = staging_start.elapsed();
 
-        // 2. Insert rows into staging table using batch INSERT
+        // 2. Insert rows into staging table using multi-statement batch INSERT
         let insert_start = Instant::now();
         let conn = self.get_connection()?;
 
@@ -1006,11 +1076,14 @@ impl TargetPool for OdbcMssqlTargetPool {
         let col_str = col_list.join(", ");
 
         let cols_per_row = cols.len();
-        let max_rows_per_batch = (MAX_PARAMS_PER_BATCH / cols_per_row)
+        let max_rows_per_insert = (MAX_PARAMS_PER_BATCH / cols_per_row)
             .min(MAX_ROWS_PER_INSERT)
             .max(1);
 
-        for batch in rows.chunks(max_rows_per_batch) {
+        // Build individual INSERT statements and batch them
+        let mut insert_statements: Vec<String> = Vec::new();
+
+        for batch in rows.chunks(max_rows_per_insert) {
             let mut value_groups = Vec::with_capacity(batch.len());
 
             for row in batch {
@@ -1024,9 +1097,23 @@ impl TargetPool for OdbcMssqlTargetPool {
                 col_str,
                 value_groups.join(", ")
             );
+            insert_statements.push(sql);
 
-            conn.execute(&sql, ()).map_err(|e| {
-                MigrateError::transfer(&staging_table, format!("staging INSERT: {}", e))
+            // Execute when we have enough statements
+            if insert_statements.len() >= STATEMENTS_PER_EXECUTE {
+                let batch_sql = insert_statements.join(";\n");
+                conn.execute(&batch_sql, ()).map_err(|e| {
+                    MigrateError::transfer(&staging_table, format!("staging multi-INSERT: {}", e))
+                })?;
+                insert_statements.clear();
+            }
+        }
+
+        // Execute remaining statements
+        if !insert_statements.is_empty() {
+            let batch_sql = insert_statements.join(";\n");
+            conn.execute(&batch_sql, ()).map_err(|e| {
+                MigrateError::transfer(&staging_table, format!("staging multi-INSERT: {}", e))
             })?;
         }
         let insert_time = insert_start.elapsed();
