@@ -7,8 +7,12 @@
 //! - MSSQL → MSSQL
 //! - PostgreSQL → PostgreSQL
 
-use crate::config::{Config, MssqlAuthMethod};
-use crate::error::{MigrateError, Result};
+#[cfg(feature = "kerberos")]
+use crate::config::AuthMethod;
+use crate::config::Config;
+#[cfg(not(feature = "kerberos"))]
+use crate::error::MigrateError;
+use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
@@ -16,9 +20,9 @@ use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool};
 use std::sync::Arc;
 
 #[cfg(feature = "kerberos")]
-use crate::source::OdbcMssqlPool;
+use crate::source::{OdbcMssqlPool, OdbcPgSourcePool};
 #[cfg(feature = "kerberos")]
-use crate::target::{check_odbc_available, OdbcMssqlTargetPool};
+use crate::target::{check_odbc_available, OdbcMssqlTargetPool, OdbcPgTargetPool};
 #[cfg(feature = "kerberos")]
 use tracing::{info, warn};
 
@@ -28,6 +32,8 @@ pub enum SourcePoolImpl {
     Postgres(Arc<PgSourcePool>),
     #[cfg(feature = "kerberos")]
     OdbcMssql(Arc<OdbcMssqlPool>),
+    #[cfg(feature = "kerberos")]
+    OdbcPostgres(Arc<OdbcPgSourcePool>),
 }
 
 impl SourcePoolImpl {
@@ -37,21 +43,18 @@ impl SourcePoolImpl {
         let source_type = config.source.r#type.to_lowercase();
 
         if source_type == "postgres" || source_type == "postgresql" {
-            let pool = PgSourcePool::new(&config.source, pool_size as usize).await?;
-            Ok(Self::Postgres(Arc::new(pool)))
-        } else {
-            // MSSQL source - check auth method
-            if config.source.auth == MssqlAuthMethod::Kerberos {
+            // PostgreSQL source - check auth method for ODBC
+            if config.source.auth.uses_odbc() {
                 #[cfg(not(feature = "kerberos"))]
                 {
                     return Err(MigrateError::Config(
-                        "Kerberos authentication requires the 'kerberos' feature. \
+                        "ODBC authentication requires the 'kerberos' feature. \
                          Rebuild with: cargo build --features kerberos\n\n\
-                         Additionally, the Microsoft ODBC Driver for SQL Server must be installed:\n\
-                         - Windows: Download from Microsoft\n\
-                         - Linux: apt install msodbcsql18 (or yum install msodbcsql18)\n\
-                         - macOS: brew install msodbcsql18\n\n\
-                         On Linux/macOS, obtain a Kerberos ticket before running: kinit user@REALM".into()
+                         Additionally, the PostgreSQL ODBC Driver (psqlODBC) must be installed:\n\
+                         - Windows: Download from postgresql.org\n\
+                         - Linux: apt install odbc-postgresql (or yum install postgresql-odbc)\n\
+                         - macOS: brew install psqlodbc\n\n\
+                         For Kerberos auth on Linux/macOS, obtain a ticket before running: kinit user@REALM".into()
                     ));
                 }
                 #[cfg(feature = "kerberos")]
@@ -59,14 +62,54 @@ impl SourcePoolImpl {
                     // Check if ODBC is available before proceeding
                     check_odbc_available()?;
 
-                    info!(
-                        "Using Kerberos authentication via ODBC for source. \
-                         Ensure you have a valid Kerberos ticket (kinit user@REALM)."
-                    );
-                    warn!(
-                        "ODBC-based source has limited transfer support. \
-                         Schema extraction works, but data transfer falls back to tiberius."
-                    );
+                    if config.source.auth == AuthMethod::Kerberos {
+                        info!(
+                            "Using Kerberos authentication via ODBC for PostgreSQL source. \
+                             Ensure you have a valid Kerberos ticket (kinit user@REALM)."
+                        );
+                    } else {
+                        info!("Using ODBC driver for PostgreSQL source.");
+                    }
+
+                    let pool = OdbcPgSourcePool::with_max_connections(
+                        config.source.clone(),
+                        pool_size,
+                    ).await?;
+                    return Ok(Self::OdbcPostgres(Arc::new(pool)));
+                }
+            }
+            // Default to native tokio-postgres
+            let pool = PgSourcePool::new(&config.source, pool_size as usize).await?;
+            Ok(Self::Postgres(Arc::new(pool)))
+        } else {
+            // MSSQL source - check auth method
+            // Use ODBC for both Kerberos and explicit ODBC auth
+            if config.source.auth.uses_odbc() {
+                #[cfg(not(feature = "kerberos"))]
+                {
+                    return Err(MigrateError::Config(
+                        "ODBC authentication requires the 'kerberos' feature. \
+                         Rebuild with: cargo build --features kerberos\n\n\
+                         Additionally, the Microsoft ODBC Driver for SQL Server must be installed:\n\
+                         - Windows: Download from Microsoft\n\
+                         - Linux: apt install msodbcsql18 (or yum install msodbcsql18)\n\
+                         - macOS: brew install msodbcsql18\n\n\
+                         For Kerberos auth on Linux/macOS, obtain a ticket before running: kinit user@REALM".into()
+                    ));
+                }
+                #[cfg(feature = "kerberos")]
+                {
+                    // Check if ODBC is available before proceeding
+                    check_odbc_available()?;
+
+                    if config.source.auth == AuthMethod::Kerberos {
+                        info!(
+                            "Using Kerberos authentication via ODBC for source. \
+                             Ensure you have a valid Kerberos ticket (kinit user@REALM)."
+                        );
+                    } else {
+                        info!("Using SQL Server authentication via ODBC for source.");
+                    }
 
                     let pool = OdbcMssqlPool::with_max_connections(
                         config.source.clone(),
@@ -88,6 +131,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.db_type(),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.db_type(),
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.db_type(),
         }
     }
 
@@ -98,6 +143,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.extract_schema(schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.extract_schema(schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.extract_schema(schema).await,
         }
     }
 
@@ -112,6 +159,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.get_partition_boundaries(table, num_partitions).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.get_partition_boundaries(table, num_partitions).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.get_partition_boundaries(table, num_partitions).await,
         }
     }
 
@@ -122,6 +171,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.load_indexes(table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.load_indexes(table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.load_indexes(table).await,
         }
     }
 
@@ -132,6 +183,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.load_foreign_keys(table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.load_foreign_keys(table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.load_foreign_keys(table).await,
         }
     }
 
@@ -142,6 +195,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.load_check_constraints(table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.load_check_constraints(table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.load_check_constraints(table).await,
         }
     }
 
@@ -152,6 +207,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.get_row_count(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.get_row_count(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.get_row_count(schema, table).await,
         }
     }
 
@@ -162,6 +219,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.test_connection().await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => Ok(()), // ODBC connections are tested at creation
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => Ok(()), // ODBC connections are tested at creation
         }
     }
 
@@ -172,6 +231,8 @@ impl SourcePoolImpl {
             Self::Postgres(p) => p.close().await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.close().await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.close().await,
         }
     }
 
@@ -188,14 +249,9 @@ impl SourcePoolImpl {
             Self::Mssql(p) => p.query_rows_fast(sql, columns, col_types).await,
             Self::Postgres(p) => p.query_rows_fast(sql, columns, col_types).await,
             #[cfg(feature = "kerberos")]
-            Self::OdbcMssql(_) => {
-                // ODBC source doesn't support fast row queries for data transfer.
-                // This should not be called - data transfer uses tiberius pool.
-                Err(MigrateError::transfer(
-                    "ODBC source",
-                    "Data transfer via ODBC is not supported. Use SQL Server authentication for data transfer.".to_string()
-                ))
-            }
+            Self::OdbcMssql(p) => p.query_rows_fast(sql, columns, col_types).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.query_rows_fast(sql, columns, col_types).await,
         }
     }
 
@@ -205,13 +261,9 @@ impl SourcePoolImpl {
             Self::Mssql(p) => p.get_max_pk(schema, table, pk_col).await,
             Self::Postgres(p) => p.get_max_pk(schema, table, pk_col).await,
             #[cfg(feature = "kerberos")]
-            Self::OdbcMssql(_) => {
-                // ODBC source doesn't support this for data transfer.
-                Err(MigrateError::transfer(
-                    "ODBC source",
-                    format!("Cannot get max PK for {}.{}.{} via ODBC", schema, table, pk_col)
-                ))
-            }
+            Self::OdbcMssql(p) => p.get_max_pk(schema, table, pk_col).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.get_max_pk(schema, table, pk_col).await,
         }
     }
 
@@ -223,27 +275,31 @@ impl SourcePoolImpl {
             Self::Postgres(_) => None,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => None, // ODBC pools don't expose tiberius interface
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => None,
         }
     }
 
     /// Get the underlying PostgreSQL source pool.
-    /// Returns None if not PostgreSQL.
+    /// Returns None if not PostgreSQL or is ODBC-based.
     pub fn as_postgres(&self) -> Option<Arc<PgSourcePool>> {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => None,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => None, // ODBC pools don't expose tokio-postgres interface
         }
     }
 
-    /// Check if this is an ODBC-based source (for Kerberos).
+    /// Check if this is an ODBC-based source.
     #[cfg(feature = "kerberos")]
     pub fn is_odbc(&self) -> bool {
-        matches!(self, Self::OdbcMssql(_))
+        matches!(self, Self::OdbcMssql(_) | Self::OdbcPostgres(_))
     }
 
-    /// Check if this is an ODBC-based source (for Kerberos).
+    /// Check if this is an ODBC-based source.
     #[cfg(not(feature = "kerberos"))]
     pub fn is_odbc(&self) -> bool {
         false
@@ -256,6 +312,8 @@ pub enum TargetPoolImpl {
     Postgres(Arc<PgPool>),
     #[cfg(feature = "kerberos")]
     OdbcMssql(Arc<OdbcMssqlTargetPool>),
+    #[cfg(feature = "kerberos")]
+    OdbcPostgres(Arc<OdbcPgTargetPool>),
 }
 
 impl TargetPoolImpl {
@@ -266,17 +324,18 @@ impl TargetPoolImpl {
 
         if target_type == "mssql" {
             // MSSQL target - check auth method
-            if config.target.auth == MssqlAuthMethod::Kerberos {
+            // Use ODBC for both Kerberos and explicit ODBC auth
+            if config.target.auth.uses_odbc() {
                 #[cfg(not(feature = "kerberos"))]
                 {
                     return Err(MigrateError::Config(
-                        "Kerberos authentication for MSSQL target requires the 'kerberos' feature. \
+                        "ODBC authentication for MSSQL target requires the 'kerberos' feature. \
                          Rebuild with: cargo build --features kerberos\n\n\
                          Additionally, the Microsoft ODBC Driver for SQL Server must be installed:\n\
                          - Windows: Download from Microsoft\n\
                          - Linux: apt install msodbcsql18 (or yum install msodbcsql18)\n\
                          - macOS: brew install msodbcsql18\n\n\
-                         On Linux/macOS, obtain a Kerberos ticket before running: kinit user@REALM".into()
+                         For Kerberos auth on Linux/macOS, obtain a ticket before running: kinit user@REALM".into()
                     ));
                 }
                 #[cfg(feature = "kerberos")]
@@ -284,13 +343,17 @@ impl TargetPoolImpl {
                     // Check if ODBC is available before proceeding
                     check_odbc_available()?;
 
-                    info!(
-                        "Using Kerberos authentication via ODBC for MSSQL target. \
-                         Ensure you have a valid Kerberos ticket (kinit user@REALM)."
-                    );
+                    if config.target.auth == AuthMethod::Kerberos {
+                        info!(
+                            "Using Kerberos authentication via ODBC for MSSQL target. \
+                             Ensure you have a valid Kerberos ticket (kinit user@REALM)."
+                        );
+                    } else {
+                        info!("Using SQL Server authentication via ODBC for MSSQL target.");
+                    }
                     warn!(
                         "ODBC-based target uses batch INSERT (slower than TDS bulk insert). \
-                         Expect ~10-30K rows/sec vs ~70K+ rows/sec with SQL Server auth."
+                         Expect ~10-30K rows/sec vs ~70K+ rows/sec with tiberius."
                     );
 
                     let pool = OdbcMssqlTargetPool::new(&config.target, max_conns as u32).await?;
@@ -300,7 +363,43 @@ impl TargetPoolImpl {
             let pool = MssqlTargetPool::new(&config.target, max_conns as u32).await?;
             Ok(Self::Mssql(Arc::new(pool)))
         } else {
-            // Default to PostgreSQL
+            // PostgreSQL target - check auth method for ODBC
+            if config.target.auth.uses_odbc() {
+                #[cfg(not(feature = "kerberos"))]
+                {
+                    return Err(MigrateError::Config(
+                        "ODBC authentication for PostgreSQL target requires the 'kerberos' feature. \
+                         Rebuild with: cargo build --features kerberos\n\n\
+                         Additionally, the PostgreSQL ODBC Driver (psqlODBC) must be installed:\n\
+                         - Windows: Download from postgresql.org\n\
+                         - Linux: apt install odbc-postgresql (or yum install postgresql-odbc)\n\
+                         - macOS: brew install psqlodbc\n\n\
+                         For Kerberos auth on Linux/macOS, obtain a ticket before running: kinit user@REALM".into()
+                    ));
+                }
+                #[cfg(feature = "kerberos")]
+                {
+                    // Check if ODBC is available before proceeding
+                    check_odbc_available()?;
+
+                    if config.target.auth == AuthMethod::Kerberos {
+                        info!(
+                            "Using Kerberos authentication via ODBC for PostgreSQL target. \
+                             Ensure you have a valid Kerberos ticket (kinit user@REALM)."
+                        );
+                    } else {
+                        info!("Using ODBC driver for PostgreSQL target.");
+                    }
+                    warn!(
+                        "ODBC-based target uses batch INSERT (slower than COPY protocol). \
+                         Expect ~10-30K rows/sec vs ~100K+ rows/sec with native tokio-postgres."
+                    );
+
+                    let pool = OdbcPgTargetPool::new(&config.target, max_conns as u32).await?;
+                    return Ok(Self::OdbcPostgres(Arc::new(pool)));
+                }
+            }
+            // Default to native tokio-postgres with COPY protocol
             let pool = PgPool::new(
                 &config.target,
                 max_conns,
@@ -319,6 +418,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.db_type(),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.db_type(),
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.db_type(),
         }
     }
 
@@ -329,6 +430,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_schema(schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_schema(schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_schema(schema).await,
         }
     }
 
@@ -339,6 +442,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_table(table, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_table(table, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_table(table, target_schema).await,
         }
     }
 
@@ -349,6 +454,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_table_unlogged(table, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_table_unlogged(table, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_table_unlogged(table, target_schema).await,
         }
     }
 
@@ -359,6 +466,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.drop_table(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.drop_table(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.drop_table(schema, table).await,
         }
     }
 
@@ -369,6 +478,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.truncate_table(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.truncate_table(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.truncate_table(schema, table).await,
         }
     }
 
@@ -379,6 +490,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.table_exists(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.table_exists(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.table_exists(schema, table).await,
         }
     }
 
@@ -389,6 +502,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_primary_key(table, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_primary_key(table, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_primary_key(table, target_schema).await,
         }
     }
 
@@ -404,6 +519,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_index(table, idx, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_index(table, idx, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_index(table, idx, target_schema).await,
         }
     }
 
@@ -414,6 +531,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.drop_non_pk_indexes(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.drop_non_pk_indexes(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.drop_non_pk_indexes(schema, table).await,
         }
     }
 
@@ -429,6 +548,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_foreign_key(table, fk, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_foreign_key(table, fk, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_foreign_key(table, fk, target_schema).await,
         }
     }
 
@@ -444,6 +565,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.create_check_constraint(table, chk, target_schema).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.create_check_constraint(table, chk, target_schema).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.create_check_constraint(table, chk, target_schema).await,
         }
     }
 
@@ -454,6 +577,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.has_primary_key(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.has_primary_key(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.has_primary_key(schema, table).await,
         }
     }
 
@@ -464,6 +589,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.get_row_count(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.get_row_count(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.get_row_count(schema, table).await,
         }
     }
 
@@ -474,6 +601,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.reset_sequence(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.reset_sequence(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.reset_sequence(schema, table).await,
         }
     }
 
@@ -484,6 +613,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.set_table_logged(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.set_table_logged(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.set_table_logged(schema, table).await,
         }
     }
 
@@ -494,6 +625,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.set_table_unlogged(schema, table).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.set_table_unlogged(schema, table).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.set_table_unlogged(schema, table).await,
         }
     }
 
@@ -510,6 +643,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.write_chunk(schema, table, cols, rows).await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.write_chunk(schema, table, cols, rows).await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.write_chunk(schema, table, cols, rows).await,
         }
     }
 
@@ -538,6 +673,11 @@ impl TargetPoolImpl {
                 p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
                     .await
             }
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => {
+                p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
+                    .await
+            }
         }
     }
 
@@ -560,6 +700,8 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.test_connection().await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => Ok(()), // ODBC connections are tested at creation
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => Ok(()), // ODBC connections are tested at creation
         }
     }
 
@@ -570,17 +712,21 @@ impl TargetPoolImpl {
             Self::Postgres(p) => p.close().await,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => p.close().await,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => p.close().await,
         }
     }
 
     /// Get the underlying PostgreSQL pool (for transfer engine compatibility).
-    /// Returns None if not PostgreSQL.
+    /// Returns None if not PostgreSQL or is ODBC-based.
     pub fn as_postgres(&self) -> Option<Arc<PgPool>> {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => None,
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => None, // ODBC pools don't expose tokio-postgres interface
         }
     }
 
@@ -592,16 +738,18 @@ impl TargetPoolImpl {
             Self::Postgres(_) => None,
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(_) => None, // ODBC pools don't expose tiberius interface
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(_) => None,
         }
     }
 
-    /// Check if this is an ODBC-based target (for Kerberos).
+    /// Check if this is an ODBC-based target.
     #[cfg(feature = "kerberos")]
     pub fn is_odbc(&self) -> bool {
-        matches!(self, Self::OdbcMssql(_))
+        matches!(self, Self::OdbcMssql(_) | Self::OdbcPostgres(_))
     }
 
-    /// Check if this is an ODBC-based target (for Kerberos).
+    /// Check if this is an ODBC-based target.
     #[cfg(not(feature = "kerberos"))]
     pub fn is_odbc(&self) -> bool {
         false
@@ -615,6 +763,8 @@ impl Clone for SourcePoolImpl {
             Self::Postgres(p) => Self::Postgres(p.clone()),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => Self::OdbcMssql(p.clone()),
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => Self::OdbcPostgres(p.clone()),
         }
     }
 }
@@ -626,6 +776,8 @@ impl Clone for TargetPoolImpl {
             Self::Postgres(p) => Self::Postgres(p.clone()),
             #[cfg(feature = "kerberos")]
             Self::OdbcMssql(p) => Self::OdbcMssql(p.clone()),
+            #[cfg(feature = "kerberos")]
+            Self::OdbcPostgres(p) => Self::OdbcPostgres(p.clone()),
         }
     }
 }

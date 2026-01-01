@@ -1,22 +1,21 @@
-//! ODBC-based MSSQL source for Kerberos authentication.
+//! ODBC-based PostgreSQL source for Kerberos and ODBC authentication.
 //!
-//! This module provides an ODBC-based implementation of `SourcePool` that supports
-//! Kerberos/Windows Integrated Authentication via the Microsoft ODBC Driver for SQL Server.
+//! This module provides an ODBC-based implementation of `SourcePool` that supports:
+//! - Kerberos/GSSAPI Authentication (`auth: kerberos`)
+//! - ODBC Authentication with username/password (`auth: odbc`)
 //!
 //! **Requirements:**
 //! - The `kerberos` feature must be enabled
-//! - Microsoft ODBC Driver for SQL Server must be installed:
-//!   - Windows: Download from Microsoft (uses SSPI automatically)
-//!   - Linux: `apt install msodbcsql18` or `yum install msodbcsql18`
-//!   - macOS: `brew install msodbcsql18`
+//! - PostgreSQL ODBC Driver (psqlODBC) must be installed:
+//!   - Windows: Download from https://www.postgresql.org/ftp/odbc/versions/
+//!   - Linux: `apt install odbc-postgresql` or `yum install postgresql-odbc`
+//!   - macOS: `brew install psqlodbc`
 //!
-//! **Usage:**
+//! **Usage (Kerberos):**
 //! On Linux/macOS, obtain a Kerberos ticket before running:
 //! ```sh
 //! kinit user@REALM
 //! ```
-//!
-//! On Windows with domain-joined machines, authentication is automatic via SSPI.
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
@@ -30,8 +29,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-/// ODBC-based MSSQL source pool for Kerberos authentication.
-pub struct OdbcMssqlPool {
+/// ODBC-based PostgreSQL source pool.
+pub struct OdbcPgSourcePool {
     env: Arc<Environment>,
     connection_string: String,
     #[allow(dead_code)]
@@ -46,14 +45,14 @@ fn escape_sql_string(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Escape a SQL identifier for use in bracketed notation.
-/// Doubles right brackets: `Table]Name` -> `Table]]Name`
-fn escape_sql_ident(s: &str) -> String {
-    s.replace(']', "]]")
+/// Escape a PostgreSQL identifier for use in quoted notation.
+/// Doubles double quotes: `Table"Name` -> `Table""Name`
+fn escape_pg_ident(s: &str) -> String {
+    s.replace('"', "\"\"")
 }
 
-impl OdbcMssqlPool {
-    /// Create a new ODBC-based MSSQL source pool.
+impl OdbcPgSourcePool {
+    /// Create a new ODBC-based PostgreSQL source pool.
     ///
     /// # Errors
     ///
@@ -65,7 +64,7 @@ impl OdbcMssqlPool {
         Self::with_max_connections(config, 8).await
     }
 
-    /// Create a new ODBC-based MSSQL source pool with specified max connections.
+    /// Create a new ODBC-based PostgreSQL source pool with specified max connections.
     pub async fn with_max_connections(config: SourceConfig, _max_size: u32) -> Result<Self> {
         use crate::config::AuthMethod;
 
@@ -74,10 +73,10 @@ impl OdbcMssqlPool {
             MigrateError::pool_msg(
                 format!(
                     "Failed to create ODBC environment: {}. \
-                     Make sure the Microsoft ODBC Driver for SQL Server is installed. \
-                     Windows: Download from Microsoft. \
-                     Linux: apt install msodbcsql18. \
-                     macOS: brew install msodbcsql18.",
+                     Make sure the PostgreSQL ODBC Driver (psqlODBC) is installed. \
+                     Windows: Download from postgresql.org. \
+                     Linux: apt install odbc-postgresql. \
+                     macOS: brew install psqlodbc.",
                     e
                 ),
                 "ODBC connection"
@@ -87,63 +86,58 @@ impl OdbcMssqlPool {
         // Build connection string based on auth method
         let (connection_string, auth_desc) = match config.auth {
             AuthMethod::Kerberos => {
-                // Kerberos: use Trusted_Connection (Windows Integrated Auth)
+                // Kerberos: use GSSAPI authentication
                 let conn_str = format!(
-                    "Driver={{ODBC Driver 18 for SQL Server}};\
-                     Server={},{};\
+                    "Driver={{PostgreSQL Unicode}};\
+                     Server={};\
+                     Port={};\
                      Database={};\
-                     Trusted_Connection=yes;\
-                     Encrypt={};\
-                     TrustServerCertificate={};",
+                     UseKerberos=1;\
+                     SSLMode=prefer;",
                     config.host,
                     config.port,
                     config.database,
-                    if config.encrypt { "yes" } else { "no" },
-                    if config.trust_server_cert { "yes" } else { "no" },
                 );
                 (conn_str, "Kerberos")
             }
             AuthMethod::Odbc | AuthMethod::Native | AuthMethod::SqlServer => {
-                // SQL Server auth via ODBC: use UID/PWD
+                // Username/password auth via ODBC
                 let conn_str = format!(
-                    "Driver={{ODBC Driver 18 for SQL Server}};\
-                     Server={},{};\
+                    "Driver={{PostgreSQL Unicode}};\
+                     Server={};\
+                     Port={};\
                      Database={};\
-                     UID={};\
-                     PWD={};\
-                     Encrypt={};\
-                     TrustServerCertificate={};",
+                     Uid={};\
+                     Pwd={};\
+                     SSLMode=prefer;",
                     config.host,
                     config.port,
                     config.database,
                     config.user,
                     config.password,
-                    if config.encrypt { "yes" } else { "no" },
-                    if config.trust_server_cert { "yes" } else { "no" },
                 );
-                (conn_str, "SQL Server")
+                (conn_str, "ODBC")
             }
         };
 
         debug!(
-            "ODBC connection string (credentials hidden): Driver={{ODBC Driver 18 for SQL Server}};Server={},{};Database={};Auth={};...",
+            "PostgreSQL ODBC connection string (credentials hidden): Driver={{PostgreSQL Unicode}};Server={};Port={};Database={};Auth={};...",
             config.host, config.port, config.database, auth_desc
         );
 
-        // Test connection - use a scope so conn is dropped before we move env
+        // Test connection
         {
             let conn = env
                 .connect_with_connection_string(&connection_string, ConnectionOptions::default())
                 .map_err(|e| {
                     let help_msg = if config.auth == AuthMethod::Kerberos {
-                        "Ensure you have a valid Kerberos ticket (run 'kinit user@REALM' on Linux/macOS) \
-                         or are on a domain-joined Windows machine."
+                        "Ensure you have a valid Kerberos ticket (run 'kinit user@REALM' on Linux/macOS)."
                     } else {
                         "Check that the username and password are correct."
                     };
                     MigrateError::pool_msg(
                         format!(
-                            "Failed to connect to MSSQL via ODBC ({}): {}. {}",
+                            "Failed to connect to PostgreSQL via ODBC ({}): {}. {}",
                             auth_desc, e, help_msg
                         ),
                         "ODBC connection"
@@ -155,7 +149,7 @@ impl OdbcMssqlPool {
         }
 
         info!(
-            "Connected to MSSQL via ODBC ({}): {}:{}/{}",
+            "Connected to PostgreSQL via ODBC ({}): {}:{}/{}",
             auth_desc, config.host, config.port, config.database
         );
 
@@ -174,7 +168,7 @@ impl OdbcMssqlPool {
             .map_err(|e| MigrateError::pool_msg(format!("ODBC connection failed: {}", e), "getting ODBC connection"))
     }
 
-    /// Execute a query and return rows as Vec<Vec<String>>.
+    /// Execute a query and return rows as Vec<Vec<Option<String>>>.
     fn execute_query(&self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let conn = self.get_connection()?;
 
@@ -230,12 +224,10 @@ impl OdbcMssqlPool {
         if let Some(mut cursor) = conn.execute(sql, ()).map_err(|e| {
             MigrateError::transfer("ODBC query", format!("Query failed: {} - SQL: {}", e, sql))
         })? {
-            // Determine number of columns from result set
             let num_cols: usize = cursor.num_result_cols().map_err(|e| {
                 MigrateError::transfer("ODBC query", format!("Failed to get column count: {}", e))
             })? as usize;
 
-            // Create a buffer for fetching rows - larger buffer for data transfer
             let mut buffers =
                 TextRowSet::for_cursor(5000, &mut cursor, Some(65536)).map_err(|e| {
                     MigrateError::transfer("ODBC query", format!("Failed to create row buffer: {}", e))
@@ -251,12 +243,12 @@ impl OdbcMssqlPool {
                 for row_idx in 0..batch.num_rows() {
                     let mut row = Vec::with_capacity(num_cols);
                     for col_idx in 0..num_cols {
-                        let col_type = col_types.get(col_idx).map(|s| s.as_str()).unwrap_or("varchar");
+                        let col_type = col_types.get(col_idx).map(|s| s.as_str()).unwrap_or("text");
                         let text_value = batch
                             .at(col_idx, row_idx)
                             .map(|bytes| String::from_utf8_lossy(bytes).to_string());
 
-                        let value = convert_text_to_sqlvalue(text_value, col_type);
+                        let value = convert_pg_text_to_sqlvalue(text_value, col_type);
                         row.push(value);
                     }
                     result.push(row);
@@ -269,12 +261,12 @@ impl OdbcMssqlPool {
 
     /// Get the maximum primary key value for a table.
     pub fn get_max_pk_sync(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
-        let pk_ident = escape_sql_ident(pk_col);
-        let schema_ident = escape_sql_ident(schema);
-        let table_ident = escape_sql_ident(table);
+        let pk_ident = escape_pg_ident(pk_col);
+        let schema_ident = escape_pg_ident(schema);
+        let table_ident = escape_pg_ident(table);
 
         let sql = format!(
-            "SELECT CAST(MAX([{pk_ident}]) AS BIGINT) FROM [{schema_ident}].[{table_ident}] WITH (NOLOCK)"
+            r#"SELECT CAST(MAX("{pk_ident}") AS BIGINT) FROM "{schema_ident}"."{table_ident}""#
         );
 
         let rows = self.execute_query(&sql)?;
@@ -288,7 +280,6 @@ impl OdbcMssqlPool {
     }
 
     /// Async version of query_rows_fast.
-    /// Query rows with pre-computed column types for O(1) lookup per value.
     pub async fn query_rows_fast(
         &self,
         sql: &str,
@@ -300,34 +291,39 @@ impl OdbcMssqlPool {
     }
 
     /// Async version of get_max_pk.
-    /// Get the maximum primary key value for a table.
     pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
         let _lock = self.conn_mutex.lock().await;
         self.get_max_pk_sync(schema, table, pk_col)
     }
 
     fn load_columns_sync(&self, schema: &str, table_name: &str, table: &mut Table) -> Result<()> {
-        // Use escape_sql_ident for bracketed identifiers, escape_sql_string for string literals
-        let schema_ident = escape_sql_ident(schema);
-        let table_ident = escape_sql_ident(table_name);
         let schema_lit = escape_sql_string(schema);
         let table_lit = escape_sql_string(table_name);
 
         let sql = format!(
             r#"
             SELECT
-                COLUMN_NAME,
-                DATA_TYPE,
-                CAST(ISNULL(CHARACTER_MAXIMUM_LENGTH, 0) AS INT),
-                CAST(ISNULL(NUMERIC_PRECISION, 0) AS INT),
-                CAST(ISNULL(NUMERIC_SCALE, 0) AS INT),
-                CASE WHEN IS_NULLABLE = 'YES' THEN 1 ELSE 0 END,
-                COLUMNPROPERTY(OBJECT_ID('[{schema_ident}].[{table_ident}]'), COLUMN_NAME, 'IsIdentity'),
-                ORDINAL_POSITION
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = '{schema_lit}'
-                AND TABLE_NAME = '{table_lit}'
-            ORDER BY ORDINAL_POSITION
+                column_name,
+                udt_name,
+                COALESCE(character_maximum_length, 0)::int4,
+                COALESCE(numeric_precision, 0)::int4,
+                COALESCE(numeric_scale, 0)::int4,
+                CASE WHEN is_nullable = 'YES' THEN 1 ELSE 0 END,
+                COALESCE(
+                    (SELECT 1 FROM pg_catalog.pg_class c
+                     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = columns.table_schema
+                       AND c.relname = columns.table_name
+                       AND a.attname = columns.column_name
+                       AND a.attidentity IN ('a', 'd')),
+                    0
+                ) AS is_identity,
+                ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = '{schema_lit}'
+                AND table_name = '{table_lit}'
+            ORDER BY ordinal_position
             "#
         );
 
@@ -393,16 +389,16 @@ impl OdbcMssqlPool {
 
         let sql = format!(
             r#"
-            SELECT c.COLUMN_NAME
-            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
-                ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-                AND tc.TABLE_SCHEMA = c.TABLE_SCHEMA
-                AND tc.TABLE_NAME = c.TABLE_NAME
-            WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-                AND tc.TABLE_SCHEMA = '{schema_lit}'
-                AND tc.TABLE_NAME = '{table_lit}'
-            ORDER BY c.ORDINAL_POSITION
+            SELECT a.attname
+            FROM pg_catalog.pg_constraint c
+            JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid
+            WHERE n.nspname = '{schema_lit}'
+              AND t.relname = '{table_lit}'
+              AND c.contype = 'p'
+              AND a.attnum = ANY(c.conkey)
+            ORDER BY array_position(c.conkey, a.attnum)
             "#
         );
 
@@ -411,7 +407,6 @@ impl OdbcMssqlPool {
         for row in rows {
             if let Some(col_name) = row.get(0).and_then(|v| v.clone()) {
                 table.primary_key.push(col_name.clone());
-                // Also add to pk_columns
                 if let Some(col) = table.columns.iter().find(|c| c.name == col_name) {
                     table.pk_columns.push(col.clone());
                 }
@@ -423,7 +418,7 @@ impl OdbcMssqlPool {
 }
 
 #[async_trait]
-impl SourcePool for OdbcMssqlPool {
+impl SourcePool for OdbcPgSourcePool {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
         let _lock = self.conn_mutex.lock().await;
 
@@ -433,14 +428,14 @@ impl SourcePool for OdbcMssqlPool {
         let sql = format!(
             r#"
             SELECT
-                t.TABLE_NAME,
-                ISNULL(p.rows, 0) as row_count
-            FROM INFORMATION_SCHEMA.TABLES t
-            LEFT JOIN sys.partitions p ON p.object_id = OBJECT_ID(t.TABLE_SCHEMA + '.' + t.TABLE_NAME)
-                AND p.index_id IN (0, 1)
-            WHERE t.TABLE_SCHEMA = '{schema_lit}'
-                AND t.TABLE_TYPE = 'BASE TABLE'
-            ORDER BY t.TABLE_NAME
+                t.table_name,
+                COALESCE(c.reltuples::bigint, 0) as row_count
+            FROM information_schema.tables t
+            LEFT JOIN pg_catalog.pg_class c ON c.relname = t.table_name
+            LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.table_schema
+            WHERE t.table_schema = '{schema_lit}'
+                AND t.table_type = 'BASE TABLE'
+            ORDER BY t.table_name
             "#
         );
 
@@ -474,30 +469,29 @@ impl SourcePool for OdbcMssqlPool {
             // Load primary key
             self.load_primary_key_sync(schema, &table_name, &mut table)?;
 
-            // Estimate row size (simple heuristic: sum of column sizes)
+            // Estimate row size
             table.estimated_row_size = table
                 .columns
                 .iter()
                 .map(|c| match c.data_type.as_str() {
-                    "int" => 4,
-                    "bigint" => 8,
-                    "smallint" => 2,
-                    "tinyint" => 1,
-                    "bit" => 1,
-                    "float" => 8,
-                    "real" => 4,
-                    "datetime" | "datetime2" => 8,
-                    "date" => 3,
-                    "time" => 5,
-                    "uniqueidentifier" => 16,
-                    "varchar" | "nvarchar" | "char" | "nchar" => {
-                        if c.max_length == -1 {
+                    "int4" => 4,
+                    "int8" => 8,
+                    "int2" => 2,
+                    "bool" => 1,
+                    "float8" => 8,
+                    "float4" => 4,
+                    "timestamp" | "timestamptz" => 8,
+                    "date" => 4,
+                    "time" | "timetz" => 8,
+                    "uuid" => 16,
+                    "varchar" | "text" | "char" | "bpchar" => {
+                        if c.max_length == 0 {
                             100
                         } else {
                             c.max_length.min(100) as i64
                         }
                     }
-                    _ => 8, // default
+                    _ => 8,
                 })
                 .sum();
 
@@ -505,7 +499,7 @@ impl SourcePool for OdbcMssqlPool {
         }
 
         info!(
-            "Extracted {} tables from schema '{}' via ODBC",
+            "Extracted {} tables from schema '{}' via PostgreSQL ODBC",
             tables.len(),
             schema
         );
@@ -524,13 +518,13 @@ impl SourcePool for OdbcMssqlPool {
         }
 
         let pk_col = &table.primary_key[0];
-        let pk_ident = escape_sql_ident(pk_col);
-        let schema_ident = escape_sql_ident(&table.schema);
-        let table_ident = escape_sql_ident(&table.name);
+        let pk_ident = escape_pg_ident(pk_col);
+        let schema_ident = escape_pg_ident(&table.schema);
+        let table_ident = escape_pg_ident(&table.name);
 
         // Get min and max PK values
         let sql = format!(
-            "SELECT MIN([{pk_ident}]), MAX([{pk_ident}]) FROM [{schema_ident}].[{table_ident}]"
+            r#"SELECT MIN("{pk_ident}")::bigint, MAX("{pk_ident}")::bigint FROM "{schema_ident}"."{table_ident}""#
         );
 
         let rows = self.execute_query(&sql)?;
@@ -592,134 +586,153 @@ impl SourcePool for OdbcMssqlPool {
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
         let _lock = self.conn_mutex.lock().await;
 
-        let schema_ident = escape_sql_ident(&table.schema);
-        let table_ident = escape_sql_ident(&table.name);
+        let schema_lit = escape_sql_string(&table.schema);
+        let table_lit = escape_sql_string(&table.name);
 
         let sql = format!(
             r#"
             SELECT
-                i.name AS index_name,
-                i.is_unique,
-                i.type_desc,
-                c.name AS column_name,
-                ic.is_included_column
-            FROM sys.indexes i
-            INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-            INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-            WHERE i.object_id = OBJECT_ID('[{schema_ident}].[{table_ident}]')
-                AND i.is_primary_key = 0
-                AND i.type > 0
-            ORDER BY i.name, ic.key_ordinal
+                i.relname AS index_name,
+                ix.indisunique,
+                am.amname,
+                array_to_string(array_agg(a.attname ORDER BY array_position(ix.indkey, a.attnum)), ',') AS columns
+            FROM pg_catalog.pg_class t
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_catalog.pg_index ix ON t.oid = ix.indrelid
+            JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_catalog.pg_am am ON am.oid = i.relam
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+            WHERE n.nspname = '{schema_lit}'
+              AND t.relname = '{table_lit}'
+              AND NOT ix.indisprimary
+            GROUP BY i.relname, ix.indisunique, am.amname
+            ORDER BY i.relname
             "#
         );
 
         let rows = self.execute_query(&sql)?;
-
-        let mut indexes: std::collections::HashMap<String, Index> =
-            std::collections::HashMap::new();
 
         for row in rows {
             let index_name = row.get(0).and_then(|v| v.clone()).unwrap_or_default();
             let is_unique: bool = row
                 .get(1)
                 .and_then(|v| v.as_ref())
-                .map(|s| s == "1" || s.to_lowercase() == "true")
+                .map(|s| s == "t" || s == "true" || s == "1")
                 .unwrap_or(false);
-            let type_desc = row.get(2).and_then(|v| v.clone()).unwrap_or_default();
-            let column_name = row.get(3).and_then(|v| v.clone()).unwrap_or_default();
-            let is_included: bool = row
-                .get(4)
-                .and_then(|v| v.as_ref())
-                .map(|s| s == "1" || s.to_lowercase() == "true")
-                .unwrap_or(false);
+            let _am_name = row.get(2).and_then(|v| v.clone()).unwrap_or_default();
+            let columns_str = row.get(3).and_then(|v| v.clone()).unwrap_or_default();
 
-            let index = indexes.entry(index_name.clone()).or_insert_with(|| Index {
+            table.indexes.push(Index {
                 name: index_name,
                 is_unique,
-                is_clustered: type_desc == "CLUSTERED",
-                columns: Vec::new(),
-                include_cols: Vec::new(),
+                is_clustered: false, // PostgreSQL doesn't have clustered indexes like MSSQL
+                columns: columns_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+                include_cols: Vec::new(), // PostgreSQL INCLUDE columns require different query
             });
-
-            if is_included {
-                index.include_cols.push(column_name);
-            } else {
-                index.columns.push(column_name);
-            }
         }
 
-        table.indexes = indexes.into_values().collect();
         Ok(())
     }
 
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
         let _lock = self.conn_mutex.lock().await;
 
-        let schema_ident = escape_sql_ident(&table.schema);
-        let table_ident = escape_sql_ident(&table.name);
+        let schema_lit = escape_sql_string(&table.schema);
+        let table_lit = escape_sql_string(&table.name);
 
         let sql = format!(
             r#"
             SELECT
-                fk.name AS fk_name,
-                COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS column_name,
-                OBJECT_SCHEMA_NAME(fkc.referenced_object_id) AS ref_schema,
-                OBJECT_NAME(fkc.referenced_object_id) AS ref_table,
-                COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS ref_column,
-                fk.delete_referential_action_desc,
-                fk.update_referential_action_desc
-            FROM sys.foreign_keys fk
-            INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-            WHERE fk.parent_object_id = OBJECT_ID('[{schema_ident}].[{table_ident}]')
-            ORDER BY fk.name, fkc.constraint_column_id
+                c.conname AS fk_name,
+                array_to_string(array_agg(a.attname ORDER BY array_position(c.conkey, a.attnum)), ',') AS columns,
+                rn.nspname AS ref_schema,
+                rc.relname AS ref_table,
+                array_to_string(array_agg(ra.attname ORDER BY array_position(c.confkey, ra.attnum)), ',') AS ref_columns,
+                CASE c.confdeltype
+                    WHEN 'a' THEN 'NO_ACTION'
+                    WHEN 'r' THEN 'RESTRICT'
+                    WHEN 'c' THEN 'CASCADE'
+                    WHEN 'n' THEN 'SET_NULL'
+                    WHEN 'd' THEN 'SET_DEFAULT'
+                    ELSE 'NO_ACTION'
+                END AS on_delete,
+                CASE c.confupdtype
+                    WHEN 'a' THEN 'NO_ACTION'
+                    WHEN 'r' THEN 'RESTRICT'
+                    WHEN 'c' THEN 'CASCADE'
+                    WHEN 'n' THEN 'SET_NULL'
+                    WHEN 'd' THEN 'SET_DEFAULT'
+                    ELSE 'NO_ACTION'
+                END AS on_update
+            FROM pg_catalog.pg_constraint c
+            JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_catalog.pg_class rc ON rc.oid = c.confrelid
+            JOIN pg_catalog.pg_namespace rn ON rn.oid = rc.relnamespace
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+            JOIN pg_catalog.pg_attribute ra ON ra.attrelid = rc.oid AND ra.attnum = ANY(c.confkey)
+            WHERE n.nspname = '{schema_lit}'
+              AND t.relname = '{table_lit}'
+              AND c.contype = 'f'
+            GROUP BY c.conname, rn.nspname, rc.relname, c.confdeltype, c.confupdtype
+            ORDER BY c.conname
             "#
         );
 
         let rows = self.execute_query(&sql)?;
 
-        let mut fks: std::collections::HashMap<String, ForeignKey> =
-            std::collections::HashMap::new();
-
         for row in rows {
             let fk_name = row.get(0).and_then(|v| v.clone()).unwrap_or_default();
-            let column_name = row.get(1).and_then(|v| v.clone()).unwrap_or_default();
+            let columns_str = row.get(1).and_then(|v| v.clone()).unwrap_or_default();
             let ref_schema = row.get(2).and_then(|v| v.clone()).unwrap_or_default();
             let ref_table = row.get(3).and_then(|v| v.clone()).unwrap_or_default();
-            let ref_column = row.get(4).and_then(|v| v.clone()).unwrap_or_default();
+            let ref_columns_str = row.get(4).and_then(|v| v.clone()).unwrap_or_default();
             let on_delete = row.get(5).and_then(|v| v.clone()).unwrap_or_default();
             let on_update = row.get(6).and_then(|v| v.clone()).unwrap_or_default();
 
-            let fk = fks.entry(fk_name.clone()).or_insert_with(|| ForeignKey {
+            table.foreign_keys.push(ForeignKey {
                 name: fk_name,
-                columns: Vec::new(),
+                columns: columns_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
                 ref_schema,
                 ref_table,
-                ref_columns: Vec::new(),
+                ref_columns: ref_columns_str
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
                 on_delete,
                 on_update,
             });
-
-            fk.columns.push(column_name);
-            fk.ref_columns.push(ref_column);
         }
 
-        table.foreign_keys = fks.into_values().collect();
         Ok(())
     }
 
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
         let _lock = self.conn_mutex.lock().await;
 
-        let schema_ident = escape_sql_ident(&table.schema);
-        let table_ident = escape_sql_ident(&table.name);
+        let schema_lit = escape_sql_string(&table.schema);
+        let table_lit = escape_sql_string(&table.name);
 
         let sql = format!(
             r#"
             SELECT
-                cc.name AS constraint_name,
-                cc.definition
-            FROM sys.check_constraints cc
-            WHERE cc.parent_object_id = OBJECT_ID('[{schema_ident}].[{table_ident}]')
+                c.conname AS constraint_name,
+                pg_get_constraintdef(c.oid) AS definition
+            FROM pg_catalog.pg_constraint c
+            JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = '{schema_lit}'
+              AND t.relname = '{table_lit}'
+              AND c.contype = 'c'
             "#
         );
 
@@ -738,10 +751,10 @@ impl SourcePool for OdbcMssqlPool {
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         let _lock = self.conn_mutex.lock().await;
 
-        let schema_ident = escape_sql_ident(schema);
-        let table_ident = escape_sql_ident(table);
+        let schema_ident = escape_pg_ident(schema);
+        let table_ident = escape_pg_ident(table);
 
-        let sql = format!("SELECT COUNT(*) FROM [{schema_ident}].[{table_ident}]");
+        let sql = format!(r#"SELECT COUNT(*)::bigint FROM "{schema_ident}"."{table_ident}""#);
 
         let rows = self.execute_query(&sql)?;
 
@@ -754,7 +767,7 @@ impl SourcePool for OdbcMssqlPool {
     }
 
     fn db_type(&self) -> &str {
-        "mssql"
+        "postgres"
     }
 
     async fn close(&self) {
@@ -762,23 +775,22 @@ impl SourcePool for OdbcMssqlPool {
     }
 }
 
-/// Convert a text value from ODBC to SqlValue based on the column type.
-fn convert_text_to_sqlvalue(text: Option<String>, data_type: &str) -> SqlValue {
+/// Convert a text value from ODBC to SqlValue based on PostgreSQL column type.
+fn convert_pg_text_to_sqlvalue(text: Option<String>, data_type: &str) -> SqlValue {
     let Some(s) = text else {
-        // Return appropriate null type based on data type
         return match data_type.to_lowercase().as_str() {
-            "bit" => SqlValue::Null(SqlNullType::Bool),
-            "tinyint" | "smallint" => SqlValue::Null(SqlNullType::I16),
-            "int" => SqlValue::Null(SqlNullType::I32),
-            "bigint" => SqlValue::Null(SqlNullType::I64),
-            "real" => SqlValue::Null(SqlNullType::F32),
-            "float" => SqlValue::Null(SqlNullType::F64),
-            "uniqueidentifier" => SqlValue::Null(SqlNullType::Uuid),
-            "datetime" | "datetime2" | "smalldatetime" => SqlValue::Null(SqlNullType::DateTime),
+            "bool" => SqlValue::Null(SqlNullType::Bool),
+            "int2" => SqlValue::Null(SqlNullType::I16),
+            "int4" => SqlValue::Null(SqlNullType::I32),
+            "int8" => SqlValue::Null(SqlNullType::I64),
+            "float4" => SqlValue::Null(SqlNullType::F32),
+            "float8" => SqlValue::Null(SqlNullType::F64),
+            "uuid" => SqlValue::Null(SqlNullType::Uuid),
+            "timestamp" | "timestamptz" => SqlValue::Null(SqlNullType::DateTime),
             "date" => SqlValue::Null(SqlNullType::Date),
-            "time" => SqlValue::Null(SqlNullType::Time),
-            "binary" | "varbinary" | "image" => SqlValue::Null(SqlNullType::Bytes),
-            "decimal" | "numeric" | "money" | "smallmoney" => SqlValue::Null(SqlNullType::Decimal),
+            "time" | "timetz" => SqlValue::Null(SqlNullType::Time),
+            "bytea" => SqlValue::Null(SqlNullType::Bytes),
+            "numeric" | "decimal" | "money" => SqlValue::Null(SqlNullType::Decimal),
             _ => SqlValue::Null(SqlNullType::String),
         };
     };
@@ -786,41 +798,35 @@ fn convert_text_to_sqlvalue(text: Option<String>, data_type: &str) -> SqlValue {
     let dt = data_type.to_lowercase();
 
     match dt.as_str() {
-        "bit" => match s.as_str() {
-            "1" | "true" | "True" | "TRUE" => SqlValue::Bool(true),
-            "0" | "false" | "False" | "FALSE" => SqlValue::Bool(false),
+        "bool" => match s.as_str() {
+            "t" | "true" | "1" | "yes" | "on" => SqlValue::Bool(true),
+            "f" | "false" | "0" | "no" | "off" => SqlValue::Bool(false),
             _ => SqlValue::Bool(s.parse().unwrap_or(false)),
         },
-        "tinyint" => s
-            .parse::<u8>()
-            .map(|v| SqlValue::I16(v as i16))
-            .unwrap_or(SqlValue::Null(SqlNullType::I16)),
-        "smallint" => s
+        "int2" => s
             .parse::<i16>()
             .map(SqlValue::I16)
             .unwrap_or(SqlValue::Null(SqlNullType::I16)),
-        "int" => s
+        "int4" => s
             .parse::<i32>()
             .map(SqlValue::I32)
             .unwrap_or(SqlValue::Null(SqlNullType::I32)),
-        "bigint" => s
+        "int8" => s
             .parse::<i64>()
             .map(SqlValue::I64)
             .unwrap_or(SqlValue::Null(SqlNullType::I64)),
-        "real" => s
+        "float4" => s
             .parse::<f32>()
             .map(SqlValue::F32)
             .unwrap_or(SqlValue::Null(SqlNullType::F32)),
-        "float" => s
+        "float8" => s
             .parse::<f64>()
             .map(SqlValue::F64)
             .unwrap_or(SqlValue::Null(SqlNullType::F64)),
-        "uniqueidentifier" => uuid::Uuid::parse_str(&s)
+        "uuid" => uuid::Uuid::parse_str(&s)
             .map(SqlValue::Uuid)
             .unwrap_or(SqlValue::Null(SqlNullType::Uuid)),
-        "datetime" | "datetime2" | "smalldatetime" => {
-            // ODBC typically returns datetime in format: "2023-01-15 10:30:45.123"
-            // Try multiple formats
+        "timestamp" | "timestamptz" => {
             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
                 .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S"))
                 .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
@@ -831,44 +837,36 @@ fn convert_text_to_sqlvalue(text: Option<String>, data_type: &str) -> SqlValue {
         "date" => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
             .map(SqlValue::Date)
             .unwrap_or(SqlValue::Null(SqlNullType::Date)),
-        "time" => chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
+        "time" | "timetz" => chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")
             .or_else(|_| chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S"))
             .map(SqlValue::Time)
             .unwrap_or(SqlValue::Null(SqlNullType::Time)),
-        "binary" | "varbinary" | "image" => {
-            // ODBC returns binary as hex string (e.g., "0xDEADBEEF" or just hex digits)
-            let hex_str = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(&s);
+        "bytea" => {
+            // PostgreSQL bytea in hex format: \x followed by hex digits
+            let hex_str = s.strip_prefix("\\x").unwrap_or(&s);
             hex::decode(hex_str)
                 .map(SqlValue::Bytes)
                 .unwrap_or_else(|_| SqlValue::Bytes(s.into_bytes()))
         }
-        "decimal" | "numeric" | "money" | "smallmoney" => {
-            // Remove currency symbols and commas that might be present for money types
+        "numeric" | "decimal" | "money" => {
             let cleaned = s.replace(['$', ','], "");
             rust_decimal::Decimal::from_str_exact(&cleaned)
                 .or_else(|_| cleaned.parse::<rust_decimal::Decimal>())
                 .map(SqlValue::Decimal)
                 .unwrap_or_else(|_| {
-                    // Fallback to f64
                     cleaned
                         .parse::<f64>()
                         .map(SqlValue::F64)
                         .unwrap_or(SqlValue::Null(SqlNullType::Decimal))
                 })
         }
-        _ => {
-            // Default: treat as string
-            SqlValue::String(s)
-        }
+        _ => SqlValue::String(s),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, Timelike};
-
-    // === escape_sql_string tests ===
 
     #[test]
     fn test_escape_sql_string_no_quotes() {
@@ -881,213 +879,44 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_sql_string_multiple_quotes() {
-        assert_eq!(escape_sql_string("It's a 'test'"), "It''s a ''test''");
+    fn test_escape_pg_ident_no_quotes() {
+        assert_eq!(escape_pg_ident("TableName"), "TableName");
     }
 
     #[test]
-    fn test_escape_sql_string_empty() {
-        assert_eq!(escape_sql_string(""), "");
+    fn test_escape_pg_ident_with_quote() {
+        assert_eq!(escape_pg_ident("Table\"Name"), "Table\"\"Name");
     }
 
     #[test]
-    fn test_escape_sql_string_sql_injection_attempt() {
-        // Attempt: '; DROP TABLE users; --
-        let malicious = "'; DROP TABLE users; --";
-        let escaped = escape_sql_string(malicious);
-        assert_eq!(escaped, "''; DROP TABLE users; --");
-        // The doubled quote prevents the injection
-    }
-
-    // === escape_sql_ident tests ===
-
-    #[test]
-    fn test_escape_sql_ident_no_brackets() {
-        assert_eq!(escape_sql_ident("TableName"), "TableName");
+    fn test_convert_pg_null_values() {
+        assert!(matches!(convert_pg_text_to_sqlvalue(None, "int4"), SqlValue::Null(SqlNullType::I32)));
+        assert!(matches!(convert_pg_text_to_sqlvalue(None, "int8"), SqlValue::Null(SqlNullType::I64)));
+        assert!(matches!(convert_pg_text_to_sqlvalue(None, "text"), SqlValue::Null(SqlNullType::String)));
+        assert!(matches!(convert_pg_text_to_sqlvalue(None, "bool"), SqlValue::Null(SqlNullType::Bool)));
     }
 
     #[test]
-    fn test_escape_sql_ident_with_bracket() {
-        assert_eq!(escape_sql_ident("Table]Name"), "Table]]Name");
+    fn test_convert_pg_bool_values() {
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("t".into()), "bool"), SqlValue::Bool(true));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("f".into()), "bool"), SqlValue::Bool(false));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("true".into()), "bool"), SqlValue::Bool(true));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("false".into()), "bool"), SqlValue::Bool(false));
     }
 
     #[test]
-    fn test_escape_sql_ident_multiple_brackets() {
-        assert_eq!(escape_sql_ident("a]b]c"), "a]]b]]c");
+    fn test_convert_pg_integer_values() {
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("42".into()), "int4"), SqlValue::I32(42));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("-100".into()), "int4"), SqlValue::I32(-100));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("9223372036854775807".into()), "int8"), SqlValue::I64(i64::MAX));
+        assert_eq!(convert_pg_text_to_sqlvalue(Some("-32768".into()), "int2"), SqlValue::I16(-32768));
     }
 
     #[test]
-    fn test_escape_sql_ident_empty() {
-        assert_eq!(escape_sql_ident(""), "");
-    }
-
-    // === convert_text_to_sqlvalue tests ===
-
-    #[test]
-    fn test_convert_null_values() {
-        // Null for various types
-        assert!(matches!(convert_text_to_sqlvalue(None, "int"), SqlValue::Null(SqlNullType::I32)));
-        assert!(matches!(convert_text_to_sqlvalue(None, "bigint"), SqlValue::Null(SqlNullType::I64)));
-        assert!(matches!(convert_text_to_sqlvalue(None, "varchar"), SqlValue::Null(SqlNullType::String)));
-        assert!(matches!(convert_text_to_sqlvalue(None, "bit"), SqlValue::Null(SqlNullType::Bool)));
-        assert!(matches!(convert_text_to_sqlvalue(None, "datetime"), SqlValue::Null(SqlNullType::DateTime)));
-    }
-
-    #[test]
-    fn test_convert_bit_values() {
-        assert_eq!(convert_text_to_sqlvalue(Some("1".into()), "bit"), SqlValue::Bool(true));
-        assert_eq!(convert_text_to_sqlvalue(Some("0".into()), "bit"), SqlValue::Bool(false));
-        assert_eq!(convert_text_to_sqlvalue(Some("true".into()), "bit"), SqlValue::Bool(true));
-        assert_eq!(convert_text_to_sqlvalue(Some("false".into()), "bit"), SqlValue::Bool(false));
-        assert_eq!(convert_text_to_sqlvalue(Some("TRUE".into()), "bit"), SqlValue::Bool(true));
-        assert_eq!(convert_text_to_sqlvalue(Some("FALSE".into()), "bit"), SqlValue::Bool(false));
-    }
-
-    #[test]
-    fn test_convert_integer_values() {
-        assert_eq!(convert_text_to_sqlvalue(Some("42".into()), "int"), SqlValue::I32(42));
-        assert_eq!(convert_text_to_sqlvalue(Some("-100".into()), "int"), SqlValue::I32(-100));
-        assert_eq!(convert_text_to_sqlvalue(Some("9223372036854775807".into()), "bigint"), SqlValue::I64(i64::MAX));
-        assert_eq!(convert_text_to_sqlvalue(Some("255".into()), "tinyint"), SqlValue::I16(255));
-        assert_eq!(convert_text_to_sqlvalue(Some("-32768".into()), "smallint"), SqlValue::I16(-32768));
-    }
-
-    #[test]
-    fn test_convert_float_values() {
-        assert_eq!(convert_text_to_sqlvalue(Some("3.14".into()), "real"), SqlValue::F32(3.14));
-        assert_eq!(convert_text_to_sqlvalue(Some("2.718281828".into()), "float"), SqlValue::F64(2.718281828));
-    }
-
-    #[test]
-    fn test_convert_string_values() {
+    fn test_convert_pg_string_values() {
         assert_eq!(
-            convert_text_to_sqlvalue(Some("Hello World".into()), "varchar"),
+            convert_pg_text_to_sqlvalue(Some("Hello World".into()), "text"),
             SqlValue::String("Hello World".into())
         );
-        assert_eq!(
-            convert_text_to_sqlvalue(Some("Unicode: 日本語".into()), "nvarchar"),
-            SqlValue::String("Unicode: 日本語".into())
-        );
-    }
-
-    #[test]
-    fn test_convert_datetime_values() {
-        let dt = convert_text_to_sqlvalue(Some("2023-12-25 10:30:45.123".into()), "datetime");
-        match dt {
-            SqlValue::DateTime(ndt) => {
-                assert_eq!(ndt.year(), 2023);
-                assert_eq!(ndt.month(), 12);
-                assert_eq!(ndt.day(), 25);
-                assert_eq!(ndt.hour(), 10);
-                assert_eq!(ndt.minute(), 30);
-            }
-            _ => panic!("Expected DateTime"),
-        }
-
-        // Test ISO format
-        let dt2 = convert_text_to_sqlvalue(Some("2023-12-25T10:30:45".into()), "datetime2");
-        assert!(matches!(dt2, SqlValue::DateTime(_)));
-    }
-
-    #[test]
-    fn test_convert_date_values() {
-        let d = convert_text_to_sqlvalue(Some("2023-12-25".into()), "date");
-        match d {
-            SqlValue::Date(nd) => {
-                assert_eq!(nd.year(), 2023);
-                assert_eq!(nd.month(), 12);
-                assert_eq!(nd.day(), 25);
-            }
-            _ => panic!("Expected Date"),
-        }
-    }
-
-    #[test]
-    fn test_convert_time_values() {
-        let t = convert_text_to_sqlvalue(Some("14:30:45.123".into()), "time");
-        match t {
-            SqlValue::Time(nt) => {
-                assert_eq!(nt.hour(), 14);
-                assert_eq!(nt.minute(), 30);
-                assert_eq!(nt.second(), 45);
-            }
-            _ => panic!("Expected Time"),
-        }
-    }
-
-    #[test]
-    fn test_convert_uuid_values() {
-        let u = convert_text_to_sqlvalue(
-            Some("550e8400-e29b-41d4-a716-446655440000".into()),
-            "uniqueidentifier",
-        );
-        match u {
-            SqlValue::Uuid(uuid) => {
-                assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
-            }
-            _ => panic!("Expected Uuid"),
-        }
-    }
-
-    #[test]
-    fn test_convert_binary_values() {
-        // With 0x prefix
-        let b = convert_text_to_sqlvalue(Some("0xDEADBEEF".into()), "varbinary");
-        match b {
-            SqlValue::Bytes(bytes) => {
-                assert_eq!(bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-            }
-            _ => panic!("Expected Bytes"),
-        }
-
-        // Without prefix
-        let b2 = convert_text_to_sqlvalue(Some("CAFEBABE".into()), "binary");
-        match b2 {
-            SqlValue::Bytes(bytes) => {
-                assert_eq!(bytes, vec![0xCA, 0xFE, 0xBA, 0xBE]);
-            }
-            _ => panic!("Expected Bytes"),
-        }
-    }
-
-    #[test]
-    fn test_convert_decimal_values() {
-        let d = convert_text_to_sqlvalue(Some("123.456".into()), "decimal");
-        match d {
-            SqlValue::Decimal(dec) => {
-                assert_eq!(dec.to_string(), "123.456");
-            }
-            _ => panic!("Expected Decimal"),
-        }
-
-        // Money with currency symbol
-        let m = convert_text_to_sqlvalue(Some("$1,234.56".into()), "money");
-        match m {
-            SqlValue::Decimal(dec) => {
-                assert_eq!(dec.to_string(), "1234.56");
-            }
-            _ => panic!("Expected Decimal for money"),
-        }
-    }
-
-    #[test]
-    fn test_convert_invalid_values_return_null() {
-        // Invalid int
-        assert!(matches!(
-            convert_text_to_sqlvalue(Some("not_a_number".into()), "int"),
-            SqlValue::Null(SqlNullType::I32)
-        ));
-
-        // Invalid uuid
-        assert!(matches!(
-            convert_text_to_sqlvalue(Some("not-a-uuid".into()), "uniqueidentifier"),
-            SqlValue::Null(SqlNullType::Uuid)
-        ));
-
-        // Invalid date
-        assert!(matches!(
-            convert_text_to_sqlvalue(Some("not-a-date".into()), "date"),
-            SqlValue::Null(SqlNullType::Date)
-        ));
     }
 }

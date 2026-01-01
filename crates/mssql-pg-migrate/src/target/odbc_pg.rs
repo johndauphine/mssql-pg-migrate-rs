@@ -1,57 +1,41 @@
-//! ODBC-based MSSQL target for Kerberos and SQL Server authentication.
+//! ODBC-based PostgreSQL target for Kerberos and ODBC authentication.
 //!
 //! This module provides an ODBC-based implementation of `TargetPool` that supports:
-//! - Kerberos/Windows Integrated Authentication (`auth: kerberos`)
-//! - SQL Server Authentication via ODBC (`auth: odbc`)
+//! - Kerberos/GSSAPI Authentication (`auth: kerberos`)
+//! - ODBC Authentication with username/password (`auth: odbc`)
 //!
 //! **Requirements:**
 //! - The `kerberos` feature must be enabled
-//! - Microsoft ODBC Driver for SQL Server must be installed:
-//!   - Windows: Download from Microsoft (uses SSPI automatically for Kerberos)
-//!   - Linux: `apt install msodbcsql18` or `yum install msodbcsql18`
-//!   - macOS: `brew install msodbcsql18`
-//!
-//! **Usage (Kerberos):**
-//! On Linux/macOS, obtain a Kerberos ticket before running:
-//! ```sh
-//! kinit user@REALM
-//! ```
-//!
-//! On Windows with domain-joined machines, authentication is automatic via SSPI.
-//!
-//! **Usage (SQL Server auth via ODBC):**
-//! Set `auth: odbc` in the config and provide username/password.
+//! - PostgreSQL ODBC Driver (psqlODBC) must be installed:
+//!   - Windows: Download from https://www.postgresql.org/ftp/odbc/versions/
+//!   - Linux: `apt install odbc-postgresql` or `yum install postgresql-odbc`
+//!   - macOS: `brew install psqlodbc`
 //!
 //! **Performance Notes:**
-//! ODBC does not support TDS bulk insert, so this implementation uses parameterized
-//! batch INSERT statements. While slower than TDS bulk insert (~10-30K rows/sec vs
-//! ~70K+ rows/sec), it still provides reasonable performance for most workloads.
+//! ODBC does not support the PostgreSQL COPY protocol, so this implementation uses
+//! batched INSERT statements. While slower than COPY (~10-30K rows/sec vs ~100K+ rows/sec),
+//! it still provides reasonable performance for most workloads.
 
 use crate::config::TargetConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
 use crate::target::{SqlValue, TargetPool};
-use crate::typemap::postgres_to_mssql;
+use crate::typemap::mssql_to_postgres;
 use async_trait::async_trait;
 use odbc_api::{ConnectionOptions, Cursor, Environment, ResultSetMetadata};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-/// Maximum number of parameters per ODBC batch (MSSQL limit is 2100).
-const MAX_PARAMS_PER_BATCH: usize = 2100;
-
-/// Maximum rows per INSERT VALUES clause (MSSQL limit is 1000).
+/// Maximum rows per INSERT VALUES clause (PostgreSQL doesn't have a hard limit,
+/// but we batch for memory efficiency).
 const MAX_ROWS_PER_INSERT: usize = 1000;
 
-/// Maximum number of retry attempts for deadlock errors.
-const DEADLOCK_MAX_RETRIES: u32 = 5;
+/// Maximum number of parameters per query (avoid excessive memory usage).
+const MAX_PARAMS_PER_BATCH: usize = 32000;
 
-/// Base delay between deadlock retry attempts in milliseconds.
-const DEADLOCK_RETRY_DELAY_MS: u64 = 200;
-
-/// ODBC-based MSSQL target pool for Kerberos authentication.
-pub struct OdbcMssqlTargetPool {
+/// ODBC-based PostgreSQL target pool.
+pub struct OdbcPgTargetPool {
     env: Arc<Environment>,
     connection_string: String,
     #[allow(dead_code)]
@@ -60,8 +44,8 @@ pub struct OdbcMssqlTargetPool {
     conn_mutex: Mutex<()>,
 }
 
-impl OdbcMssqlTargetPool {
-    /// Create a new ODBC-based MSSQL target pool.
+impl OdbcPgTargetPool {
+    /// Create a new ODBC-based PostgreSQL target pool.
     ///
     /// # Errors
     ///
@@ -71,17 +55,16 @@ impl OdbcMssqlTargetPool {
     pub async fn new(config: &TargetConfig, _max_conns: u32) -> Result<Self> {
         use crate::config::AuthMethod;
 
-        // Create ODBC environment - this will fail if ODBC is not installed
+        // Create ODBC environment
         let env = Environment::new().map_err(|e| {
             MigrateError::pool_msg(
                 format!(
                     "Failed to create ODBC environment: {}.\n\n\
-                     ODBC authentication requires the Microsoft ODBC Driver for SQL Server.\n\
+                     ODBC authentication requires the PostgreSQL ODBC Driver (psqlODBC).\n\
                      Please install it:\n\
-                     - Windows: Download from Microsoft\n\
-                     - Linux: apt install msodbcsql18 (or yum install msodbcsql18)\n\
-                     - macOS: brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release && \
-                              brew install msodbcsql18",
+                     - Windows: Download from postgresql.org/ftp/odbc/versions\n\
+                     - Linux: apt install odbc-postgresql (or yum install postgresql-odbc)\n\
+                     - macOS: brew install psqlodbc",
                     e
                 ),
                 "ODBC connection",
@@ -91,46 +74,44 @@ impl OdbcMssqlTargetPool {
         // Build connection string based on auth method
         let (connection_string, auth_desc) = match config.auth {
             AuthMethod::Kerberos => {
-                // Kerberos: use Trusted_Connection (Windows Integrated Auth)
+                // Kerberos: use GSSAPI authentication
                 let conn_str = format!(
-                    "Driver={{ODBC Driver 18 for SQL Server}};\
-                     Server={},{};\
+                    "Driver={{PostgreSQL Unicode}};\
+                     Server={};\
+                     Port={};\
                      Database={};\
-                     Trusted_Connection=yes;\
-                     Encrypt={};\
-                     TrustServerCertificate={};",
+                     UseKerberos=1;\
+                     SSLMode={};",
                     config.host,
                     config.port,
                     config.database,
-                    if config.encrypt { "yes" } else { "no" },
-                    if config.trust_server_cert { "yes" } else { "no" },
+                    &config.ssl_mode,
                 );
                 (conn_str, "Kerberos")
             }
             AuthMethod::Odbc | AuthMethod::Native | AuthMethod::SqlServer => {
-                // SQL Server auth via ODBC: use UID/PWD
+                // Username/password auth via ODBC
                 let conn_str = format!(
-                    "Driver={{ODBC Driver 18 for SQL Server}};\
-                     Server={},{};\
+                    "Driver={{PostgreSQL Unicode}};\
+                     Server={};\
+                     Port={};\
                      Database={};\
-                     UID={};\
-                     PWD={};\
-                     Encrypt={};\
-                     TrustServerCertificate={};",
+                     Uid={};\
+                     Pwd={};\
+                     SSLMode={};",
                     config.host,
                     config.port,
                     config.database,
                     config.user,
                     config.password,
-                    if config.encrypt { "yes" } else { "no" },
-                    if config.trust_server_cert { "yes" } else { "no" },
+                    &config.ssl_mode,
                 );
-                (conn_str, "SQL Server")
+                (conn_str, "ODBC")
             }
         };
 
         debug!(
-            "ODBC target connection string (credentials hidden): Driver={{ODBC Driver 18 for SQL Server}};Server={},{};Database={};Auth={};...",
+            "PostgreSQL ODBC target connection string (credentials hidden): Driver={{PostgreSQL Unicode}};Server={};Port={};Database={};Auth={};...",
             config.host, config.port, config.database, auth_desc
         );
 
@@ -141,14 +122,13 @@ impl OdbcMssqlTargetPool {
                 .map_err(|e| {
                     let help_msg = if config.auth == AuthMethod::Kerberos {
                         "Ensure you have a valid Kerberos ticket:\n\
-                         - Linux/macOS: Run 'kinit user@REALM' before running the migration\n\
-                         - Windows: Be on a domain-joined machine or use 'runas /netonly'"
+                         - Linux/macOS: Run 'kinit user@REALM' before running the migration"
                     } else {
                         "Check that the username and password are correct."
                     };
                     MigrateError::pool_msg(
                         format!(
-                            "Failed to connect to MSSQL target via ODBC ({}): {}.\n\n{}",
+                            "Failed to connect to PostgreSQL target via ODBC ({}): {}.\n\n{}",
                             auth_desc, e, help_msg
                         ),
                         "ODBC connection",
@@ -160,7 +140,7 @@ impl OdbcMssqlTargetPool {
         }
 
         info!(
-            "Connected to MSSQL target via ODBC ({}): {}:{}/{}",
+            "Connected to PostgreSQL target via ODBC ({}): {}:{}/{}",
             auth_desc, config.host, config.port, config.database
         );
 
@@ -245,9 +225,9 @@ impl OdbcMssqlTargetPool {
         Ok(value > 0)
     }
 
-    /// Quote an MSSQL identifier with brackets.
+    /// Quote a PostgreSQL identifier with double quotes.
     fn quote_ident(name: &str) -> String {
-        format!("[{}]", name.replace(']', "]]"))
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 
     /// Qualify a table name with schema.
@@ -255,159 +235,76 @@ impl OdbcMssqlTargetPool {
         format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
     }
 
-    /// Check if a data type is an MSSQL native type.
-    fn is_mssql_type(data_type: &str) -> bool {
+    /// Check if a data type is a PostgreSQL native type.
+    fn is_pg_type(data_type: &str) -> bool {
         let lower = data_type.to_lowercase();
         matches!(
             lower.as_str(),
-            "bigint"
-                | "int"
+            "int2"
+                | "int4"
+                | "int8"
                 | "smallint"
-                | "tinyint"
-                | "bit"
-                | "decimal"
-                | "numeric"
-                | "money"
-                | "smallmoney"
-                | "float"
+                | "integer"
+                | "bigint"
+                | "serial"
+                | "bigserial"
+                | "smallserial"
+                | "bool"
+                | "boolean"
                 | "real"
-                | "datetime"
-                | "datetime2"
-                | "smalldatetime"
-                | "time"
-                | "datetimeoffset"
-                | "nchar"
-                | "nvarchar"
-                | "binary"
-                | "varbinary"
-                | "image"
-                | "uniqueidentifier"
+                | "float4"
+                | "double precision"
+                | "float8"
+                | "numeric"
+                | "decimal"
+                | "money"
+                | "text"
+                | "varchar"
+                | "char"
+                | "bpchar"
+                | "bytea"
+                | "uuid"
+                | "json"
+                | "jsonb"
                 | "xml"
-                | "sql_variant"
-                | "rowversion"
-                | "geography"
-                | "geometry"
-                | "hierarchyid"
+                | "timestamp"
+                | "timestamptz"
+                | "date"
+                | "time"
+                | "timetz"
+                | "interval"
+                | "inet"
+                | "cidr"
+                | "macaddr"
+                | "point"
+                | "line"
+                | "lseg"
+                | "box"
+                | "path"
+                | "polygon"
+                | "circle"
         )
     }
 
-    /// Format an MSSQL type with proper length/precision.
-    fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
-        let lower = data_type.to_lowercase();
-        match lower.as_str() {
-            // Fixed-length types
-            "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney" | "real"
-            | "datetime" | "smalldatetime" | "date" | "text" | "ntext" | "image"
-            | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
-            | "geography" | "geometry" | "hierarchyid" => data_type.to_string(),
-
-            "float" => {
-                if precision > 0 {
-                    format!("float({})", precision)
-                } else {
-                    "float".to_string()
-                }
-            }
-
-            "decimal" | "numeric" => {
-                if precision > 0 {
-                    format!("{}({}, {})", data_type, precision, scale)
-                } else {
-                    format!("{}(18, 0)", data_type)
-                }
-            }
-
-            "datetime2" => {
-                if scale > 0 {
-                    format!("datetime2({})", scale)
-                } else {
-                    "datetime2".to_string()
-                }
-            }
-
-            "time" => {
-                if scale > 0 {
-                    format!("time({})", scale)
-                } else {
-                    "time".to_string()
-                }
-            }
-
-            "datetimeoffset" => {
-                if scale > 0 {
-                    format!("datetimeoffset({})", scale)
-                } else {
-                    "datetimeoffset".to_string()
-                }
-            }
-
-            "char" | "varchar" | "nchar" | "nvarchar" => {
-                if max_length == -1 {
-                    format!("{}(max)", data_type)
-                } else if max_length > 0 {
-                    let len = if lower.starts_with('n') && max_length > 0 {
-                        max_length / 2
-                    } else {
-                        max_length
-                    };
-                    format!("{}({})", data_type, len)
-                } else {
-                    format!("{}(255)", data_type)
-                }
-            }
-
-            "binary" | "varbinary" => {
-                if max_length == -1 {
-                    format!("{}(max)", data_type)
-                } else if max_length > 0 {
-                    format!("{}({})", data_type, max_length)
-                } else {
-                    format!("{}(255)", data_type)
-                }
-            }
-
-            _ => data_type.to_string(),
-        }
-    }
-
-    /// Check if table has an identity column.
-    fn has_identity_column(&self, schema: &str, table: &str) -> Result<bool> {
-        let sql = format!(
-            r#"SELECT COUNT(*)
-               FROM sys.columns c
-               JOIN sys.tables t ON c.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND c.is_identity = 1"#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
-        );
-        self.query_scalar_bool(&sql)
-    }
-
-    /// Get column definitions for creating a staging table.
+    /// Get column definitions from the target table.
     fn get_column_definitions(&self, schema: &str, table: &str) -> Result<Vec<(String, String, bool)>> {
         let conn = self.get_connection()?;
 
         let sql = format!(
             r#"
             SELECT
-                c.name AS column_name,
+                column_name,
                 CASE
-                    WHEN t.name IN ('nvarchar', 'nchar') AND c.max_length = -1 THEN t.name + '(max)'
-                    WHEN t.name IN ('nvarchar', 'nchar') THEN t.name + '(' + CAST(c.max_length/2 AS VARCHAR) + ')'
-                    WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') AND c.max_length = -1 THEN t.name + '(max)'
-                    WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') THEN t.name + '(' + CAST(c.max_length AS VARCHAR) + ')'
-                    WHEN t.name IN ('decimal', 'numeric') THEN t.name + '(' + CAST(c.precision AS VARCHAR) + ',' + CAST(c.scale AS VARCHAR) + ')'
-                    WHEN t.name IN ('datetime2', 'time', 'datetimeoffset') AND c.scale > 0 THEN t.name + '(' + CAST(c.scale AS VARCHAR) + ')'
-                    ELSE t.name
+                    WHEN character_maximum_length IS NOT NULL THEN udt_name || '(' || character_maximum_length || ')'
+                    WHEN numeric_precision IS NOT NULL AND numeric_scale IS NOT NULL AND udt_name IN ('numeric', 'decimal')
+                        THEN udt_name || '(' || numeric_precision || ',' || numeric_scale || ')'
+                    ELSE udt_name
                 END AS data_type,
-                c.is_nullable
-            FROM sys.columns c
-            JOIN sys.types t ON c.user_type_id = t.user_type_id
-            JOIN sys.tables tbl ON c.object_id = tbl.object_id
-            JOIN sys.schemas s ON tbl.schema_id = s.schema_id
-            WHERE s.name = '{}' AND tbl.name = '{}'
-            ORDER BY c.column_id
+                CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = '{}'
+                AND table_name = '{}'
+            ORDER BY ordinal_position
             "#,
             schema.replace('\'', "''"),
             table.replace('\'', "''")
@@ -455,7 +352,10 @@ impl OdbcMssqlTargetPool {
                         .unwrap_or_default();
                     let is_nullable = batch
                         .at(2, row_idx)
-                        .map(|b| String::from_utf8_lossy(b) == "1")
+                        .map(|b| {
+                            let s = String::from_utf8_lossy(b);
+                            s == "t" || s == "true" || s == "1"
+                        })
                         .unwrap_or(true);
 
                     columns.push((name, data_type, is_nullable));
@@ -482,12 +382,12 @@ impl OdbcMssqlTargetPool {
 
         // Check if staging table exists
         let check_sql = format!(
-            "SELECT OBJECT_ID(N'{}.{}', 'U')",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{}' AND table_name = '{}'",
             schema.replace('\'', "''"),
             staging_table_name.replace('\'', "''")
         );
 
-        let exists = self.query_scalar_i64(&check_sql)? != 0;
+        let exists = self.query_scalar_bool(&check_sql)?;
 
         if exists {
             // Truncate existing staging table
@@ -505,7 +405,7 @@ impl OdbcMssqlTargetPool {
                 ));
             }
 
-            // Build CREATE TABLE statement without identity columns
+            // Build CREATE TABLE statement
             let col_defs: Vec<String> = columns
                 .iter()
                 .map(|(name, data_type, is_nullable)| {
@@ -514,8 +414,9 @@ impl OdbcMssqlTargetPool {
                 })
                 .collect();
 
+            // Create as UNLOGGED for performance
             let create_sql = format!(
-                "CREATE TABLE {} ({})",
+                "CREATE UNLOGGED TABLE {} ({})",
                 qualified_staging,
                 col_defs.join(", ")
             );
@@ -527,89 +428,7 @@ impl OdbcMssqlTargetPool {
         Ok(qualified_staging)
     }
 
-    /// Build MERGE SQL statement from staging table to target table.
-    fn build_staging_merge_sql(
-        target_table: &str,
-        staging_table: &str,
-        cols: &[String],
-        pk_cols: &[String],
-    ) -> String {
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
-        let col_str = col_list.join(", ");
-
-        // Build ON clause for PK matching
-        let join_condition: Vec<String> = pk_cols
-            .iter()
-            .map(|pk| {
-                format!(
-                    "target.{} = source.{}",
-                    Self::quote_ident(pk),
-                    Self::quote_ident(pk)
-                )
-            })
-            .collect();
-
-        // Build UPDATE SET clause (exclude PK columns)
-        let update_cols: Vec<String> = cols
-            .iter()
-            .filter(|c| !pk_cols.contains(c))
-            .map(|c| format!("{} = source.{}", Self::quote_ident(c), Self::quote_ident(c)))
-            .collect();
-
-        // Build source column references for INSERT
-        let source_cols: Vec<String> = cols
-            .iter()
-            .map(|c| format!("source.{}", Self::quote_ident(c)))
-            .collect();
-
-        if update_cols.is_empty() {
-            // PK-only table
-            format!(
-                r#"MERGE INTO {} WITH (TABLOCK) AS target
-                   USING {} AS source
-                   ON {}
-                   WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});"#,
-                target_table,
-                staging_table,
-                join_condition.join(" AND "),
-                col_str,
-                source_cols.join(", ")
-            )
-        } else {
-            // Build change detection
-            let change_detection: Vec<String> = cols
-                .iter()
-                .filter(|c| !pk_cols.contains(c))
-                .map(|c| {
-                    let quoted = Self::quote_ident(c);
-                    format!(
-                        "(target.{0} <> source.{0} OR (target.{0} IS NULL AND source.{0} IS NOT NULL) OR (target.{0} IS NOT NULL AND source.{0} IS NULL))",
-                        quoted
-                    )
-                })
-                .collect();
-
-            format!(
-                r#"MERGE INTO {} WITH (TABLOCK) AS target
-                   USING {} AS source
-                   ON {}
-                   WHEN MATCHED AND ({}) THEN UPDATE SET {}
-                   WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});"#,
-                target_table,
-                staging_table,
-                join_condition.join(" AND "),
-                change_detection.join(" OR "),
-                update_cols.join(", "),
-                col_str,
-                source_cols.join(", ")
-            )
-        }
-    }
-
     /// Insert rows using batched INSERT statements.
-    ///
-    /// ODBC doesn't support TDS bulk insert, so we use parameterized batch INSERT.
-    /// This is slower than TDS bulk insert but still reasonably performant.
     async fn insert_batch(
         &self,
         schema: &str,
@@ -628,7 +447,7 @@ impl OdbcMssqlTargetPool {
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_str = col_list.join(", ");
 
-        // Calculate batch size based on MSSQL limits
+        // Calculate batch size
         let cols_per_row = cols.len();
         if cols_per_row == 0 {
             return Err(MigrateError::transfer(
@@ -649,7 +468,7 @@ impl OdbcMssqlTargetPool {
             let mut value_groups = Vec::with_capacity(batch.len());
 
             for row in batch {
-                let values: Vec<String> = row.iter().map(sql_value_to_sql_literal).collect();
+                let values: Vec<String> = row.iter().map(pg_sql_value_to_literal).collect();
                 value_groups.push(format!("({})", values.join(", ")));
             }
 
@@ -680,15 +499,11 @@ impl OdbcMssqlTargetPool {
 }
 
 #[async_trait]
-impl TargetPool for OdbcMssqlTargetPool {
+impl TargetPool for OdbcPgTargetPool {
     async fn create_schema(&self, schema: &str) -> Result<()> {
         let _lock = self.conn_mutex.lock().await;
         let quoted_schema = Self::quote_ident(schema);
-        let sql = format!(
-            "IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{}') EXEC(N'CREATE SCHEMA {}')",
-            schema.replace('\'', "''"),
-            quoted_schema.replace('\'', "''")
-        );
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", quoted_schema);
         self.execute(&sql)?;
         debug!("Created schema: {}", schema);
         Ok(())
@@ -702,16 +517,10 @@ impl TargetPool for OdbcMssqlTargetPool {
             .columns
             .iter()
             .map(|c| {
-                let target_type = if Self::is_mssql_type(&c.data_type) {
-                    Self::format_mssql_type(&c.data_type, c.max_length, c.precision, c.scale)
+                let target_type = if Self::is_pg_type(&c.data_type) {
+                    c.data_type.clone()
                 } else {
-                    let mapping = postgres_to_mssql(&c.data_type, c.max_length, c.precision, c.scale);
-                    if mapping.is_lossy {
-                        if let Some(warning) = &mapping.warning {
-                            warn!("Column {}.{}: {}", table.name, c.name, warning);
-                        }
-                    }
-                    mapping.target_type
+                    mssql_to_postgres(&c.data_type, c.max_length, c.precision, c.scale)
                 };
 
                 let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
@@ -719,28 +528,10 @@ impl TargetPool for OdbcMssqlTargetPool {
             })
             .collect();
 
-        // Build PRIMARY KEY CLUSTERED constraint if table has a primary key
-        let pk_constraint = if !table.primary_key.is_empty() {
-            let pk_cols: Vec<String> = table
-                .primary_key
-                .iter()
-                .map(|c| Self::quote_ident(c))
-                .collect();
-            let pk_name = format!("PK_{}_{}", target_schema, table.name);
-            format!(
-                ",\n    CONSTRAINT {} PRIMARY KEY CLUSTERED ({})",
-                Self::quote_ident(&pk_name),
-                pk_cols.join(", ")
-            )
-        } else {
-            String::new()
-        };
-
         let ddl = format!(
-            "CREATE TABLE {} (\n    {}{}\n)",
+            "CREATE TABLE {} (\n    {}\n)",
             Self::qualify_table(target_schema, &table.name),
-            col_defs.join(",\n    "),
-            pk_constraint
+            col_defs.join(",\n    ")
         );
 
         self.execute(&ddl)?;
@@ -749,18 +540,38 @@ impl TargetPool for OdbcMssqlTargetPool {
     }
 
     async fn create_table_unlogged(&self, table: &Table, target_schema: &str) -> Result<()> {
-        // MSSQL doesn't have UNLOGGED tables; use regular CREATE TABLE
-        self.create_table(table, target_schema).await
+        let _lock = self.conn_mutex.lock().await;
+
+        // Generate column definitions
+        let col_defs: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| {
+                let target_type = if Self::is_pg_type(&c.data_type) {
+                    c.data_type.clone()
+                } else {
+                    mssql_to_postgres(&c.data_type, c.max_length, c.precision, c.scale)
+                };
+
+                let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
+                format!("{} {} {}", Self::quote_ident(&c.name), target_type, null_clause)
+            })
+            .collect();
+
+        let ddl = format!(
+            "CREATE UNLOGGED TABLE {} (\n    {}\n)",
+            Self::qualify_table(target_schema, &table.name),
+            col_defs.join(",\n    ")
+        );
+
+        self.execute(&ddl)?;
+        debug!("Created UNLOGGED table via ODBC: {}.{}", target_schema, table.name);
+        Ok(())
     }
 
     async fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
         let _lock = self.conn_mutex.lock().await;
-        let sql = format!(
-            "IF OBJECT_ID(N'{}.{}', 'U') IS NOT NULL DROP TABLE {}",
-            schema.replace('\'', "''"),
-            table.replace('\'', "''"),
-            Self::qualify_table(schema, table)
-        );
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", Self::qualify_table(schema, table));
         self.execute(&sql)?;
         debug!("Dropped table via ODBC: {}.{}", schema, table);
         Ok(())
@@ -777,7 +588,7 @@ impl TargetPool for OdbcMssqlTargetPool {
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let _lock = self.conn_mutex.lock().await;
         let sql = format!(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{}' AND table_name = '{}'",
             schema.replace('\'', "''"),
             table.replace('\'', "''")
         );
@@ -791,17 +602,16 @@ impl TargetPool for OdbcMssqlTargetPool {
         }
 
         let _lock = self.conn_mutex.lock().await;
-        let pk_name = format!("PK_{}_{}", target_schema, table.name);
+        let pk_name = format!("pk_{}_{}", target_schema, table.name);
 
         // Check if primary key already exists
         let check_sql = format!(
-            r#"SELECT COUNT(*) FROM sys.key_constraints
-               WHERE name = '{}' AND parent_object_id = OBJECT_ID(N'{}.{}')"#,
+            "SELECT COUNT(*) FROM pg_constraint WHERE conname = '{}' AND conrelid = '{}.{}'::regclass",
             pk_name.replace('\'', "''"),
             target_schema.replace('\'', "''"),
             table.name.replace('\'', "''")
         );
-        if self.query_scalar_bool(&check_sql)? {
+        if self.query_scalar_bool(&check_sql).unwrap_or(false) {
             debug!("Primary key already exists on {}.{}", target_schema, table.name);
             return Ok(());
         }
@@ -824,20 +634,20 @@ impl TargetPool for OdbcMssqlTargetPool {
         let idx_cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
 
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
-        let clustered = if idx.is_clustered {
-            "CLUSTERED "
-        } else {
-            "NONCLUSTERED "
-        };
 
-        let sql = format!(
-            "CREATE {}{}INDEX {} ON {} ({})",
+        let mut sql = format!(
+            "CREATE {}INDEX {} ON {} ({})",
             unique,
-            clustered,
             Self::quote_ident(&idx.name),
             Self::qualify_table(target_schema, &table.name),
             idx_cols.join(", ")
         );
+
+        // Add INCLUDE columns if present (PostgreSQL 11+)
+        if !idx.include_cols.is_empty() {
+            let include_cols: Vec<String> = idx.include_cols.iter().map(|c| Self::quote_ident(c)).collect();
+            sql.push_str(&format!(" INCLUDE ({})", include_cols.join(", ")));
+        }
 
         self.execute(&sql)?;
         debug!("Created index via ODBC: {} on {}.{}", idx.name, target_schema, table.name);
@@ -849,12 +659,16 @@ impl TargetPool for OdbcMssqlTargetPool {
         let conn = self.get_connection()?;
 
         let sql = format!(
-            r#"SELECT i.name
-               FROM sys.indexes i
-               JOIN sys.tables t ON i.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}'
-                 AND i.is_primary_key = 0 AND i.type > 0"#,
+            r#"
+            SELECT i.relname
+            FROM pg_index ix
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = '{}'
+              AND t.relname = '{}'
+              AND NOT ix.indisprimary
+            "#,
             schema.replace('\'', "''"),
             table.replace('\'', "''")
         );
@@ -888,12 +702,12 @@ impl TargetPool for OdbcMssqlTargetPool {
             }
         }
 
-        // Drop the indexes in a separate connection
+        // Drop the indexes
         for index_name in &dropped_indexes {
             let drop_sql = format!(
-                "DROP INDEX {} ON {}",
-                Self::quote_ident(index_name),
-                Self::qualify_table(schema, table)
+                "DROP INDEX IF EXISTS {}.{}",
+                Self::quote_ident(schema),
+                Self::quote_ident(index_name)
             );
             self.execute(&drop_sql)?;
         }
@@ -954,11 +768,13 @@ impl TargetPool for OdbcMssqlTargetPool {
     async fn has_primary_key(&self, schema: &str, table: &str) -> Result<bool> {
         let _lock = self.conn_mutex.lock().await;
         let sql = format!(
-            r#"SELECT COUNT(*)
-               FROM sys.indexes i
-               JOIN sys.tables t ON i.object_id = t.object_id
-               JOIN sys.schemas s ON t.schema_id = s.schema_id
-               WHERE s.name = '{}' AND t.name = '{}' AND i.is_primary_key = 1"#,
+            r#"
+            SELECT COUNT(*)
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = '{}' AND c.relname = '{}' AND i.indisprimary
+            "#,
             schema.replace('\'', "''"),
             table.replace('\'', "''")
         );
@@ -968,24 +784,44 @@ impl TargetPool for OdbcMssqlTargetPool {
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         let _lock = self.conn_mutex.lock().await;
         let sql = format!(
-            "SELECT CAST(COUNT(*) AS BIGINT) FROM {} WITH (NOLOCK)",
+            "SELECT COUNT(*)::bigint FROM {}",
             Self::qualify_table(schema, table)
         );
         self.query_scalar_i64(&sql)
     }
 
-    async fn reset_sequence(&self, _schema: &str, _table: &Table) -> Result<()> {
-        // MSSQL identity columns auto-increment; no sequence reset needed
+    async fn reset_sequence(&self, schema: &str, table: &Table) -> Result<()> {
+        // Find identity columns and reset their sequences
+        for col in &table.columns {
+            if col.is_identity {
+                let _lock = self.conn_mutex.lock().await;
+                let sql = format!(
+                    "SELECT setval(pg_get_serial_sequence('{}.{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 1))",
+                    schema.replace('\'', "''"),
+                    table.name.replace('\'', "''"),
+                    col.name.replace('\'', "''"),
+                    Self::quote_ident(&col.name),
+                    Self::qualify_table(schema, &table.name)
+                );
+                let _ = self.execute(&sql); // Ignore errors if sequence doesn't exist
+            }
+        }
         Ok(())
     }
 
-    async fn set_table_logged(&self, _schema: &str, _table: &str) -> Result<()> {
-        // MSSQL doesn't have UNLOGGED tables
+    async fn set_table_logged(&self, schema: &str, table: &str) -> Result<()> {
+        let _lock = self.conn_mutex.lock().await;
+        let sql = format!("ALTER TABLE {} SET LOGGED", Self::qualify_table(schema, table));
+        self.execute(&sql)?;
+        debug!("Set table to LOGGED via ODBC: {}.{}", schema, table);
         Ok(())
     }
 
-    async fn set_table_unlogged(&self, _schema: &str, _table: &str) -> Result<()> {
-        // MSSQL doesn't have UNLOGGED tables
+    async fn set_table_unlogged(&self, schema: &str, table: &str) -> Result<()> {
+        let _lock = self.conn_mutex.lock().await;
+        let sql = format!("ALTER TABLE {} SET UNLOGGED", Self::qualify_table(schema, table));
+        self.execute(&sql)?;
+        debug!("Set table to UNLOGGED via ODBC: {}.{}", schema, table);
         Ok(())
     }
 
@@ -1034,7 +870,7 @@ impl TargetPool for OdbcMssqlTargetPool {
         let staging_table = self.ensure_staging_table(schema, table, writer_id, partition_id)?;
         let staging_time = staging_start.elapsed();
 
-        // 2. Insert rows into staging table using batch INSERT
+        // 2. Insert rows into staging table
         let insert_start = Instant::now();
         let conn = self.get_connection()?;
 
@@ -1050,7 +886,7 @@ impl TargetPool for OdbcMssqlTargetPool {
             let mut value_groups = Vec::with_capacity(batch.len());
 
             for row in batch {
-                let values: Vec<String> = row.iter().map(sql_value_to_sql_literal).collect();
+                let values: Vec<String> = row.iter().map(pg_sql_value_to_literal).collect();
                 value_groups.push(format!("({})", values.join(", ")));
             }
 
@@ -1067,58 +903,50 @@ impl TargetPool for OdbcMssqlTargetPool {
         }
         let insert_time = insert_start.elapsed();
 
-        // 3. Build and execute MERGE from staging to target
-        let merge_start = Instant::now();
+        // 3. Build and execute INSERT ON CONFLICT from staging to target
+        let upsert_start = Instant::now();
 
-        // Check if target has identity column
-        let has_identity = self.has_identity_column(schema, table)?;
+        // Build the upsert SQL
+        let pk_cols_quoted: Vec<String> = pk_cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let update_cols: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| format!("{} = EXCLUDED.{}", Self::quote_ident(c), Self::quote_ident(c)))
+            .collect();
 
-        // Build MERGE SQL
-        let merge_sql = Self::build_staging_merge_sql(&qualified_target, &staging_table, cols, pk_cols);
-
-        // Wrap with IDENTITY_INSERT if needed
-        let batch_sql = if has_identity {
+        let upsert_sql = if update_cols.is_empty() {
+            // PK-only table - just insert and ignore conflicts
             format!(
-                "SET IDENTITY_INSERT {} ON; {} SET IDENTITY_INSERT {} OFF;",
-                qualified_target, merge_sql, qualified_target
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO NOTHING",
+                qualified_target,
+                col_str,
+                col_str,
+                staging_table,
+                pk_cols_quoted.join(", ")
             )
         } else {
-            merge_sql
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+                qualified_target,
+                col_str,
+                col_str,
+                staging_table,
+                pk_cols_quoted.join(", "),
+                update_cols.join(", ")
+            )
         };
 
-        // Execute MERGE with deadlock retry
-        let mut retries = 0;
-        loop {
-            match conn.execute(&batch_sql, ()) {
-                Ok(_) => break,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("1205") && retries < DEADLOCK_MAX_RETRIES {
-                        retries += 1;
-                        warn!(
-                            "Deadlock detected during MERGE to {}, retry {}/{}",
-                            qualified_target, retries, DEADLOCK_MAX_RETRIES
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            DEADLOCK_RETRY_DELAY_MS * retries as u64,
-                        ));
-                        continue;
-                    }
-                    return Err(MigrateError::transfer(
-                        &qualified_target,
-                        format!("MERGE failed: {}", e),
-                    ));
-                }
-            }
-        }
+        conn.execute(&upsert_sql, ()).map_err(|e| {
+            MigrateError::transfer(&qualified_target, format!("upsert failed: {}", e))
+        })?;
 
-        let merge_time = merge_start.elapsed();
+        let upsert_time = upsert_start.elapsed();
         let total_time = chunk_start.elapsed();
 
         if row_count >= 1000 {
             debug!(
-                "{}.{}: ODBC upsert {} rows - staging: {:?}, insert: {:?}, merge: {:?}, total: {:?}",
-                schema, table, row_count, staging_time, insert_time, merge_time, total_time
+                "{}.{}: ODBC upsert {} rows - staging: {:?}, insert: {:?}, upsert: {:?}, total: {:?}",
+                schema, table, row_count, staging_time, insert_time, upsert_time, total_time
             );
         }
 
@@ -1126,7 +954,7 @@ impl TargetPool for OdbcMssqlTargetPool {
     }
 
     fn db_type(&self) -> &str {
-        "mssql"
+        "postgres"
     }
 
     async fn close(&self) {
@@ -1134,61 +962,49 @@ impl TargetPool for OdbcMssqlTargetPool {
     }
 }
 
-/// Convert SqlValue to SQL literal string for INSERT statements.
-///
-/// This function escapes values appropriately for embedding in SQL.
-/// Note: This is less secure than parameterized queries but necessary for
-/// ODBC batch INSERT since ODBC parameter binding has limitations.
-fn sql_value_to_sql_literal(value: &SqlValue) -> String {
+/// Convert SqlValue to PostgreSQL SQL literal string for INSERT statements.
+fn pg_sql_value_to_literal(value: &SqlValue) -> String {
     match value {
         SqlValue::Null(_) => "NULL".to_string(),
-        SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        SqlValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         SqlValue::I16(n) => n.to_string(),
         SqlValue::I32(n) => n.to_string(),
         SqlValue::I64(n) => n.to_string(),
         SqlValue::F32(f) => {
-            if f.is_nan() || f.is_infinite() {
-                "NULL".to_string()
+            if f.is_nan() {
+                "'NaN'::float4".to_string()
+            } else if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "'Infinity'::float4".to_string()
+                } else {
+                    "'-Infinity'::float4".to_string()
+                }
             } else {
                 f.to_string()
             }
         }
         SqlValue::F64(f) => {
-            if f.is_nan() || f.is_infinite() {
-                "NULL".to_string()
+            if f.is_nan() {
+                "'NaN'::float8".to_string()
+            } else if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "'Infinity'::float8".to_string()
+                } else {
+                    "'-Infinity'::float8".to_string()
+                }
             } else {
                 f.to_string()
             }
         }
-        SqlValue::String(s) => format!("N'{}'", s.replace('\'', "''")),
-        SqlValue::Bytes(b) => format!("0x{}", hex::encode(b)),
-        SqlValue::Uuid(u) => format!("'{}'", u),
+        SqlValue::String(s) => format!("'{}'", s.replace('\'', "''")),
+        SqlValue::Bytes(b) => format!("'\\x{}'::bytea", hex::encode(b)),
+        SqlValue::Uuid(u) => format!("'{}'::uuid", u),
         SqlValue::Decimal(d) => d.to_string(),
-        SqlValue::DateTime(dt) => format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")),
-        SqlValue::DateTimeOffset(dto) => format!("'{}'", dto.format("%Y-%m-%d %H:%M:%S%.6f %:z")),
-        SqlValue::Date(d) => format!("'{}'", d.format("%Y-%m-%d")),
-        SqlValue::Time(t) => format!("'{}'", t.format("%H:%M:%S%.6f")),
+        SqlValue::DateTime(dt) => format!("'{}'::timestamp", dt.format("%Y-%m-%d %H:%M:%S%.6f")),
+        SqlValue::DateTimeOffset(dto) => format!("'{}'::timestamptz", dto.format("%Y-%m-%d %H:%M:%S%.6f %:z")),
+        SqlValue::Date(d) => format!("'{}'::date", d.format("%Y-%m-%d")),
+        SqlValue::Time(t) => format!("'{}'::time", t.format("%H:%M:%S%.6f")),
     }
-}
-
-/// Check if the ODBC driver is installed and available.
-///
-/// Returns Ok(()) if ODBC is available, or an error with installation instructions.
-pub fn check_odbc_available() -> Result<()> {
-    Environment::new().map_err(|e| {
-        MigrateError::Config(format!(
-            "ODBC driver not found: {}.\n\n\
-             Kerberos authentication requires the Microsoft ODBC Driver for SQL Server.\n\
-             Please install it:\n\
-             - Windows: Download from https://aka.ms/msodbcsql\n\
-             - Linux: apt install msodbcsql18 (Debian/Ubuntu) or yum install msodbcsql18 (RHEL/CentOS)\n\
-             - macOS: brew tap microsoft/mssql-release && brew install msodbcsql18\n\n\
-             After installation, you may need to set LIBRARY_PATH on macOS:\n\
-             export LIBRARY_PATH=\"/opt/homebrew/opt/unixodbc/lib:$LIBRARY_PATH\"",
-            e
-        ))
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1197,109 +1013,70 @@ mod tests {
     use crate::target::SqlNullType;
 
     #[test]
-    fn test_sql_value_to_sql_literal_null() {
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::Null(SqlNullType::I32)), "NULL");
+    fn test_pg_sql_value_to_literal_null() {
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::Null(SqlNullType::I32)), "NULL");
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_bool() {
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::Bool(true)), "1");
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::Bool(false)), "0");
+    fn test_pg_sql_value_to_literal_bool() {
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::Bool(true)), "true");
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::Bool(false)), "false");
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_numbers() {
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::I16(42)), "42");
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::I32(-100)), "-100");
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::I64(9999999999)), "9999999999");
+    fn test_pg_sql_value_to_literal_numbers() {
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::I16(42)), "42");
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::I32(-100)), "-100");
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::I64(9999999999)), "9999999999");
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_string_escaping() {
+    fn test_pg_sql_value_to_literal_string_escaping() {
         assert_eq!(
-            sql_value_to_sql_literal(&SqlValue::String("hello".to_string())),
-            "N'hello'"
+            pg_sql_value_to_literal(&SqlValue::String("hello".to_string())),
+            "'hello'"
         );
         assert_eq!(
-            sql_value_to_sql_literal(&SqlValue::String("it's".to_string())),
-            "N'it''s'"
-        );
-        assert_eq!(
-            sql_value_to_sql_literal(&SqlValue::String("a'b'c".to_string())),
-            "N'a''b''c'"
+            pg_sql_value_to_literal(&SqlValue::String("it's".to_string())),
+            "'it''s'"
         );
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_nan_infinity() {
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::F32(f32::NAN)), "NULL");
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::F64(f64::INFINITY)), "NULL");
-        assert_eq!(sql_value_to_sql_literal(&SqlValue::F64(f64::NEG_INFINITY)), "NULL");
+    fn test_pg_sql_value_to_literal_nan_infinity() {
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::F32(f32::NAN)), "'NaN'::float4");
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::F64(f64::INFINITY)), "'Infinity'::float8");
+        assert_eq!(pg_sql_value_to_literal(&SqlValue::F64(f64::NEG_INFINITY)), "'-Infinity'::float8");
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_bytes() {
+    fn test_pg_sql_value_to_literal_bytes() {
         assert_eq!(
-            sql_value_to_sql_literal(&SqlValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])),
-            "0xdeadbeef"
+            pg_sql_value_to_literal(&SqlValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            "'\\xdeadbeef'::bytea"
         );
     }
 
     #[test]
-    fn test_sql_value_to_sql_literal_uuid() {
+    fn test_pg_sql_value_to_literal_uuid() {
         let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert_eq!(
-            sql_value_to_sql_literal(&SqlValue::Uuid(uuid)),
-            "'550e8400-e29b-41d4-a716-446655440000'"
+            pg_sql_value_to_literal(&SqlValue::Uuid(uuid)),
+            "'550e8400-e29b-41d4-a716-446655440000'::uuid"
         );
     }
 
     #[test]
     fn test_quote_ident() {
-        assert_eq!(OdbcMssqlTargetPool::quote_ident("users"), "[users]");
-        assert_eq!(OdbcMssqlTargetPool::quote_ident("user]name"), "[user]]name]");
+        assert_eq!(OdbcPgTargetPool::quote_ident("users"), "\"users\"");
+        assert_eq!(OdbcPgTargetPool::quote_ident("user\"name"), "\"user\"\"name\"");
     }
 
     #[test]
     fn test_qualify_table() {
         assert_eq!(
-            OdbcMssqlTargetPool::qualify_table("dbo", "users"),
-            "[dbo].[users]"
+            OdbcPgTargetPool::qualify_table("public", "users"),
+            "\"public\".\"users\""
         );
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql() {
-        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = OdbcMssqlTargetPool::build_staging_merge_sql(
-            "[dbo].[users]",
-            "[dbo].[_staging_users_0]",
-            &cols,
-            &pk_cols,
-        );
-
-        assert!(sql.contains("MERGE INTO [dbo].[users] WITH (TABLOCK)"));
-        assert!(sql.contains("USING [dbo].[_staging_users_0]"));
-        assert!(sql.contains("target.[id] = source.[id]"));
-        assert!(sql.contains("[name] = source.[name]"));
-    }
-
-    #[test]
-    fn test_build_staging_merge_sql_pk_only() {
-        let cols = vec!["id".to_string()];
-        let pk_cols = vec!["id".to_string()];
-
-        let sql = OdbcMssqlTargetPool::build_staging_merge_sql(
-            "[dbo].[lookup]",
-            "[dbo].[_staging_lookup_0]",
-            &cols,
-            &pk_cols,
-        );
-
-        // PK-only table should not have WHEN MATCHED
-        assert!(!sql.contains("WHEN MATCHED"));
-        assert!(sql.contains("WHEN NOT MATCHED THEN INSERT"));
     }
 }

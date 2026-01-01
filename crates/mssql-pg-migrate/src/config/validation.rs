@@ -1,6 +1,6 @@
 //! Configuration validation.
 
-use super::Config;
+use super::{AuthMethod, Config};
 use crate::error::{MigrateError, Result};
 
 /// Validate the configuration.
@@ -12,8 +12,9 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.source.database.is_empty() {
         return Err(MigrateError::Config("source.database is required".into()));
     }
-    if config.source.user.is_empty() {
-        return Err(MigrateError::Config("source.user is required".into()));
+    // Username is required for native and ODBC auth, but optional for Kerberos (integrated auth)
+    if config.source.user.is_empty() && config.source.auth != AuthMethod::Kerberos {
+        return Err(MigrateError::Config("source.user is required (unless using Kerberos auth)".into()));
     }
     let source_type = config.source.r#type.to_lowercase();
     if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
@@ -30,8 +31,9 @@ pub fn validate(config: &Config) -> Result<()> {
     if config.target.database.is_empty() {
         return Err(MigrateError::Config("target.database is required".into()));
     }
-    if config.target.user.is_empty() {
-        return Err(MigrateError::Config("target.user is required".into()));
+    // Username is required for native and ODBC auth, but optional for Kerberos (integrated auth)
+    if config.target.user.is_empty() && config.target.auth != AuthMethod::Kerberos {
+        return Err(MigrateError::Config("target.user is required (unless using Kerberos auth)".into()));
     }
     let target_type = config.target.r#type.to_lowercase();
     if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
@@ -149,7 +151,7 @@ fn validate_table_pattern(pattern: &str, field_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MigrationConfig, MssqlAuthMethod, SourceConfig, TargetConfig};
+    use crate::config::{AuthMethod, MigrationConfig, SourceConfig, TargetConfig};
 
     fn valid_config() -> Config {
         Config {
@@ -163,7 +165,7 @@ mod tests {
                 schema: "dbo".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
-                auth: MssqlAuthMethod::SqlServer,
+                auth: AuthMethod::Native,
             },
             target: TargetConfig {
                 r#type: "postgres".to_string(),
@@ -174,7 +176,7 @@ mod tests {
                 password: "password".to_string(),
                 schema: "public".to_string(),
                 ssl_mode: "disable".to_string(),
-                auth: MssqlAuthMethod::SqlServer,
+                auth: AuthMethod::Native,
                 encrypt: false,
                 trust_server_cert: true,
             },

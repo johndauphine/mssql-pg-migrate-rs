@@ -12,11 +12,17 @@ mod types;
 #[cfg(feature = "kerberos")]
 mod odbc;
 
+#[cfg(feature = "kerberos")]
+mod odbc_pg;
+
 pub use postgres::PgSourcePool;
 pub use types::*;
 
 #[cfg(feature = "kerberos")]
 pub use odbc::OdbcMssqlPool;
+
+#[cfg(feature = "kerberos")]
+pub use odbc_pg::OdbcPgSourcePool;
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
