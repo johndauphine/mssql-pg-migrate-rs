@@ -96,6 +96,11 @@ impl OdbcPgSourcePool {
             )
         })?;
 
+        // SSL mode for PostgreSQL ODBC (default to "prefer")
+        // Note: SourceConfig uses encrypt/trust_server_cert for MSSQL compatibility.
+        // For PostgreSQL ODBC, we default to "prefer" which attempts SSL but allows fallback.
+        let ssl_mode = "prefer";
+
         // Build connection string based on auth method
         let (connection_string, auth_desc) = match config.auth {
             AuthMethod::Kerberos => {
@@ -106,10 +111,11 @@ impl OdbcPgSourcePool {
                      Port={};\
                      Database={};\
                      UseKerberos=1;\
-                     SSLMode=prefer;",
+                     SSLMode={};",
                     config.host,
                     config.port,
                     config.database,
+                    ssl_mode,
                 );
                 (conn_str, "Kerberos")
             }
@@ -122,12 +128,13 @@ impl OdbcPgSourcePool {
                      Database={};\
                      Uid={};\
                      Pwd={};\
-                     SSLMode=prefer;",
+                     SSLMode={};",
                     config.host,
                     config.port,
                     config.database,
                     config.user,
                     config.password,
+                    ssl_mode,
                 );
                 (conn_str, "ODBC")
             }

@@ -34,6 +34,35 @@ const MAX_ROWS_PER_INSERT: usize = 1000;
 /// Maximum number of parameters per query (avoid excessive memory usage).
 const MAX_PARAMS_PER_BATCH: usize = 32000;
 
+/// Escape a SQL string literal value to prevent SQL injection.
+/// Doubles single quotes: `O'Brien` -> `O''Brien`
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Escape a PostgreSQL identifier for use in quoted notation.
+/// Doubles double quotes: `Table"Name` -> `Table""Name`
+#[allow(dead_code)]
+fn escape_pg_ident(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
+/// Validate that a PostgreSQL data type is safe to interpolate into DDL.
+/// Only allows characters commonly used in PostgreSQL type names.
+fn validate_data_type(data_type: &str) -> Result<&str> {
+    // Allow alphanumerics, space, underscore, parentheses, commas, brackets, quotes
+    if data_type.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '(' | ')' | ',' | '[' | ']' | '"')
+    }) {
+        Ok(data_type)
+    } else {
+        Err(MigrateError::transfer(
+            "data type validation",
+            format!("unsafe or unsupported PostgreSQL data type '{}'", data_type),
+        ))
+    }
+}
+
 /// ODBC-based PostgreSQL target pool.
 pub struct OdbcPgTargetPool {
     env: Arc<Environment>,
@@ -306,8 +335,8 @@ impl OdbcPgTargetPool {
                 AND table_name = '{}'
             ORDER BY ordinal_position
             "#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
+            escape_sql_string(schema),
+            escape_sql_string(table)
         );
 
         let mut columns = Vec::new();
@@ -383,8 +412,8 @@ impl OdbcPgTargetPool {
         // Check if staging table exists
         let check_sql = format!(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{}' AND table_name = '{}'",
-            schema.replace('\'', "''"),
-            staging_table_name.replace('\'', "''")
+            escape_sql_string(schema),
+            escape_sql_string(&staging_table_name)
         );
 
         let exists = self.query_scalar_bool(&check_sql)?;
@@ -405,14 +434,15 @@ impl OdbcPgTargetPool {
                 ));
             }
 
-            // Build CREATE TABLE statement
+            // Build CREATE TABLE statement with data type validation
             let col_defs: Vec<String> = columns
                 .iter()
-                .map(|(name, data_type, is_nullable)| {
+                .map(|(name, data_type, is_nullable)| -> Result<String> {
+                    let safe_type = validate_data_type(data_type)?;
                     let null_str = if *is_nullable { "NULL" } else { "NOT NULL" };
-                    format!("{} {} {}", Self::quote_ident(name), data_type, null_str)
+                    Ok(format!("{} {} {}", Self::quote_ident(name), safe_type, null_str))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             // Create as UNLOGGED for performance
             let create_sql = format!(
@@ -589,8 +619,8 @@ impl TargetPool for OdbcPgTargetPool {
         let _lock = self.conn_mutex.lock().await;
         let sql = format!(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{}' AND table_name = '{}'",
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
+            escape_sql_string(schema),
+            escape_sql_string(table)
         );
         let count = self.query_scalar_i64(&sql)?;
         Ok(count > 0)
@@ -607,9 +637,9 @@ impl TargetPool for OdbcPgTargetPool {
         // Check if primary key already exists
         let check_sql = format!(
             "SELECT COUNT(*) FROM pg_constraint WHERE conname = '{}' AND conrelid = '{}.{}'::regclass",
-            pk_name.replace('\'', "''"),
-            target_schema.replace('\'', "''"),
-            table.name.replace('\'', "''")
+            escape_sql_string(&pk_name),
+            escape_sql_string(target_schema),
+            escape_sql_string(&table.name)
         );
         if self.query_scalar_bool(&check_sql).unwrap_or(false) {
             debug!("Primary key already exists on {}.{}", target_schema, table.name);
@@ -669,8 +699,8 @@ impl TargetPool for OdbcPgTargetPool {
               AND t.relname = '{}'
               AND NOT ix.indisprimary
             "#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
+            escape_sql_string(schema),
+            escape_sql_string(table)
         );
 
         let mut dropped_indexes = Vec::new();
@@ -775,8 +805,8 @@ impl TargetPool for OdbcPgTargetPool {
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = '{}' AND c.relname = '{}' AND i.indisprimary
             "#,
-            schema.replace('\'', "''"),
-            table.replace('\'', "''")
+            escape_sql_string(schema),
+            escape_sql_string(table)
         );
         self.query_scalar_bool(&sql)
     }
@@ -797,9 +827,9 @@ impl TargetPool for OdbcPgTargetPool {
                 let _lock = self.conn_mutex.lock().await;
                 let sql = format!(
                     "SELECT setval(pg_get_serial_sequence('{}.{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 1))",
-                    schema.replace('\'', "''"),
-                    table.name.replace('\'', "''"),
-                    col.name.replace('\'', "''"),
+                    escape_sql_string(schema),
+                    escape_sql_string(&table.name),
+                    escape_sql_string(&col.name),
                     Self::quote_ident(&col.name),
                     Self::qualify_table(schema, &table.name)
                 );
