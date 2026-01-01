@@ -1321,10 +1321,8 @@ impl TargetPool for PgPool {
         // reducing catalog churn while avoiding race conditions.
         // When intra-table partitioning is enabled, include partition_id to avoid
         // collisions between parallel partition jobs.
-        let staging_table = match partition_id {
-            Some(pid) => format!("_staging_{}_{}_p{}_{}", schema, table, pid, writer_id),
-            None => format!("_staging_{}_{}_{}", schema, table, writer_id),
-        };
+        // Uses pg_staging_table_name to ensure name fits within PostgreSQL's 63-byte limit.
+        let staging_table = pg_staging_table_name(schema, table, writer_id, partition_id);
 
         let client = self
             .pool
@@ -2156,6 +2154,63 @@ fn pg_qualify_table(schema: &str, table: &str) -> String {
     format!("{}.{}", pg_quote_ident(schema), pg_quote_ident(table))
 }
 
+/// PostgreSQL maximum identifier length in bytes.
+const PG_MAX_IDENTIFIER_LEN: usize = 63;
+
+/// Generate a staging table name that fits within PostgreSQL's 63-byte identifier limit.
+///
+/// If the generated name exceeds 63 bytes, it truncates the middle portion and appends
+/// a hash suffix to ensure uniqueness. The suffix format `_p{partition_id}_{writer_id}`
+/// is always preserved to prevent collisions between parallel workers.
+fn pg_staging_table_name(
+    schema: &str,
+    table: &str,
+    writer_id: usize,
+    partition_id: Option<i32>,
+) -> String {
+    // Build the suffix first - this must always be preserved for uniqueness
+    let suffix = match partition_id {
+        Some(pid) => format!("_p{}_{}", pid, writer_id),
+        None => format!("_{}", writer_id),
+    };
+
+    // Build the ideal name
+    let prefix = "_staging";
+    let ideal_name = format!("{}_{}_{}{}",prefix, schema, table, suffix);
+
+    if ideal_name.len() <= PG_MAX_IDENTIFIER_LEN {
+        return ideal_name;
+    }
+
+    // Name too long - need to truncate and add hash for uniqueness
+    // Strategy: keep prefix, truncate schema_table, add hash, keep suffix
+    //
+    // Format: _staging_{truncated_schema_table}_{hash}{suffix}
+    // Example: _staging_very_long_sch_a1b2c3d4_p0_0
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    schema.hash(&mut hasher);
+    table.hash(&mut hasher);
+    let hash = format!("{:08x}", hasher.finish() as u32); // 8 hex chars
+
+    // Calculate available space for schema_table portion
+    // Format: {prefix}_{schema_table}_{hash}{suffix}
+    let fixed_len = prefix.len() + 1 + 1 + hash.len() + suffix.len(); // +1 for each underscore
+    let available = PG_MAX_IDENTIFIER_LEN.saturating_sub(fixed_len);
+
+    let schema_table = format!("{}_{}", schema, table);
+    let truncated = if schema_table.len() > available {
+        &schema_table[..available]
+    } else {
+        &schema_table
+    };
+
+    format!("{}_{}_{}{}", prefix, truncated, hash, suffix)
+}
+
 /// Build SQL to merge from staging table into target table.
 /// Uses INSERT ... SELECT ... ON CONFLICT DO UPDATE with change detection.
 ///
@@ -2253,5 +2308,54 @@ mod tests {
         let sql = build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols);
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
+    }
+
+    #[test]
+    fn test_pg_staging_table_name_short_names() {
+        // Short names should not be truncated
+        let name = pg_staging_table_name("public", "users", 0, None);
+        assert_eq!(name, "_staging_public_users_0");
+        assert!(name.len() <= PG_MAX_IDENTIFIER_LEN);
+
+        let name = pg_staging_table_name("public", "users", 5, Some(3));
+        assert_eq!(name, "_staging_public_users_p3_5");
+        assert!(name.len() <= PG_MAX_IDENTIFIER_LEN);
+    }
+
+    #[test]
+    fn test_pg_staging_table_name_long_names_truncated() {
+        // Long names should be truncated with hash to fit 63 bytes
+        let long_schema = "very_long_schema_name_that_exceeds_limits";
+        let long_table = "extremely_long_table_name_for_testing";
+
+        let name = pg_staging_table_name(long_schema, long_table, 0, Some(7));
+        assert!(
+            name.len() <= PG_MAX_IDENTIFIER_LEN,
+            "Name '{}' is {} bytes, exceeds limit of {}",
+            name,
+            name.len(),
+            PG_MAX_IDENTIFIER_LEN
+        );
+        // Should still end with the partition/writer suffix for uniqueness
+        assert!(name.ends_with("_p7_0"), "Name '{}' should end with _p7_0", name);
+        // Should contain hash (8 hex chars)
+        assert!(name.contains("_staging_"), "Name should start with _staging_");
+    }
+
+    #[test]
+    fn test_pg_staging_table_name_different_partitions_unique() {
+        // Different partitions of the same long table should get unique names
+        let long_schema = "very_long_schema_name_that_exceeds_limits";
+        let long_table = "extremely_long_table_name_for_testing";
+
+        let name1 = pg_staging_table_name(long_schema, long_table, 0, Some(0));
+        let name2 = pg_staging_table_name(long_schema, long_table, 0, Some(1));
+        let name3 = pg_staging_table_name(long_schema, long_table, 1, Some(0));
+
+        assert_ne!(name1, name2, "Different partitions should have different names");
+        assert_ne!(name1, name3, "Different writers should have different names");
+        assert!(name1.len() <= PG_MAX_IDENTIFIER_LEN);
+        assert!(name2.len() <= PG_MAX_IDENTIFIER_LEN);
+        assert!(name3.len() <= PG_MAX_IDENTIFIER_LEN);
     }
 }
