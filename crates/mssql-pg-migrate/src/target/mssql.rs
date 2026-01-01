@@ -248,17 +248,23 @@ impl MssqlTargetPool {
     ///
     /// Creates a staging table in the target schema with the same structure
     /// as the target table, but WITHOUT identity columns (to allow bulk insert).
-    /// Staging table name: _staging_[table]_[writer_id]
+    /// Staging table name: _staging_[table]_[writer_id] or _staging_[table]_p[partition_id]_[writer_id]
     /// Uses TRUNCATE for subsequent calls to reuse the table efficiently.
     async fn ensure_staging_table(
         conn: &mut tiberius::Client<Compat<TcpStream>>,
         schema: &str,
         table: &str,
         writer_id: usize,
+        partition_id: Option<i32>,
     ) -> Result<String> {
         // Build staging table name in target schema: [schema].[_staging_table_writerid]
         // Prefix with underscore to clearly mark as staging/internal table
-        let staging_table_name = format!("_staging_{}_{}", table, writer_id);
+        // When intra-table partitioning is enabled, include partition_id to avoid
+        // collisions between parallel partition jobs.
+        let staging_table_name = match partition_id {
+            Some(pid) => format!("_staging_{}_p{}_{}", table, pid, writer_id),
+            None => format!("_staging_{}_{}", table, writer_id),
+        };
         let qualified_staging = format!(
             "{}.{}",
             Self::quote_ident(schema),
@@ -1401,6 +1407,7 @@ impl TargetPool for MssqlTargetPool {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
         writer_id: usize,
+        partition_id: Option<i32>,
     ) -> Result<u64> {
         use std::time::Instant;
 
@@ -1422,7 +1429,8 @@ impl TargetPool for MssqlTargetPool {
 
         // 1. Create or reuse staging table (TRUNCATE if exists)
         let staging_start = Instant::now();
-        let staging_table = Self::ensure_staging_table(&mut conn, schema, table, writer_id).await?;
+        let staging_table =
+            Self::ensure_staging_table(&mut conn, schema, table, writer_id, partition_id).await?;
         let staging_time = staging_start.elapsed();
 
         // 2. Bulk insert rows into staging table

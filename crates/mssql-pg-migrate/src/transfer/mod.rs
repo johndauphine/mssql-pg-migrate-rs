@@ -149,6 +149,8 @@ impl RangeTracker {
 struct WriteJob {
     /// Row data to write.
     rows: Vec<Vec<SqlValue>>,
+    /// Partition ID for partition-aware staging tables (None for non-partitioned jobs).
+    partition_id: Option<i32>,
 }
 
 /// Transfer engine configuration.
@@ -309,6 +311,9 @@ impl TransferEngine {
 
                     let result = match target_mode {
                         TargetMode::Upsert => {
+                            // Per-chunk upsert: copy to staging, merge, repeat
+                            // This approach has lower lock contention than deferred merge
+                            // because each MERGE is smaller and releases locks faster.
                             target
                                 .upsert_chunk(
                                     &schema,
@@ -317,6 +322,7 @@ impl TransferEngine {
                                     &pk_cols_clone,
                                     write_job.rows,
                                     writer_id,
+                                    write_job.partition_id,
                                 )
                                 .await
                         }
@@ -392,7 +398,10 @@ impl TransferEngine {
 
             // Send rows to writers
             if !chunk.rows.is_empty() {
-                let write_job = WriteJob { rows: chunk.rows };
+                let write_job = WriteJob {
+                    rows: chunk.rows,
+                    partition_id: job.partition_id,
+                };
 
                 if write_tx.send(write_job).await.is_err() {
                     // Writers have all failed
