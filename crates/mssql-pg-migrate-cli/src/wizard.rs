@@ -215,6 +215,7 @@ fn prompt_source_config(existing: Option<&SourceConfig>) -> WizardResult<SourceC
         schema,
         encrypt,
         trust_server_cert,
+        auth: Default::default(), // SQL Server auth by default; Kerberos via config file
     })
 }
 
@@ -280,6 +281,9 @@ fn prompt_target_config(existing: Option<&TargetConfig>) -> WizardResult<TargetC
         password,
         schema,
         ssl_mode: ssl_modes[ssl_mode_idx].to_string(),
+        encrypt: true,             // Default for MSSQL targets (ignored for PostgreSQL)
+        trust_server_cert: false,  // Default for MSSQL targets (ignored for PostgreSQL)
+        auth: Default::default(),  // SQL Server auth by default (ignored for PostgreSQL)
     })
 }
 

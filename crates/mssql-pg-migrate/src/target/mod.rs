@@ -2,11 +2,18 @@
 //!
 //! This module provides target database implementations:
 //! - `PgPool` - PostgreSQL target
-//! - `MssqlTargetPool` - MSSQL target
+//! - `MssqlTargetPool` - MSSQL target (uses tiberius/TDS)
+//! - `OdbcMssqlTargetPool` - MSSQL target via ODBC (for Kerberos auth)
 
 mod mssql;
 
+#[cfg(feature = "kerberos")]
+mod odbc;
+
 pub use mssql::MssqlTargetPool;
+
+#[cfg(feature = "kerberos")]
+pub use odbc::{check_odbc_available, OdbcMssqlTargetPool};
 
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};

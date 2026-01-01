@@ -9,6 +9,10 @@ description = "High-performance MSSQL to PostgreSQL migration library"
 keywords = ["mssql", "postgresql", "migration", "database", "etl"]
 categories = ["database", "command-line-utilities"]
 
+[features]
+default = []
+kerberos = ["odbc-api"]
+
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
@@ -73,6 +77,9 @@ sysinfo = { workspace = true }
 
 # Glob pattern matching for table filters
 glob = "0.3"
+
+# ODBC for Kerberos authentication (optional)
+odbc-api = { version = "8", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

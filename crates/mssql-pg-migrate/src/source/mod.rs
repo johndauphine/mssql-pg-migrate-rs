@@ -2,14 +2,21 @@
 //!
 //! This module provides database-agnostic source operations via the `SourcePool` trait.
 //! Implementations are provided for:
-//! - MSSQL: `MssqlPool` (the default source)
+//! - MSSQL: `MssqlPool` (the default source, uses tiberius with SQL Server auth)
+//! - MSSQL with Kerberos: `OdbcMssqlPool` (requires `kerberos` feature and ODBC driver)
 //! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
 mod postgres;
 mod types;
 
+#[cfg(feature = "kerberos")]
+mod odbc;
+
 pub use postgres::PgSourcePool;
 pub use types::*;
+
+#[cfg(feature = "kerberos")]
+pub use odbc::OdbcMssqlPool;
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};

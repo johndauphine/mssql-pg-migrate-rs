@@ -149,7 +149,7 @@ fn validate_table_pattern(pattern: &str, field_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{MigrationConfig, SourceConfig, TargetConfig};
+    use crate::config::{MigrationConfig, MssqlAuthMethod, SourceConfig, TargetConfig};
 
     fn valid_config() -> Config {
         Config {
@@ -163,6 +163,7 @@ mod tests {
                 schema: "dbo".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
+                auth: MssqlAuthMethod::SqlServer,
             },
             target: TargetConfig {
                 r#type: "postgres".to_string(),
@@ -173,6 +174,9 @@ mod tests {
                 password: "password".to_string(),
                 schema: "public".to_string(),
                 ssl_mode: "disable".to_string(),
+                auth: MssqlAuthMethod::SqlServer,
+                encrypt: false,
+                trust_server_cert: true,
             },
             migration: MigrationConfig::default(),
         }

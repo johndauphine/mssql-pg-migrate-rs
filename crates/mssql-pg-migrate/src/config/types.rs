@@ -15,6 +15,31 @@ pub enum DatabaseType {
     Postgres,
 }
 
+/// Authentication method for MSSQL connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MssqlAuthMethod {
+    /// SQL Server authentication (username/password).
+    /// This is the default and works on all platforms.
+    #[default]
+    SqlServer,
+
+    /// Kerberos authentication via ODBC driver.
+    /// Requires Microsoft ODBC Driver for SQL Server to be installed.
+    ///
+    /// **IMPORTANT**: This requires the `kerberos` feature flag and the
+    /// Microsoft ODBC Driver for SQL Server:
+    /// - Windows: Download from Microsoft (SSPI is used automatically)
+    /// - Linux: `apt install msodbcsql18` or `yum install msodbcsql18`
+    /// - macOS: `brew install msodbcsql18`
+    ///
+    /// On Linux/macOS, you must obtain a Kerberos ticket before running:
+    /// ```sh
+    /// kinit user@REALM
+    /// ```
+    Kerberos,
+}
+
 impl DatabaseType {
     /// Parse database type from string (case-insensitive).
     pub fn parse(s: &str) -> Option<Self> {
@@ -171,10 +196,12 @@ pub struct SourceConfig {
     /// Database name.
     pub database: String,
 
-    /// Username.
+    /// Username (optional for Kerberos auth).
+    #[serde(default)]
     pub user: String,
 
-    /// Password.
+    /// Password (optional for Kerberos auth).
+    #[serde(default)]
     pub password: String,
 
     /// Source schema (default: "dbo").
@@ -188,6 +215,12 @@ pub struct SourceConfig {
     /// Trust server certificate (default: false).
     #[serde(default)]
     pub trust_server_cert: bool,
+
+    /// Authentication method (default: sql_server).
+    /// Use "kerberos" for Windows Integrated Authentication via ODBC.
+    /// **Requires `kerberos` feature and Microsoft ODBC Driver for SQL Server.**
+    #[serde(default)]
+    pub auth: MssqlAuthMethod,
 }
 
 impl fmt::Debug for SourceConfig {
@@ -202,40 +235,58 @@ impl fmt::Debug for SourceConfig {
             .field("schema", &self.schema)
             .field("encrypt", &self.encrypt)
             .field("trust_server_cert", &self.trust_server_cert)
+            .field("auth", &self.auth)
             .finish()
     }
 }
 
-/// Target database (PostgreSQL) configuration.
+/// Target database configuration.
+/// Supports PostgreSQL (default) and MSSQL targets.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TargetConfig {
-    /// Database type (always "postgres" for now).
+    /// Database type ("postgres" or "mssql").
     #[serde(default = "default_postgres")]
     pub r#type: String,
 
     /// Database host.
     pub host: String,
 
-    /// Database port (default: 5432).
+    /// Database port (default: 5432 for PostgreSQL, 1433 for MSSQL).
     #[serde(default = "default_pg_port")]
     pub port: u16,
 
     /// Database name.
     pub database: String,
 
-    /// Username.
+    /// Username (optional for Kerberos auth with MSSQL targets).
+    #[serde(default)]
     pub user: String,
 
-    /// Password.
+    /// Password (optional for Kerberos auth with MSSQL targets).
+    #[serde(default)]
     pub password: String,
 
-    /// Target schema (default: "public").
+    /// Target schema (default: "public" for PostgreSQL, "dbo" for MSSQL).
     #[serde(default = "default_public_schema")]
     pub schema: String,
 
-    /// SSL mode (default: "require").
+    /// SSL mode for PostgreSQL (default: "require"). Ignored for MSSQL.
     #[serde(default = "default_require")]
     pub ssl_mode: String,
+
+    /// Encrypt connection for MSSQL targets (default: true). Ignored for PostgreSQL.
+    #[serde(default = "default_true")]
+    pub encrypt: bool,
+
+    /// Trust server certificate for MSSQL targets (default: false). Ignored for PostgreSQL.
+    #[serde(default)]
+    pub trust_server_cert: bool,
+
+    /// Authentication method for MSSQL targets (default: sql_server). Ignored for PostgreSQL.
+    /// Use "kerberos" for Windows Integrated Authentication via ODBC.
+    /// **Requires `kerberos` feature and Microsoft ODBC Driver for SQL Server.**
+    #[serde(default)]
+    pub auth: MssqlAuthMethod,
 }
 
 impl fmt::Debug for TargetConfig {
@@ -249,6 +300,9 @@ impl fmt::Debug for TargetConfig {
             .field("password", &"[REDACTED]")
             .field("schema", &self.schema)
             .field("ssl_mode", &self.ssl_mode)
+            .field("encrypt", &self.encrypt)
+            .field("trust_server_cert", &self.trust_server_cert)
+            .field("auth", &self.auth)
             .finish()
     }
 }
