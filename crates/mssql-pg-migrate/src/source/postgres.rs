@@ -5,12 +5,15 @@
 
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
+use crate::source::pg_binary::BinaryRowParser;
 use crate::source::{CheckConstraint, Column, ForeignKey, Index, Partition, SourcePool, Table};
 use crate::target::SqlValue;
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use futures::StreamExt;
 use rustls::ClientConfig;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_postgres::Config as PgConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, info, warn};
@@ -254,6 +257,128 @@ impl PgSourcePool {
         }
 
         Ok(result)
+    }
+
+    /// Read rows using PostgreSQL COPY TO BINARY format for maximum throughput.
+    ///
+    /// This method uses async streaming with `copy_out` and the binary protocol
+    /// parser to achieve higher throughput than row-by-row SELECT:
+    /// - ~2x throughput improvement (estimated 400-600K rows/s vs 250K)
+    /// - Lower CPU usage due to binary parsing (no text encoding/decoding)
+    /// - Better memory efficiency with incremental parsing
+    ///
+    /// # Arguments
+    /// * `schema` - Schema name
+    /// * `table` - Table name
+    /// * `columns` - Column names to read
+    /// * `col_types` - PostgreSQL type names for each column (from information_schema.columns.udt_name)
+    /// * `pk_col` - Primary key column for range filtering (optional)
+    /// * `min_pk` - Minimum PK value (inclusive, optional)
+    /// * `max_pk` - Maximum PK value (inclusive, optional)
+    /// * `tx` - Channel sender to stream row batches to
+    /// * `batch_size` - Number of rows per batch sent to channel
+    ///
+    /// # Returns
+    /// Total number of rows read.
+    pub async fn copy_rows_binary(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+        col_types: &[String],
+        pk_col: Option<&str>,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+        tx: mpsc::Sender<Vec<Vec<SqlValue>>>,
+        batch_size: usize,
+    ) -> Result<i64> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for copy_rows_binary"))?;
+
+        // Build COPY query
+        let query = build_copy_query(schema, table, columns, pk_col, min_pk, max_pk);
+        debug!("COPY query: {}", query);
+
+        let t1 = Instant::now();
+
+        // Execute COPY TO STDOUT BINARY
+        let copy_stream = client.copy_out(&query).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                format!("initiating COPY: {}", e),
+            )
+        })?;
+
+        let t_copy_init = t1.elapsed();
+
+        // Create parser with column types
+        let mut parser = BinaryRowParser::from_type_names(col_types);
+
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut total_rows = 0i64;
+        let mut chunk_count = 0usize;
+
+        tokio::pin!(copy_stream);
+
+        while let Some(data) = copy_stream.next().await {
+            let bytes = data.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", schema, table),
+                    format!("reading COPY data: {}", e),
+                )
+            })?;
+
+            chunk_count += 1;
+            parser.extend(&bytes);
+
+            // Parse all complete rows from buffer
+            while let Some(row) = parser.next_row()? {
+                batch.push(row);
+                total_rows += 1;
+
+                if batch.len() >= batch_size {
+                    if tx.send(std::mem::take(&mut batch)).await.is_err() {
+                        return Err(MigrateError::transfer(
+                            format!("{}.{}", schema, table),
+                            "channel closed while sending COPY batch".to_string(),
+                        ));
+                    }
+                    batch = Vec::with_capacity(batch_size);
+                }
+            }
+        }
+
+        // Send remaining rows
+        if !batch.is_empty() {
+            if tx.send(batch).await.is_err() {
+                return Err(MigrateError::transfer(
+                    format!("{}.{}", schema, table),
+                    "channel closed while sending final COPY batch".to_string(),
+                ));
+            }
+        }
+
+        let total_time = t0.elapsed();
+
+        debug!(
+            "COPY {}.{}: {} rows in {:?} ({} chunks, copy_init={:?}, {:.0} rows/s)",
+            schema,
+            table,
+            total_rows,
+            total_time,
+            chunk_count,
+            t_copy_init,
+            total_rows as f64 / total_time.as_secs_f64()
+        );
+
+        Ok(total_rows)
     }
 
     /// Test the connection.
@@ -622,6 +747,69 @@ impl SourcePool for PgSourcePool {
 /// Quote a PostgreSQL identifier.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build a PostgreSQL COPY TO STDOUT BINARY query with optional PK range filter.
+fn build_copy_query(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    pk_col: Option<&str>,
+    min_pk: Option<i64>,
+    max_pk: Option<i64>,
+) -> String {
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let table_ref = format!("{}.{}", quote_ident(schema), quote_ident(table));
+
+    match (pk_col, min_pk, max_pk) {
+        (Some(pk), Some(min), Some(max)) => {
+            // Use subquery for range filtering
+            format!(
+                "COPY (SELECT {} FROM {} WHERE {} >= {} AND {} <= {} ORDER BY {}) TO STDOUT (FORMAT BINARY)",
+                col_list,
+                table_ref,
+                quote_ident(pk),
+                min,
+                quote_ident(pk),
+                max,
+                quote_ident(pk)
+            )
+        }
+        (Some(pk), Some(min), None) => {
+            // Only min bound
+            format!(
+                "COPY (SELECT {} FROM {} WHERE {} >= {} ORDER BY {}) TO STDOUT (FORMAT BINARY)",
+                col_list,
+                table_ref,
+                quote_ident(pk),
+                min,
+                quote_ident(pk)
+            )
+        }
+        (Some(pk), None, Some(max)) => {
+            // Only max bound
+            format!(
+                "COPY (SELECT {} FROM {} WHERE {} <= {} ORDER BY {}) TO STDOUT (FORMAT BINARY)",
+                col_list,
+                table_ref,
+                quote_ident(pk),
+                max,
+                quote_ident(pk)
+            )
+        }
+        _ => {
+            // No PK filtering
+            format!(
+                "COPY (SELECT {} FROM {}) TO STDOUT (FORMAT BINARY)",
+                col_list, table_ref
+            )
+        }
+    }
 }
 
 /// Estimate the size of a PostgreSQL column.

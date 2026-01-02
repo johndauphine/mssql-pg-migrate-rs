@@ -6,6 +6,8 @@
 //! - MSSQL with Kerberos: `OdbcMssqlPool` (requires `kerberos` feature and ODBC driver)
 //! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
+mod bench_copy;
+mod pg_binary;
 mod postgres;
 mod types;
 
@@ -15,6 +17,7 @@ mod odbc;
 #[cfg(feature = "kerberos")]
 mod odbc_pg;
 
+pub use pg_binary::{BinaryColumnType, BinaryRowParser};
 pub use postgres::PgSourcePool;
 pub use types::*;
 

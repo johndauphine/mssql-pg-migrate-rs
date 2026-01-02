@@ -18,6 +18,7 @@ use crate::source::{
 };
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[cfg(feature = "kerberos")]
 use crate::source::{OdbcMssqlPool, OdbcPgSourcePool};
@@ -253,6 +254,41 @@ impl SourcePoolImpl {
             #[cfg(feature = "kerberos")]
             Self::OdbcPostgres(p) => p.query_rows_fast(sql, columns, col_types).await,
         }
+    }
+
+    /// Stream rows using PostgreSQL COPY TO BINARY protocol.
+    /// Returns the total number of rows read.
+    /// Only supported for PostgreSQL sources - returns an error for other sources.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_rows_binary(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+        col_types: &[String],
+        pk_col: Option<&str>,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+        tx: mpsc::Sender<Vec<Vec<SqlValue>>>,
+        batch_size: usize,
+    ) -> Result<i64> {
+        match self {
+            Self::Postgres(p) => {
+                p.copy_rows_binary(
+                    schema, table, columns, col_types, pk_col, min_pk, max_pk, tx, batch_size,
+                )
+                .await
+            }
+            // COPY TO BINARY is only supported for PostgreSQL sources
+            _ => Err(crate::error::MigrateError::Config(
+                "COPY TO BINARY is only supported for PostgreSQL sources".to_string(),
+            )),
+        }
+    }
+
+    /// Check if this source supports COPY TO BINARY streaming.
+    pub fn supports_copy_binary(&self) -> bool {
+        matches!(self, Self::Postgres(_))
     }
 
     /// Get the maximum value of a primary key column.
