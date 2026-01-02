@@ -2,8 +2,7 @@
 //!
 //! This module provides database-agnostic source operations via the `SourcePool` trait.
 //! Implementations are provided for:
-//! - MSSQL: `MssqlPool` (the default source, uses tiberius with SQL Server auth)
-//! - MSSQL with Kerberos: `OdbcMssqlPool` (requires `kerberos` feature and ODBC driver)
+//! - MSSQL: `MssqlPool` (uses Tiberius with SQL Server or Kerberos auth)
 //! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
 mod bench_copy;
@@ -11,29 +10,19 @@ mod pg_binary;
 mod postgres;
 mod types;
 
-#[cfg(feature = "kerberos")]
-mod odbc;
-
-#[cfg(feature = "kerberos")]
-mod odbc_pg;
-
 pub use pg_binary::{BinaryColumnType, BinaryRowParser};
 pub use postgres::PgSourcePool;
 pub use types::*;
 
 #[cfg(feature = "kerberos")]
-pub use odbc::OdbcMssqlPool;
-
-#[cfg(feature = "kerberos")]
-pub use odbc_pg::OdbcPgSourcePool;
-
+use crate::config::AuthMethod as ConfigAuthMethod;
 use crate::config::SourceConfig;
 use crate::error::{MigrateError, Result};
 use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
-use tiberius::{AuthMethod, Client, Config, EncryptionLevel, Query, Row};
+use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info};
@@ -92,10 +81,23 @@ impl TiberiusConnectionManager {
         config.host(&self.config.host);
         config.port(self.config.port);
         config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            &self.config.user,
-            &self.config.password,
-        ));
+
+        // Set authentication method based on config
+        match self.config.auth {
+            #[cfg(feature = "kerberos")]
+            ConfigAuthMethod::Kerberos => {
+                // Use Tiberius integrated auth (GSSAPI on Unix, SSPI on Windows)
+                info!("Using Kerberos authentication via Tiberius GSSAPI for MSSQL source");
+                config.authentication(TiberiusAuthMethod::Integrated);
+            }
+            _ => {
+                // Default to SQL Server authentication
+                config.authentication(TiberiusAuthMethod::sql_server(
+                    &self.config.user,
+                    &self.config.password,
+                ));
+            }
+        }
 
         // Encryption settings
         if self.config.encrypt {
