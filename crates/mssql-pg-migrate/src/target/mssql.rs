@@ -1355,6 +1355,22 @@ impl TargetPool for MssqlTargetPool {
 
         let qualified_table = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
 
+        // Validate column count matches for each row.
+        // Tiberius bulk insert reads column metadata from the target table, so rows must
+        // have the exact same number of columns in the correct order.
+        let expected_cols = cols.len();
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != expected_cols {
+                return Err(MigrateError::transfer(
+                    &qualified_table,
+                    format!(
+                        "row {} has {} columns, expected {} (columns: {:?})",
+                        i, row.len(), expected_cols, cols
+                    ),
+                ));
+            }
+        }
+
         // Partition rows: bulk-insertable vs oversized strings
         // Tiberius bulk insert has a 65535 byte limit for UTF-16 encoded strings.
         let mut bulk_rows = Vec::with_capacity(rows.len());
@@ -1466,6 +1482,21 @@ impl TargetPool for MssqlTargetPool {
         let chunk_start = Instant::now();
 
         let qualified_target = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
+
+        // Validate column count matches for each row.
+        // Bulk insert to staging table requires rows to have the exact column count.
+        let expected_cols = cols.len();
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != expected_cols {
+                return Err(MigrateError::transfer(
+                    &qualified_target,
+                    format!(
+                        "row {} has {} columns, expected {} (columns: {:?})",
+                        i, row.len(), expected_cols, cols
+                    ),
+                ));
+            }
+        }
 
         // Get a connection for the entire operation
         let mut conn = self.get_conn().await?;
