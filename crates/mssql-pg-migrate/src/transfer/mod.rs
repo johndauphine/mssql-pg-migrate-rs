@@ -1021,13 +1021,22 @@ fn qualify_pg_table(schema: &str, table: &str) -> String {
 }
 
 /// Check if the primary key is a sortable integer type.
+/// Supports both MSSQL and PostgreSQL type names.
 fn is_pk_sortable(table: &Table) -> bool {
     if table.pk_columns.is_empty() {
         return false;
     }
 
     let pk_type = table.pk_columns[0].data_type.to_lowercase();
-    matches!(pk_type.as_str(), "int" | "bigint" | "smallint" | "tinyint")
+    matches!(
+        pk_type.as_str(),
+        // MSSQL types
+        "int" | "bigint" | "smallint" | "tinyint" |
+        // PostgreSQL types
+        "integer" | "int4" | "int8" | "int2" |
+        // PostgreSQL aliases
+        "serial" | "bigserial" | "smallserial"
+    )
 }
 
 /// Quote a SQL Server identifier, escaping closing brackets.

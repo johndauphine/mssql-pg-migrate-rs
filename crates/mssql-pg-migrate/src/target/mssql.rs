@@ -181,17 +181,32 @@ impl MssqlTargetPool {
     /// Get column definitions for creating a staging table.
     ///
     /// Returns column definitions WITHOUT identity property to allow bulk insert.
-    /// The staging table mirrors the target table structure but with identity removed.
-    async fn get_column_definitions(
+    /// The staging table uses "widened" types to be compatible with data from any source:
+    /// - `tinyint` → `smallint` (PostgreSQL maps tinyint to smallint, so we need I16 compatibility)
+    /// - `datetime` → `datetime2(7)` (for maximum precision and compatibility with our DateTime handling)
+    /// - `smalldatetime` → `datetime2(7)` (same reason)
+    ///
+    /// This ensures bulk insert succeeds when migrating from PostgreSQL (or other sources)
+    /// where type mappings may have widened the original MSSQL types.
+    async fn get_column_definitions_for_staging(
         conn: &mut tiberius::Client<Compat<TcpStream>>,
         schema: &str,
         table: &str,
     ) -> Result<Vec<(String, String, bool)>> {
         // Query column metadata: name, data type with length/precision, and nullability
+        // Note: We widen certain types to ensure compatibility with source data:
+        // - tinyint → smallint (PostgreSQL uses smallint for MSSQL's tinyint)
+        // - datetime/smalldatetime → datetime2(7) (for precision and compatibility)
         let query = r#"
             SELECT
                 c.name AS column_name,
                 CASE
+                    -- Widen tinyint to smallint for PostgreSQL compatibility
+                    -- (PostgreSQL maps MSSQL tinyint to smallint, so source sends I16)
+                    WHEN t.name = 'tinyint' THEN 'smallint'
+                    -- Widen datetime types to datetime2(7) for precision compatibility
+                    WHEN t.name IN ('datetime', 'smalldatetime') THEN 'datetime2(7)'
+                    -- Standard type handling
                     WHEN t.name IN ('nvarchar', 'nchar') AND c.max_length = -1 THEN t.name + '(max)'
                     WHEN t.name IN ('nvarchar', 'nchar') THEN t.name + '(' + CAST(c.max_length/2 AS VARCHAR) + ')'
                     WHEN t.name IN ('varchar', 'char', 'varbinary', 'binary') AND c.max_length = -1 THEN t.name + '(max)'
@@ -288,15 +303,20 @@ impl MssqlTargetPool {
             .is_some();
 
         if table_exists {
-            // Truncate existing staging table for reuse
-            let truncate_sql = format!("TRUNCATE TABLE {}", qualified_staging);
-            conn.execute(&truncate_sql, &[]).await.map_err(|e| {
-                MigrateError::transfer(&qualified_staging, format!("truncating staging: {}", e))
+            // Drop existing staging table to ensure correct column types
+            // This is necessary because source data types may differ from target
+            // (e.g., PostgreSQL sends I16 for MSSQL's tinyint)
+            let drop_sql = format!("DROP TABLE {}", qualified_staging);
+            conn.execute(&drop_sql, &[]).await.map_err(|e| {
+                MigrateError::transfer(&qualified_staging, format!("dropping staging: {}", e))
             })?;
-            debug!("Truncated staging table {}", qualified_staging);
-        } else {
-            // Get column definitions from target table
-            let columns = Self::get_column_definitions(conn, schema, table).await?;
+            debug!("Dropped staging table {}", qualified_staging);
+        }
+
+        {
+            // Get column definitions from target table with widened types for staging
+            // This ensures compatibility with data from any source (e.g., PostgreSQL)
+            let columns = Self::get_column_definitions_for_staging(conn, schema, table).await?;
 
             if columns.is_empty() {
                 return Err(MigrateError::transfer(
