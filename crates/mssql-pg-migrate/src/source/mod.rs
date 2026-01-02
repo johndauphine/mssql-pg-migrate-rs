@@ -102,6 +102,9 @@ impl TiberiusConnectionManager {
             config.encryption(EncryptionLevel::NotSupported);
         }
 
+        // Use maximum packet size (32KB) for better performance
+        config.packet_size(32767);
+
         config
     }
 }

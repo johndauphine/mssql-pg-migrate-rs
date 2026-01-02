@@ -64,6 +64,9 @@ impl TiberiusTargetConnectionManager {
             }
         }
 
+        // Use maximum packet size (32KB) for better bulk insert performance
+        config.packet_size(32767);
+
         config
     }
 }
