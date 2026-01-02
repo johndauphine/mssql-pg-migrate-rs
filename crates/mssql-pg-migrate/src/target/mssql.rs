@@ -1378,40 +1378,97 @@ impl TargetPool for MssqlTargetPool {
         // 3. Each operation (bulk insert, INSERT batches) is atomic on its own
 
         // Process bulk-insertable rows via TDS bulk insert (5-10x faster)
+        // Retry on deadlock - page split contention can cause deadlocks with parallel writers
         if !bulk_rows.is_empty() {
             let bulk_count = bulk_rows.len() as u64;
+            let mut retries = 0u32;
 
-            // Start bulk insert - Tiberius reads column metadata from the target table
-            let mut bulk_load = conn
-                .bulk_insert(&qualified_table)
-                .await
-                .map_err(|e| {
-                    MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e))
-                })?;
+            'bulk_retry: loop {
+                // Start bulk insert - Tiberius reads column metadata from the target table
+                let bulk_load_result = conn.bulk_insert(&qualified_table).await;
 
-            // Send each row
-            for row in bulk_rows {
-                let mut token_row = TokenRow::new();
-                for value in &row {
-                    token_row.push(sql_value_to_column_data(value));
+                let mut bulk_load = match bulk_load_result {
+                    Ok(bl) => bl,
+                    Err(e) if Self::is_deadlock_error(&e) && retries < DEADLOCK_MAX_RETRIES => {
+                        retries += 1;
+                        warn!(
+                            "Deadlock detected during bulk insert init to {}, retry {}/{}",
+                            qualified_table, retries, DEADLOCK_MAX_RETRIES
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            DEADLOCK_RETRY_DELAY_MS * retries as u64,
+                        ))
+                        .await;
+                        conn = self.get_conn().await?;
+                        continue 'bulk_retry;
+                    }
+                    Err(e) => {
+                        return Err(MigrateError::transfer(
+                            &qualified_table,
+                            format!("bulk insert init: {}", e),
+                        ));
+                    }
+                };
+
+                // Send each row
+                for row in &bulk_rows {
+                    let mut token_row = TokenRow::new();
+                    for value in row {
+                        token_row.push(sql_value_to_column_data(value));
+                    }
+                    if let Err(e) = bulk_load.send(token_row).await {
+                        if Self::is_deadlock_error(&e) && retries < DEADLOCK_MAX_RETRIES {
+                            retries += 1;
+                            warn!(
+                                "Deadlock detected during bulk insert send to {}, retry {}/{}",
+                                qualified_table, retries, DEADLOCK_MAX_RETRIES
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                DEADLOCK_RETRY_DELAY_MS * retries as u64,
+                            ))
+                            .await;
+                            conn = self.get_conn().await?;
+                            continue 'bulk_retry;
+                        }
+                        return Err(MigrateError::transfer(
+                            &qualified_table,
+                            format!("bulk insert send: {}", e),
+                        ));
+                    }
                 }
-                bulk_load.send(token_row).await.map_err(|e| {
-                    MigrateError::transfer(&qualified_table, format!("bulk insert send: {}", e))
-                })?;
+
+                // Finalize the bulk insert
+                match bulk_load.finalize().await {
+                    Ok(result) => {
+                        let rows_affected = result.total();
+                        debug!(
+                            "Bulk inserted {} rows into {} (reported: {})",
+                            bulk_count, qualified_table, rows_affected
+                        );
+                        total_inserted += bulk_count;
+                        break 'bulk_retry;
+                    }
+                    Err(e) if Self::is_deadlock_error(&e) && retries < DEADLOCK_MAX_RETRIES => {
+                        retries += 1;
+                        warn!(
+                            "Deadlock detected during bulk insert finalize to {}, retry {}/{}",
+                            qualified_table, retries, DEADLOCK_MAX_RETRIES
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            DEADLOCK_RETRY_DELAY_MS * retries as u64,
+                        ))
+                        .await;
+                        conn = self.get_conn().await?;
+                        continue 'bulk_retry;
+                    }
+                    Err(e) => {
+                        return Err(MigrateError::transfer(
+                            &qualified_table,
+                            format!("bulk insert finalize: {}", e),
+                        ));
+                    }
+                }
             }
-
-            // Finalize the bulk insert
-            let result = bulk_load.finalize().await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("bulk insert finalize: {}", e))
-            })?;
-
-            let rows_affected = result.total();
-            debug!(
-                "Bulk inserted {} rows into {} (reported: {})",
-                bulk_count, qualified_table, rows_affected
-            );
-
-            total_inserted += bulk_count;
         }
 
         // Fall back to parameterized INSERT statements for rows with oversized strings

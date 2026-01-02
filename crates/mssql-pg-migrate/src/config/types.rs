@@ -562,20 +562,24 @@ impl MigrationConfig {
         }
 
         // Parallel writers: depends on target database type.
-        // MSSQL targets: fixed at 2 due to TABLOCK bulk insert serialization.
-        //   - TABLOCK acquires exclusive table lock, serializing all writers
-        //   - More writers = more lock contention overhead, not more throughput
+        //
+        // MSSQL targets: fixed at 2 for all modes.
+        //   - Benchmarks show 2 writers outperforms 4 or 8 writers due to:
+        //     - Tiberius bulk insert overhead with multiple streams
+        //     - MSSQL B-tree latch contention with parallel inserts
+        //   - Deadlock retry logic handles rare page split deadlocks
+        //
         // PostgreSQL targets: cores/4 clamped to 2-4, COPY handles parallelism well.
         if self.write_ahead_writers.is_none() {
             let is_mssql_target = matches!(target_type, Some(DatabaseType::Mssql));
             let writers = if is_mssql_target {
-                2 // Fixed for MSSQL due to TABLOCK serialization
+                2 // Fixed for MSSQL: benchmarks show 2 writers is optimal
             } else {
                 (cores / 4).max(2).min(4)
             };
             self.write_ahead_writers = Some(writers);
             if is_mssql_target {
-                info!("  WriteAheadWriters: {} (auto: fixed 2 for MSSQL TABLOCK)", writers);
+                info!("  WriteAheadWriters: {} (auto: fixed 2 for MSSQL)", writers);
             } else {
                 info!(
                     "  WriteAheadWriters: {} (auto: cores/4 clamped 2-4, {} cores)",
