@@ -6,6 +6,7 @@
 //! - MSSQL with Kerberos: `OdbcMssqlPool` (requires `kerberos` feature and ODBC driver)
 //! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
+mod bench_copy;
 mod pg_binary;
 mod postgres;
 mod types;
