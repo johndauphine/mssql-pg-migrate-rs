@@ -17,6 +17,8 @@ tokio = { version = "1.40", features = ["full"] }
 # MSSQL driver (pure Rust with rustls)
 # Note: The "tds73" feature enables TDS 7.3 protocol, which requires SQL Server 2008 or later
 # (including Azure SQL). Earlier SQL Server versions are not supported with this configuration.
+# The "integrated-auth-gssapi" feature enables Kerberos authentication on Unix/macOS.
+# When kerberos-mssql feature is enabled, GSSAPI is added for native Kerberos auth.
 tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls", "rust_decimal", "tds73"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 

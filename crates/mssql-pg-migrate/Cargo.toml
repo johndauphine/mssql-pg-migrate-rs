@@ -11,7 +11,10 @@ categories = ["database", "command-line-utilities"]
 
 [features]
 default = []
-kerberos = ["odbc-api"]
+# MSSQL Kerberos authentication via native Tiberius GSSAPI (~180K rows/sec)
+# Requires libgssapi-krb5-2 on Linux, GSS.framework on macOS, SSPI on Windows
+# Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
+kerberos = ["tiberius/integrated-auth-gssapi"]
 
 [dependencies]
 # Async runtime
@@ -77,9 +80,6 @@ sysinfo = { workspace = true }
 
 # Glob pattern matching for table filters
 glob = "0.3"
-
-# ODBC for Kerberos authentication (optional)
-odbc-api = { version = "8", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

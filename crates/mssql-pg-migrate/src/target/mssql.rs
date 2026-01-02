@@ -3,6 +3,8 @@
 //! This module implements `TargetPool` for MSSQL, enabling MSSQL
 //! to be used as a target database for bidirectional migrations.
 
+#[cfg(feature = "kerberos")]
+use crate::config::AuthMethod as ConfigAuthMethod;
 use crate::config::TargetConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
@@ -12,7 +14,7 @@ use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::Timelike;
 use std::borrow::Cow;
-use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow};
+use tiberius::{AuthMethod as TiberiusAuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
@@ -53,10 +55,23 @@ impl TiberiusTargetConnectionManager {
         config.host(&self.config.host);
         config.port(self.config.port);
         config.database(&self.config.database);
-        config.authentication(AuthMethod::sql_server(
-            &self.config.user,
-            &self.config.password,
-        ));
+
+        // Set authentication method based on config
+        match self.config.auth {
+            #[cfg(feature = "kerberos")]
+            ConfigAuthMethod::Kerberos => {
+                // Use Tiberius integrated auth (GSSAPI on Unix, SSPI on Windows)
+                info!("Using Kerberos authentication via Tiberius GSSAPI for MSSQL target");
+                config.authentication(TiberiusAuthMethod::Integrated);
+            }
+            _ => {
+                // Default to SQL Server authentication
+                config.authentication(TiberiusAuthMethod::sql_server(
+                    &self.config.user,
+                    &self.config.password,
+                ));
+            }
+        }
 
         // Map ssl_mode to MSSQL encryption settings
         match self.config.ssl_mode.to_lowercase().as_str() {
