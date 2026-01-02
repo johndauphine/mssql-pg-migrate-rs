@@ -882,6 +882,7 @@ impl Orchestrator {
             read_ahead: self.config.migration.get_read_ahead_buffers(),
             parallel_readers: self.config.migration.get_parallel_readers(),
             parallel_writers: self.config.migration.get_write_ahead_writers(),
+            use_copy_binary: true, // Enable COPY TO BINARY for PostgreSQL sources
         };
 
         let engine = Arc::new(
