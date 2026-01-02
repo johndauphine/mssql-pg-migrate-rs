@@ -447,6 +447,9 @@ impl MssqlTargetPool {
     ///
     /// This is a helper that handles both regular rows and oversized string rows.
     /// Returns the number of rows inserted.
+    ///
+    /// Performance optimization: avoids cloning rows in the common case where no
+    /// rows have oversized strings (>65KB). Only clones when partitioning is needed.
     async fn bulk_insert_to_table(
         conn: &mut PooledConnection<'_, TiberiusTargetConnectionManager>,
         qualified_table: &str,
@@ -457,24 +460,12 @@ impl MssqlTargetPool {
             return Ok(0);
         }
 
-        // Partition rows: bulk-insertable vs oversized strings
-        let mut bulk_rows = Vec::with_capacity(rows.len());
-        let mut oversized_rows = Vec::new();
+        // Fast path: check if any rows have oversized strings (rare case)
+        // This avoids cloning all rows when partitioning isn't needed
+        let has_oversized = rows.iter().any(|r| Self::row_has_oversized_strings(r));
 
-        for row in rows {
-            if Self::row_has_oversized_strings(row) {
-                oversized_rows.push(row.clone());
-            } else {
-                bulk_rows.push(row.clone());
-            }
-        }
-
-        let mut total_inserted = 0u64;
-
-        // Process bulk-insertable rows via TDS bulk insert
-        if !bulk_rows.is_empty() {
-            let bulk_count = bulk_rows.len() as u64;
-
+        if !has_oversized {
+            // Fast path: no oversized strings, process all rows directly without cloning
             let mut bulk_load = conn
                 .bulk_insert(qualified_table)
                 .await
@@ -482,9 +473,9 @@ impl MssqlTargetPool {
                     MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
                 })?;
 
-            for row in bulk_rows {
+            for row in rows {
                 let mut token_row = TokenRow::new();
-                for value in &row {
+                for value in row {
                     token_row.push(sql_value_to_column_data(value));
                 }
                 bulk_load.send(token_row).await.map_err(|e| {
@@ -496,20 +487,52 @@ impl MssqlTargetPool {
                 MigrateError::transfer(qualified_table, format!("bulk insert finalize: {}", e))
             })?;
 
-            total_inserted += bulk_count;
+            return Ok(rows.len() as u64);
         }
+
+        // Slow path: partition rows - only clone oversized rows
+        let mut oversized_rows = Vec::new();
+        let mut bulk_count = 0u64;
+
+        // First pass: bulk insert non-oversized rows directly
+        let mut bulk_load = conn
+            .bulk_insert(qualified_table)
+            .await
+            .map_err(|e| {
+                MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
+            })?;
+
+        for row in rows {
+            if Self::row_has_oversized_strings(row) {
+                // Only clone oversized rows (rare)
+                oversized_rows.push(row.clone());
+            } else {
+                let mut token_row = TokenRow::new();
+                for value in row {
+                    token_row.push(sql_value_to_column_data(value));
+                }
+                bulk_load.send(token_row).await.map_err(|e| {
+                    MigrateError::transfer(qualified_table, format!("bulk insert send: {}", e))
+                })?;
+                bulk_count += 1;
+            }
+        }
+
+        bulk_load.finalize().await.map_err(|e| {
+            MigrateError::transfer(qualified_table, format!("bulk insert finalize: {}", e))
+        })?;
 
         // Process oversized rows via parameterized INSERT
         if !oversized_rows.is_empty() {
             debug!(
-                "Falling back to INSERT for {} rows with oversized strings in staging",
+                "Falling back to INSERT for {} rows with oversized strings",
                 oversized_rows.len()
             );
             let inserted = Self::insert_rows_fallback(conn, qualified_table, cols, &oversized_rows).await?;
-            total_inserted += inserted;
+            bulk_count += inserted;
         }
 
-        Ok(total_inserted)
+        Ok(bulk_count)
     }
 
     /// Check if a data type is an MSSQL native type.

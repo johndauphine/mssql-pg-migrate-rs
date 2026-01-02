@@ -1,0 +1,38 @@
+# Benchmark: PostgreSQL to MSSQL
+# Database: StackOverflow2010 (~19.3M rows)
+
+source:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow
+  user: postgres
+  password: "PostgresPassword123"
+  schema: public
+  ssl_mode: disable
+
+target:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: StackOverflow2010_bench
+  user: sa
+  password: "YourStrong@Passw0rd"
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+migration:
+  workers: 12
+  chunk_size: 100000
+  target_mode: drop_recreate
+  create_indexes: false
+  create_foreign_keys: false
+  create_check_constraints: false
+  parallel_readers: 8
+  parallel_writers: 8
+  read_ahead_buffers: 32
+  max_mssql_connections: 80
+  max_pg_connections: 60
+  large_table_threshold: 500000
+  max_partitions: 8
