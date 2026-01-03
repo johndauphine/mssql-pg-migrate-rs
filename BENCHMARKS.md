@@ -1,11 +1,16 @@
 # Performance Benchmarks
 
+Comprehensive benchmark results comparing Rust and Go implementations.
+
 ## Test Environment
 
-- **Source:** MSSQL Server 2022 (Docker container)
-- **Target:** PostgreSQL 15 (Docker container)
-- **Dataset:** Stack Overflow 2010 (~19.3M rows, 9 tables)
-- **Hardware:** Apple M1 Mac (localhost to localhost)
+- **Hardware**: Apple M3 Pro, 36GB RAM, 14 CPU cores
+- **OS**: macOS (Darwin 25.2.0)
+- **Databases**: SQL Server 2022, PostgreSQL 15 (Docker containers)
+- **Dataset**: StackOverflow2010 (~19.3M rows, 9 tables)
+- **Date**: January 2026
+
+> **Note**: SQL Server runs under Rosetta 2 emulation on Apple Silicon, adding overhead. Production Linux deployments will be faster.
 
 ## Dataset Details
 
@@ -13,63 +18,105 @@
 |-------|------|-------------|
 | Votes | 10,143,364 | Largest table |
 | Comments | 3,875,183 | Text-heavy |
-| Posts | 3,729,195 | Mixed types |
+| Posts | 3,729,195 | Mixed content types |
 | Badges | 1,102,020 | Datetime columns |
 | Users | 299,398 | Various types |
 | PostLinks | 161,519 | Foreign keys |
 | VoteTypes | 15 | Small lookup |
-| PostTypes | 8 | Small lookup |
+| PostTypes | 10 | Small lookup |
 | LinkTypes | 2 | Small lookup |
-| **Total** | **19,310,704** | |
+| **Total** | **19,310,706** | |
 
-## Results
+## Rust vs Go Comparison
 
-### Single Worker (workers=1, chunk_size=50000)
+### MSSQL → PostgreSQL
 
-| Mode | Duration | Throughput | Notes |
-|------|----------|------------|-------|
-| truncate | 104s | 185,680 rows/sec | Fastest - COPY protocol, no DDL |
-| drop_recreate | 136.6s | 141,323 rows/sec | COPY protocol + table creation |
-| upsert | ~96s | ~200,000 rows/sec | Staging table + ON CONFLICT DO UPDATE |
+| Mode | Rust | Go | Rust Advantage |
+|------|------|-----|----------------|
+| drop_recreate | **289,372 rows/s** (74s) | 287,000 rows/s (75s) | ~same |
+| upsert | **181,450 rows/s** (106s) | 72,628 rows/s (266s) | **2.5x faster** |
 
-### Key Implementation Details
+### PostgreSQL → MSSQL
 
-- **COPY Protocol:** `truncate` and `drop_recreate` use PostgreSQL COPY protocol for bulk inserts
-- **Upsert:** Streams to staging table via binary COPY, then merges with `INSERT...ON CONFLICT DO UPDATE SET`
-- **Read-ahead pipeline:** Concurrent reading/writing with tokio channels
+| Mode | Rust | Go | Rust Advantage |
+|------|------|-----|----------------|
+| drop_recreate | **145,175 rows/s** (133s) | 140,387 rows/s (137s) | ~same |
+| upsert | **80,075 rows/s** (241s) | 68,825 rows/s (280s) | **16% faster** |
 
-### Observations
+### Memory Usage
 
-1. **truncate is fastest** - No DDL operations, just TRUNCATE + COPY
-2. **drop_recreate** - Includes table creation time, still very fast with COPY
-3. **upsert is competitive** - Staging table + parallel partitioning achieves excellent throughput
+| Direction | Mode | Rust Peak | Go Peak |
+|-----------|------|-----------|---------|
+| MSSQL→PG | drop_recreate | 4.9 GB | 5.3 GB |
+| MSSQL→PG | upsert | 7.4 GB | 10.9 GB |
+| PG→MSSQL | drop_recreate | 5.4 GB | 1.8 GB |
+| PG→MSSQL | upsert | 3.7 GB | 0.5 GB |
 
-### Resource Usage
+## Key Findings
 
-- CPU: ~45-100% utilization (single-threaded migration)
-- Memory: Minimal (~50MB resident)
-- Network: Localhost, no network bottleneck
+### 1. Bulk Load Performance is Similar
+Both implementations achieve comparable throughput for bulk loads (~290K rows/sec MSSQL→PG). The bottleneck is database I/O, not the application.
 
-## Comparison with Go Implementation
+### 2. Rust Dominates Upsert Mode
+Rust is **2.5x faster** for MSSQL→PG upsert:
+- Zero-cost abstractions vs GC overhead during high-allocation workloads
+- More efficient MERGE statement generation
+- Better async task scheduling under sustained load
 
-The Rust implementation achieves comparable or better performance:
+### 3. PG→MSSQL is ~50% Slower Than MSSQL→PG
+- PostgreSQL COPY protocol is extremely optimized for bulk writes
+- MSSQL bulk insert has more TDS protocol overhead
+- MSSQL uses UTF-16 (NVARCHAR) vs PostgreSQL's UTF-8
 
-| Mode | Go (rows/sec) | Rust (rows/sec) | Notes |
-|------|---------------|-----------------|-------|
-| truncate | ~180K | 185K | Comparable |
-| drop_recreate | ~140K | 141K | Comparable |
-| upsert | ~75K | ~106K | Rust ~40% faster (staging table optimization) |
+### 4. Memory Trade-offs
+- Go uses less memory for PG→MSSQL due to different buffering strategies
+- Rust uses less memory for upsert mode (7.4GB vs 10.9GB)
+
+## Why Rust is Faster for Upsert
+
+1. **Zero-Cost Abstractions**: No GC pauses during millions of row allocations
+2. **Efficient Serialization**: Static dispatch vs runtime reflection
+3. **Async Runtime**: Tokio's poll-based futures vs Go's stackful goroutines
+4. **Binary Protocol**: Direct binary COPY reads with minimal parsing overhead
 
 ## Implemented Optimizations
 
-Since initial benchmarks, the following optimizations have been added:
-
-- [x] Parallel table processing with multiple workers (up to 8)
-- [x] Connection pooling for concurrent reads (bb8/deadpool)
-- [x] Binary COPY format for reduced serialization overhead
-- [x] Parallel readers/writers per table (up to 16 readers, 12 writers)
-- [x] UNLOGGED tables option for ~65% throughput boost
+- [x] Parallel table processing (auto-tuned workers)
+- [x] Connection pooling (bb8 for MSSQL, deadpool for PostgreSQL)
+- [x] Binary COPY format for reduced serialization
+- [x] Parallel readers/writers per table
+- [x] UNLOGGED tables option (~65% throughput boost)
 - [x] Staging table approach for upsert (2-3x faster than row-by-row)
-- [x] Efficient `INSERT...ON CONFLICT DO UPDATE SET` for upserts
+- [x] Intra-table partitioning for large tables
+- [x] 32KB TDS packet size (42% faster bulk inserts)
 
-See PERFORMANCE.md for current tuning recommendations.
+## Reproduction
+
+```bash
+# Build
+cargo build --release
+
+# MSSQL → PostgreSQL (drop_recreate)
+./target/release/mssql-pg-migrate -c benchmark-config.yaml run
+
+# MSSQL → PostgreSQL (upsert)
+./target/release/mssql-pg-migrate -c benchmark-upsert-clean.yaml run
+
+# PostgreSQL → MSSQL (drop_recreate)
+./target/release/mssql-pg-migrate -c benchmark-pg-to-mssql.yaml run
+```
+
+## Configuration
+
+```yaml
+migration:
+  workers: 6
+  chunk_size: 100000  # 50000 for upsert
+  parallel_readers: 8
+  parallel_writers: 8
+  target_mode: drop_recreate  # or upsert
+  large_table_threshold: 1000000
+  max_partitions: 8
+```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for tuning recommendations.
