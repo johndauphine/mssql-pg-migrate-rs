@@ -1,6 +1,3 @@
-# Upsert benchmark configuration for Rust - PostgreSQL to MSSQL direction
-# Database: StackOverflow2010 (~19.3M rows)
-
 source:
   type: postgres
   host: localhost
@@ -9,14 +6,13 @@ source:
   user: postgres
   password: "PostgresPassword123"
   schema: public
-  encrypt: false
-  trust_server_cert: true
+  ssl_mode: disable
 
 target:
   type: mssql
   host: localhost
   port: 1433
-  database: StackOverflow2010
+  database: StackOverflow2010_bench
   user: sa
   password: "YourStrong@Passw0rd"
   schema: dbo
@@ -27,11 +23,7 @@ migration:
   target_mode: upsert
   workers: 6
   chunk_size: 50000
-  parallel_readers: 8
-  parallel_writers: 8
-  max_mssql_connections: 50
-  max_pg_connections: 40
+  exclude_tables:
+    - "_staging_*"
   large_table_threshold: 1000000
   max_partitions: 8
-  include_tables:
-    - Votes
