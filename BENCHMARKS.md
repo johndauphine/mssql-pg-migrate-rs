@@ -4,7 +4,7 @@ Comprehensive benchmark results comparing Rust and Go implementations.
 
 ## Test Environment
 
-- **Hardware**: Apple M3 Pro, 36GB RAM, 14 CPU cores
+- **Hardware**: Apple M3 Max, 36GB RAM, 14 CPU cores
 - **OS**: macOS (Darwin 25.2.0)
 - **Databases**: SQL Server 2022, PostgreSQL 15 (Docker containers)
 - **Dataset**: StackOverflow2010 (~19.3M rows, 9 tables)
