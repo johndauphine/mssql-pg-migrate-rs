@@ -34,7 +34,7 @@ Comprehensive benchmark results comparing Rust and Go implementations.
 | Mode | Rust | Go | Advantage |
 |------|------|-----|-----------|
 | drop_recreate | **289,372 rows/s** (74s) | 287,000 rows/s (75s) | ~same |
-| upsert | **181,450 rows/s** (106s) | 120,000 rows/s (161s) | Rust 1.5x faster |
+| upsert | 181,450 rows/s (106s) | **235,160 rows/s** (82s) | Go 30% faster |
 
 ### PostgreSQL → MSSQL
 
@@ -43,7 +43,7 @@ Comprehensive benchmark results comparing Rust and Go implementations.
 | drop_recreate | **145,175 rows/s** (133s) | 140,387 rows/s (137s) | ~same |
 | upsert | **80,075 rows/s** (241s) | 74,593 rows/s (258s) | Rust 7% faster |
 
-> **Note**: Go upsert performance improved significantly after memory optimizations (was 72K→120K for MSSQL→PG).
+> **Note**: Go upsert performance improved significantly after memory optimizations (72K→235K for MSSQL→PG).
 
 ### Memory Usage
 
@@ -59,11 +59,11 @@ Comprehensive benchmark results comparing Rust and Go implementations.
 ### 1. Bulk Load Performance is Similar
 Both implementations achieve comparable throughput for bulk loads (~290K rows/sec MSSQL→PG). The bottleneck is database I/O, not the application.
 
-### 2. Rust Dominates Upsert Mode
-Rust is **2.5x faster** for MSSQL→PG upsert:
-- Zero-cost abstractions vs GC overhead during high-allocation workloads
-- More efficient MERGE statement generation
-- Better async task scheduling under sustained load
+### 2. Go Now Leads Upsert Mode (MSSQL→PG)
+After significant optimizations, Go is **30% faster** for MSSQL→PG upsert (235K vs 181K rows/s). Go's improvements include:
+- Fast-path upsert using COPY + MERGE strategy
+- Zero-allocation row scanning with slice recycling
+- Optimized keyset pagination
 
 ### 3. PG→MSSQL is ~50% Slower Than MSSQL→PG
 - PostgreSQL COPY protocol is extremely optimized for bulk writes
@@ -74,12 +74,11 @@ Rust is **2.5x faster** for MSSQL→PG upsert:
 - Go uses less memory for PG→MSSQL due to different buffering strategies
 - Rust uses less memory for upsert mode (7.4GB vs 10.9GB)
 
-## Why Rust is Faster for Upsert
+## Performance Notes
 
-1. **Zero-Cost Abstractions**: No GC pauses during millions of row allocations
-2. **Efficient Serialization**: Static dispatch vs runtime reflection
-3. **Async Runtime**: Tokio's poll-based futures vs Go's stackful goroutines
-4. **Binary Protocol**: Direct binary COPY reads with minimal parsing overhead
+- **Rust** still leads for PG→MSSQL upsert (7% faster)
+- **Go** now leads for MSSQL→PG upsert (30% faster) after major optimizations
+- Both use similar strategies: staging tables, COPY protocol, parallel workers
 
 ## Implemented Optimizations
 
