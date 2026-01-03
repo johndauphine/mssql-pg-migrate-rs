@@ -31,17 +31,19 @@ Comprehensive benchmark results comparing Rust and Go implementations.
 
 ### MSSQL → PostgreSQL
 
-| Mode | Rust | Go | Rust Advantage |
-|------|------|-----|----------------|
+| Mode | Rust | Go | Advantage |
+|------|------|-----|-----------|
 | drop_recreate | **289,372 rows/s** (74s) | 287,000 rows/s (75s) | ~same |
-| upsert | **181,450 rows/s** (106s) | 72,628 rows/s (266s) | **2.5x faster** |
+| upsert | **181,450 rows/s** (106s) | 120,000 rows/s (161s) | Rust 1.5x faster |
 
 ### PostgreSQL → MSSQL
 
-| Mode | Rust | Go | Rust Advantage |
-|------|------|-----|----------------|
+| Mode | Rust | Go | Advantage |
+|------|------|-----|-----------|
 | drop_recreate | **145,175 rows/s** (133s) | 140,387 rows/s (137s) | ~same |
-| upsert | **80,075 rows/s** (241s) | 68,825 rows/s (280s) | **16% faster** |
+| upsert | **80,075 rows/s** (241s) | 74,593 rows/s (258s) | Rust 7% faster |
+
+> **Note**: Go upsert performance improved significantly after memory optimizations (was 72K→120K for MSSQL→PG).
 
 ### Memory Usage
 
