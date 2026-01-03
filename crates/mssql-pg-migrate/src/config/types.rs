@@ -522,7 +522,7 @@ impl MigrationConfig {
         // Benchmarking shows 6 workers is optimal for most workloads.
         // Too few underutilizes parallelism, too many causes contention.
         if self.workers.is_none() {
-            let workers = (cores / 2).max(4).min(8);
+            let workers = (cores / 2).max(4).min(16);
             self.workers = Some(workers);
         }
         let workers = self.workers.unwrap();
@@ -530,10 +530,10 @@ impl MigrationConfig {
         // Parallel readers: conservative scaling based on cores.
         // Formula: cores/4 clamped to 2-4 for optimal throughput without overwhelming source.
         if self.parallel_readers.is_none() {
-            let readers = (cores / 4).max(2).min(4);
+            let readers = (cores / 4).max(2).min(16);
             self.parallel_readers = Some(readers);
             info!(
-                "  ParallelReaders: {} (auto: cores/4 clamped 2-4, {} cores)",
+                "  ParallelReaders: {} (auto: cores/4 clamped 2-16, {} cores)",
                 readers, cores
             );
         }
@@ -548,14 +548,14 @@ impl MigrationConfig {
             let writers = if is_mssql_target {
                 2 // Fixed for MSSQL due to TABLOCK serialization
             } else {
-                (cores / 4).max(2).min(4)
+                (cores / 4).max(2).min(16)
             };
             self.write_ahead_writers = Some(writers);
             if is_mssql_target {
                 info!("  WriteAheadWriters: {} (auto: fixed 2 for MSSQL TABLOCK)", writers);
             } else {
                 info!(
-                    "  WriteAheadWriters: {} (auto: cores/4 clamped 2-4, {} cores)",
+                    "  WriteAheadWriters: {} (auto: cores/4 clamped 2-16, {} cores)",
                     writers, cores
                 );
             }

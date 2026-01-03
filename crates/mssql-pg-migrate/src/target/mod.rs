@@ -125,6 +125,30 @@ pub trait TargetPool: Send + Sync {
 
     /// Close all connections.
     async fn close(&self);
+
+    /// Get a dedicated upsert writer for a specific table/partition.
+    ///
+    /// The writer holds a persistent connection and reuses the staging table
+    /// across chunks to minimize overhead and system catalog churn.
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>>;
+}
+
+/// Trait for a stateful upsert writer that holds a connection.
+#[async_trait]
+pub trait UpsertWriter: Send {
+    /// Upsert a chunk of rows using the held connection.
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64>;
 }
 
 /// SQL value enum for type-safe row handling.
@@ -1476,6 +1500,220 @@ impl TargetPool for PgPool {
     async fn close(&self) {
         // Pool will be closed when dropped
     }
+
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for upsert writer"))?;
+
+        Ok(Box::new(PgUpsertWriter {
+            client,
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+            staging_table_created: false,
+            copy_buffer_rows: self.copy_buffer_rows,
+        }))
+    }
+}
+
+/// Stateful upsert writer for PostgreSQL.
+/// Holds a connection to reuse the staging table across chunks.
+pub struct PgUpsertWriter {
+    client: deadpool_postgres::Object,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+    staging_table_created: bool,
+    copy_buffer_rows: usize,
+}
+
+#[async_trait]
+impl UpsertWriter for PgUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        use std::time::Instant;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        if pk_cols.is_empty() {
+            return Err(MigrateError::NoPrimaryKey(self.table.clone()));
+        }
+
+        let row_count = rows.len() as u64;
+        let chunk_start = Instant::now();
+
+        // Use per-writer staging table to avoid conflicts between parallel writers.
+        let staging_table = pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
+
+        // Start a transaction for the entire chunk to ensure atomicity and connection stability
+        let tx = self.client.transaction().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("starting upsert transaction: {}", e),
+            )
+        })?;
+
+        // 1. Create temp staging table (only once per writer session)
+        // Even though it's a TEMP table, creating it inside a transaction is fine.
+        if !self.staging_table_created {
+            let create_staging_sql = format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS",
+                pg_quote_ident(&staging_table),
+                pg_qualify_table(&self.schema, &self.table)
+            );
+            tx.execute(&create_staging_sql, &[])
+                .await
+                .map_err(|e| {
+                    MigrateError::transfer(
+                        format!("{}.{}", self.schema, self.table),
+                        format!("creating staging table: {}", e),
+                    )
+                })?;
+            self.staging_table_created = true;
+        }
+
+        // Truncate to clear any previous batch data
+        let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
+        tx.execute(&truncate_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("truncating staging table: {}", e),
+            )
+        })?;
+
+        let staging_time = chunk_start.elapsed();
+        let copy_start = Instant::now();
+
+        // 2. COPY rows into staging table using binary format
+        let col_list: String = cols
+            .iter()
+            .map(|c| pg_quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let copy_stmt = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            pg_quote_ident(&staging_table),
+            col_list
+        );
+
+        // Execute COPY within the transaction
+        let sink = tx.copy_in(&copy_stmt).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("initiating COPY to staging: {}", e),
+            )
+        })?;
+
+        futures::pin_mut!(sink);
+
+        // Build binary COPY data
+        let mut buf = BytesMut::with_capacity(COPY_SEND_BUF_SIZE * 2);
+
+        // Write binary COPY header
+        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        buf.put_i32(0); // Flags: no OIDs
+        buf.put_i32(0); // Header extension length: 0
+
+        let num_cols = cols.len() as i16;
+
+        for row in &rows {
+            // Field count (16-bit)
+            buf.put_i16(num_cols);
+
+            // Write each field
+            for value in row.iter() {
+                write_binary_value(&mut buf, value);
+            }
+
+            // Flush when buffer is large enough
+            if buf.len() > COPY_SEND_BUF_SIZE {
+                sink.send(buf.split().freeze()).await.map_err(|e| {
+                    MigrateError::transfer(
+                        format!("{}.{}", self.schema, self.table),
+                        format!("sending COPY data to staging: {}", e),
+                    )
+                })?;
+            }
+        }
+
+        // Write trailer (-1 as field count indicates end)
+        buf.put_i16(-1);
+
+        // Send remaining data
+        if !buf.is_empty() {
+            sink.send(buf.freeze()).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("sending final COPY data to staging: {}", e),
+                )
+            })?;
+        }
+
+        // Finish COPY
+        sink.finish().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("finishing COPY to staging: {}", e),
+            )
+        })?;
+
+        let copy_time = copy_start.elapsed();
+        let merge_start = Instant::now();
+
+        // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
+        let merge_sql = build_staging_merge_sql(&self.schema, &self.table, &staging_table, cols, pk_cols);
+        tx.execute(&merge_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("merging staging to target: {}", e),
+            )
+        })?;
+
+        // Commit the transaction
+        tx.commit().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("committing upsert transaction: {}", e),
+            )
+        })?;
+
+        let merge_time = merge_start.elapsed();
+        let total_time = chunk_start.elapsed();
+
+        // Log detailed timing for profiling
+        if row_count >= UPSERT_PROFILING_ROW_THRESHOLD {
+            tracing::debug!(
+                "{}.{}: upsert chunk {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
+                self.schema,
+                self.table,
+                row_count,
+                staging_time,
+                copy_time,
+                merge_time,
+                total_time
+            );
+        }
+
+        Ok(row_count)
+    }
 }
 
 impl PgPool {
@@ -2250,18 +2488,33 @@ fn build_staging_merge_sql(
             pk_list
         )
     } else {
-        // Simple DO UPDATE SET without change detection.
-        // Previous approach used IS DISTINCT FROM for each column, which is expensive
-        // for tables with large TEXT/BYTEA columns (e.g., Posts.Body).
-        // PostgreSQL's MVCC handles unchanged rows efficiently anyway.
+        // High-performance upsert with change detection.
+        // Using IS DISTINCT FROM prevents PostgreSQL from creating new dead tuples
+        // when data hasnt actually changed. This significantly reduces table bloat,
+        // index maintenance overhead, and WAL traffic.
+        let change_detection: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| {
+                let quoted = pg_quote_ident(c);
+                format!(
+                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                    pg_qualify_table(schema, table),
+                    quoted,
+                    quoted
+                )
+            })
+            .collect();
+
         format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
             pg_qualify_table(schema, table),
             col_list,
             col_list,
             pg_quote_ident(staging_table),
             pk_list,
-            update_cols.join(", ")
+            update_cols.join(", "),
+            change_detection.join(" OR ")
         )
     }
 }
@@ -2280,9 +2533,10 @@ mod tests {
         // Should update name and value columns
         assert!(sql.contains(r#""name" = EXCLUDED."name""#));
         assert!(sql.contains(r#""value" = EXCLUDED."value""#));
-        // Should not use expensive change detection
-        assert!(!sql.contains("IS DISTINCT FROM"));
-        assert!(!sql.contains("WHERE"));
+        // Should use high-performance change detection
+        assert!(sql.contains("IS DISTINCT FROM"));
+        assert!(sql.contains(r#""public"."users"."name" IS DISTINCT FROM EXCLUDED."name""#));
+        assert!(sql.contains("WHERE"));
     }
 
     #[test]

@@ -319,10 +319,28 @@ impl TransferEngine {
             let columns_clone = columns.clone();
             let pk_cols_clone = pk_cols.clone();
             let target_mode = job.target_mode;
+            let partition_id = job.partition_id;
 
             let handle = tokio::spawn(async move {
                 let mut local_write_time = Duration::ZERO;
                 let mut local_rows = 0i64;
+
+                // For Upsert mode, create a dedicated writer that holds the connection
+                // and reuses the staging table to prevent catalog churn.
+                let mut upsert_writer: Option<Box<dyn crate::target::UpsertWriter>> = if target_mode == TargetMode::Upsert {
+                    Some(
+                        target
+                            .get_upsert_writer(
+                                &schema,
+                                &table_name_clone,
+                                writer_id,
+                                partition_id,
+                            )
+                            .await?,
+                    )
+                } else {
+                    None
+                };
 
                 while let Ok(write_job) = write_rx.recv().await {
                     let write_start = Instant::now();
@@ -330,20 +348,16 @@ impl TransferEngine {
 
                     let result = match target_mode {
                         TargetMode::Upsert => {
-                            // Per-chunk upsert: copy to staging, merge, repeat
-                            // This approach has lower lock contention than deferred merge
-                            // because each MERGE is smaller and releases locks faster.
-                            target
-                                .upsert_chunk(
-                                    &schema,
-                                    &table_name_clone,
-                                    &columns_clone,
-                                    &pk_cols_clone,
-                                    write_job.rows,
-                                    writer_id,
-                                    write_job.partition_id,
-                                )
-                                .await
+                            if let Some(writer) = &mut upsert_writer {
+                                writer
+                                    .upsert_chunk(&columns_clone, &pk_cols_clone, write_job.rows)
+                                    .await
+                            } else {
+                                Err(MigrateError::transfer(
+                                    table_name_clone.clone(),
+                                    "Upsert writer not initialized".to_string(),
+                                ))
+                            }
                         }
                         _ => {
                             target

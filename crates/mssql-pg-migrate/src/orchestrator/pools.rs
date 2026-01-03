@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
-use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool};
+use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -461,6 +461,20 @@ impl TargetPoolImpl {
                 p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
                     .await
             }
+        }
+    }
+
+    /// Get a dedicated upsert writer for a specific table/partition.
+    pub async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        match self {
+            Self::Mssql(p) => p.get_upsert_writer(schema, table, writer_id, partition_id).await,
+            Self::Postgres(p) => p.get_upsert_writer(schema, table, writer_id, partition_id).await,
         }
     }
 

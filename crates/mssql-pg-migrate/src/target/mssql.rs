@@ -8,7 +8,7 @@ use crate::config::AuthMethod as ConfigAuthMethod;
 use crate::config::TargetConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
-use crate::target::{SqlNullType, SqlValue, TargetPool};
+use crate::target::{SqlNullType, SqlValue, TargetPool, UpsertWriter};
 use crate::typemap::postgres_to_mssql;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
@@ -121,6 +121,7 @@ impl bb8::ManageConnection for TiberiusTargetConnectionManager {
 }
 
 /// MSSQL target pool implementation.
+#[derive(Clone)]
 pub struct MssqlTargetPool {
     pool: Pool<TiberiusTargetConnectionManager>,
 }
@@ -1605,6 +1606,53 @@ impl TargetPool for MssqlTargetPool {
 
     async fn close(&self) {
         // bb8 handles cleanup automatically
+    }
+
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        // For MSSQL target, we don't support connection reuse in the writer yet due to lifetime complexity.
+        // We simply wrap the pool and delegate.
+        Ok(Box::new(MssqlUpsertWriter {
+            pool: self.clone(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+        }))
+    }
+}
+
+/// Stateful upsert writer for MSSQL.
+pub struct MssqlUpsertWriter {
+    pool: MssqlTargetPool,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+}
+
+#[async_trait]
+impl UpsertWriter for MssqlUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        self.pool.upsert_chunk(
+            &self.schema,
+            &self.table,
+            cols,
+            pk_cols,
+            rows,
+            self.writer_id,
+            self.partition_id,
+        ).await
     }
 }
 

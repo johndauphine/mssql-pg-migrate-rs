@@ -748,6 +748,12 @@ impl Orchestrator {
                         }
                         self.target.create_primary_key(table, target_schema).await?;
                     } else {
+                        // For existing tables, ensure primary key exists (required for upsert)
+                        if !self.target.has_primary_key(target_schema, &table.name).await? {
+                            info!("Adding missing primary key to existing table {}", table_name);
+                            self.target.create_primary_key(table, target_schema).await?;
+                        }
+
                         // Drop non-PK indexes for faster upserts (only recreated if create_indexes is enabled)
                         let dropped = self
                             .target
