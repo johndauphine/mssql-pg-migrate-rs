@@ -65,11 +65,38 @@ pub struct TransferStats {
     pub completed: bool,
 }
 
+/// Chunk data - either SqlValue rows or pre-encoded COPY binary data.
+#[derive(Debug)]
+enum ChunkData {
+    /// Standard row data (for non-upsert or when direct copy is disabled).
+    Rows(Vec<Vec<SqlValue>>),
+    /// Pre-encoded PostgreSQL COPY binary data (for direct copy upsert).
+    Direct {
+        /// Pre-encoded COPY binary data including header and trailer.
+        data: bytes::Bytes,
+        /// Number of rows in this chunk.
+        row_count: usize,
+    },
+}
+
+impl ChunkData {
+    fn len(&self) -> usize {
+        match self {
+            ChunkData::Rows(rows) => rows.len(),
+            ChunkData::Direct { row_count, .. } => *row_count,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A chunk of rows to be transferred.
 #[derive(Debug)]
 struct RowChunk {
-    /// Row data.
-    rows: Vec<Vec<SqlValue>>,
+    /// Row data (either SqlValue rows or pre-encoded bytes).
+    data: ChunkData,
     /// First PK value in this chunk (for range tracking).
     first_pk: Option<i64>,
     /// Last PK value in this chunk (for resume).
@@ -147,8 +174,8 @@ impl RangeTracker {
 
 /// A write job for the parallel writer pool.
 struct WriteJob {
-    /// Row data to write.
-    rows: Vec<Vec<SqlValue>>,
+    /// Chunk data to write (either SqlValue rows or pre-encoded bytes).
+    data: ChunkData,
     /// Partition ID for partition-aware staging tables (None for non-partitioned jobs).
     #[allow(dead_code)] // Reserved for partition-aware write routing
     partition_id: Option<i32>,
@@ -168,6 +195,9 @@ pub struct TransferConfig {
     /// Use PostgreSQL COPY TO BINARY for source reads (4-5x faster).
     /// Only applies when source is PostgreSQL.
     pub use_copy_binary: bool,
+    /// Use direct COPY encoding (bypass SqlValue for MSSQL->PG upsert).
+    /// Encodes rows directly to PostgreSQL COPY binary format during reading.
+    pub use_direct_copy: bool,
 }
 
 impl Default for TransferConfig {
@@ -178,6 +208,7 @@ impl Default for TransferConfig {
             parallel_readers: 4,
             parallel_writers: 4,
             use_copy_binary: true, // Default to COPY TO BINARY for PostgreSQL sources
+            use_direct_copy: true, // Default to direct COPY encoding for MSSQL->PG upsert
         }
     }
 }
@@ -247,7 +278,44 @@ impl TransferEngine {
         // Check if we can use COPY TO BINARY (PostgreSQL source only)
         let use_copy_binary = self.config.use_copy_binary && self.source.supports_copy_binary();
 
-        if !use_keyset && !use_copy_binary {
+        // Check if PK column is an integer type (required for direct copy PK tracking)
+        let pk_is_integer = if !pk_cols.is_empty() {
+            let pk_col = &pk_cols[0];
+            if let Some(idx) = columns.iter().position(|c| c == pk_col) {
+                is_integer_type(&col_types[idx])
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Check if we can use direct COPY encoding (MSSQL source + PG target upsert)
+        // Direct copy requires integer PK for proper resume tracking
+        let use_direct_copy = self.config.use_direct_copy
+            && self.source.supports_direct_copy()
+            && job.target_mode == TargetMode::Upsert
+            && use_keyset
+            && pk_is_integer;
+
+        if use_direct_copy {
+            info!(
+                "{}: using direct COPY encoding (bypasses SqlValue)",
+                table_name
+            );
+        } else if self.config.use_direct_copy
+            && self.source.supports_direct_copy()
+            && job.target_mode == TargetMode::Upsert
+            && use_keyset
+            && !pk_is_integer
+        {
+            debug!(
+                "{}: direct copy disabled - PK type is not integer (required for resume tracking)",
+                table_name
+            );
+        }
+
+        if !use_keyset && !use_copy_binary && !use_direct_copy {
             warn!(
                 "{}: using OFFSET pagination (slower, single reader)",
                 table_name
@@ -269,8 +337,20 @@ impl TransferEngine {
         let col_types_clone = col_types.clone();
 
         let reader_handle = tokio::spawn(async move {
+            // Use direct COPY encoding for MSSQL->PG upsert (highest performance)
+            if use_direct_copy {
+                read_table_chunks_direct(
+                    source,
+                    job_clone,
+                    columns_clone,
+                    col_types_clone,
+                    chunk_size,
+                    num_readers,
+                    read_tx,
+                )
+                .await
             // Use COPY TO BINARY for PostgreSQL sources (4-5x faster)
-            if use_copy_binary {
+            } else if use_copy_binary {
                 read_table_chunks_copy_binary(
                     source,
                     job_clone,
@@ -338,14 +418,30 @@ impl TransferEngine {
 
                 while let Ok(write_job) = write_rx.recv().await {
                     let write_start = Instant::now();
-                    let row_count = write_job.rows.len() as i64;
+                    let row_count = write_job.data.len() as i64;
 
                     let result = match target_mode {
                         TargetMode::Upsert => {
                             if let Some(writer) = &mut upsert_writer {
-                                writer
-                                    .upsert_chunk(&columns_clone, &pk_cols_clone, write_job.rows)
-                                    .await
+                                match write_job.data {
+                                    ChunkData::Direct { data, row_count } => {
+                                        // Use direct copy path (bypasses SqlValue encoding)
+                                        writer
+                                            .upsert_chunk_direct(
+                                                &columns_clone,
+                                                &pk_cols_clone,
+                                                data,
+                                                row_count,
+                                            )
+                                            .await
+                                    }
+                                    ChunkData::Rows(rows) => {
+                                        // Standard path with SqlValue encoding
+                                        writer
+                                            .upsert_chunk(&columns_clone, &pk_cols_clone, rows)
+                                            .await
+                                    }
+                                }
                             } else {
                                 Err(MigrateError::transfer(
                                     table_name_clone.clone(),
@@ -354,14 +450,23 @@ impl TransferEngine {
                             }
                         }
                         _ => {
-                            target
-                                .write_chunk(
-                                    &schema,
-                                    &table_name_clone,
-                                    &columns_clone,
-                                    write_job.rows,
-                                )
-                                .await
+                            // Non-upsert modes only support Rows
+                            match write_job.data {
+                                ChunkData::Rows(rows) => {
+                                    target
+                                        .write_chunk(
+                                            &schema,
+                                            &table_name_clone,
+                                            &columns_clone,
+                                            rows,
+                                        )
+                                        .await
+                                }
+                                ChunkData::Direct { .. } => Err(MigrateError::transfer(
+                                    table_name_clone.clone(),
+                                    "Direct copy not supported for non-upsert modes".to_string(),
+                                )),
+                            }
                         }
                     };
 
@@ -418,15 +523,15 @@ impl TransferEngine {
             range_tracker.add_range(chunk.first_pk, chunk.last_pk);
 
             // Count all rows read for progress tracking
-            let chunk_row_count = chunk.rows.len() as i64;
+            let chunk_row_count = chunk.data.len() as i64;
             if let Some(ref counter) = self.progress_counter {
                 counter.fetch_add(chunk_row_count, Ordering::Relaxed);
             }
 
             // Send rows to writers
-            if !chunk.rows.is_empty() {
+            if !chunk.data.is_empty() {
                 let write_job = WriteJob {
-                    rows: chunk.rows,
+                    data: chunk.data,
                     partition_id: job.partition_id,
                 };
 
@@ -649,6 +754,214 @@ async fn read_table_chunks_parallel(
     Ok(())
 }
 
+/// Read table data using direct COPY encoding (bypasses SqlValue for MSSQL->PG upsert).
+///
+/// This is the highest-performance path for MSSQL->PostgreSQL upsert:
+/// - Encodes rows directly to PostgreSQL COPY binary format during reading
+/// - Eliminates SqlValue intermediate type and its allocations
+/// - Reduces type dispatch from 2x per value to 1x per value
+async fn read_table_chunks_direct(
+    source: SourcePoolImpl,
+    job: TransferJob,
+    columns: Vec<String>,
+    col_types: Vec<String>,
+    chunk_size: usize,
+    num_readers: usize,
+    tx: mpsc::Sender<RowChunk>,
+) -> Result<()> {
+    let table = &job.table;
+    let table_name = table.full_name();
+
+    // Get min/max PK for range splitting
+    let min_pk = job.min_pk.unwrap_or(0);
+    let max_pk = match job.max_pk {
+        Some(pk) => pk,
+        None => {
+            source
+                .get_max_pk(&table.schema, &table.name, &table.primary_key[0])
+                .await?
+        }
+    };
+
+    // Check if this is already a partitioned job
+    let is_partitioned = job.min_pk.is_some() || job.partition_id.is_some();
+    let actual_num_readers = if is_partitioned { 1 } else { num_readers };
+
+    let ranges = split_pk_range(min_pk, max_pk, actual_num_readers);
+    let actual_readers = ranges.len();
+
+    info!(
+        "{}: starting {} direct COPY readers for PK range {} to {}{}",
+        table_name,
+        actual_readers,
+        min_pk,
+        max_pk,
+        if is_partitioned {
+            " (partitioned job)"
+        } else {
+            ""
+        }
+    );
+
+    let mut reader_handles = Vec::with_capacity(actual_readers);
+
+    for (reader_id, (range_min, range_max)) in ranges.into_iter().enumerate() {
+        let source = source.clone();
+        let table = job.table.clone();
+        let columns = columns.clone();
+        let col_types = col_types.clone();
+        let tx = tx.clone();
+
+        let (start_pk, is_resume) = if reader_id == 0 {
+            if job.resume_from_pk.is_some() {
+                (job.resume_from_pk, true)
+            } else {
+                (job.min_pk, false)
+            }
+        } else {
+            (range_min, true)
+        };
+
+        let handle = tokio::spawn(async move {
+            read_chunk_range_direct(
+                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
+                is_resume, tx,
+            )
+            .await
+        });
+
+        reader_handles.push(handle);
+    }
+
+    // Wait for all readers to complete
+    let mut total_rows = 0i64;
+    for handle in reader_handles {
+        match handle.await {
+            Ok(Ok(rows)) => total_rows += rows,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(MigrateError::Transfer {
+                    table: table_name.clone(),
+                    message: format!("Direct reader task panicked: {}", e),
+                })
+            }
+        }
+    }
+
+    info!(
+        "{}: all direct readers finished, total {} rows",
+        table_name, total_rows
+    );
+    Ok(())
+}
+
+/// Read chunks for a specific PK range using direct COPY encoding.
+async fn read_chunk_range_direct(
+    source: SourcePoolImpl,
+    table: Table,
+    columns: Vec<String>,
+    col_types: Vec<String>,
+    start_pk: Option<i64>,
+    end_pk: i64,
+    chunk_size: usize,
+    reader_id: usize,
+    is_resume: bool,
+    tx: mpsc::Sender<RowChunk>,
+) -> Result<i64> {
+    let table_name = table.full_name();
+
+    let mut last_pk = start_pk;
+    let mut total_rows = 0i64;
+    let mut chunk_num = 0;
+    let mut is_first_chunk = !is_resume;
+
+    loop {
+        let read_start = Instant::now();
+
+        // Try direct COPY encoding
+        let direct_result = read_chunk_keyset_direct(
+            &source,
+            &table,
+            &columns,
+            &col_types,
+            last_pk,
+            Some(end_pk),
+            chunk_size,
+            is_first_chunk,
+        )
+        .await?;
+
+        // Direct copy should always work for MSSQL source
+        let (data, first_pk, new_last_pk, row_count) = match direct_result {
+            Some(result) => result,
+            None => {
+                return Err(MigrateError::Transfer {
+                    table: table_name.clone(),
+                    message: "Direct copy not supported for this source".to_string(),
+                });
+            }
+        };
+
+        is_first_chunk = false;
+        let read_time = read_start.elapsed();
+
+        if row_count == 0 {
+            break;
+        }
+
+        total_rows += row_count as i64;
+        chunk_num += 1;
+
+        // Log progress every 10 chunks at info level
+        if chunk_num % 10 == 0 {
+            info!(
+                "{} reader {}: direct read {} rows ({} chunks) in {:?}",
+                table_name, reader_id, total_rows, chunk_num, read_time
+            );
+        } else {
+            debug!(
+                "{} reader {}: direct read chunk {} with {} rows in {:?}",
+                table_name, reader_id, chunk_num, row_count, read_time
+            );
+        }
+
+        let chunk = RowChunk {
+            data: ChunkData::Direct { data, row_count },
+            first_pk,
+            last_pk: new_last_pk,
+            read_time,
+        };
+
+        if tx.send(chunk).await.is_err() {
+            return Err(MigrateError::Transfer {
+                table: table_name.clone(),
+                message: format!("Reader {}: write channel closed", reader_id),
+            });
+        }
+
+        last_pk = new_last_pk;
+
+        // Check if we've reached end of range
+        if let Some(lpk) = last_pk {
+            if lpk >= end_pk {
+                break;
+            }
+        }
+
+        // If we got fewer rows than chunk_size, we're done
+        if row_count < chunk_size {
+            break;
+        }
+    }
+
+    debug!(
+        "{} reader {}: finished direct read, {} rows in {} chunks",
+        table_name, reader_id, total_rows, chunk_num
+    );
+
+    Ok(total_rows)
+}
+
 /// Read chunks for a specific PK range.
 ///
 /// `is_resume` indicates whether `start_pk` came from a resume checkpoint (true) or
@@ -710,7 +1023,7 @@ async fn read_chunk_range(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows,
+            data: ChunkData::Rows(rows),
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
@@ -819,7 +1132,7 @@ async fn read_table_chunks(
         // first_pk is the starting boundary for this chunk (previous last_pk or start)
         // This is needed for safe range tracking during parallel reads
         let chunk = RowChunk {
-            rows,
+            data: ChunkData::Rows(rows),
             first_pk: last_pk,
             last_pk: new_last_pk,
             read_time,
@@ -948,6 +1261,67 @@ async fn read_chunk_keyset_fast(
     };
 
     Ok((rows, new_last_pk))
+}
+
+/// Read a chunk using direct COPY encoding (bypasses SqlValue for MSSQL->PG).
+///
+/// Returns (encoded_bytes, first_pk, last_pk, row_count) or None if not supported.
+async fn read_chunk_keyset_direct(
+    source: &SourcePoolImpl,
+    table: &Table,
+    columns: &[String],
+    col_types: &[String],
+    last_pk: Option<i64>,
+    max_pk: Option<i64>,
+    chunk_size: usize,
+    first_chunk: bool,
+) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
+    // Only MSSQL supports direct copy
+    if !source.supports_direct_copy() {
+        return Ok(None);
+    }
+
+    let pk_col = &table.primary_key[0];
+
+    // Build column list with MSSQL quoting
+    let col_list = columns
+        .iter()
+        .map(|c| quote_mssql_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let pk_quoted = quote_mssql_ident(pk_col);
+    let table_ref = qualify_mssql_table(&table.schema, &table.name);
+
+    // Build query with MSSQL syntax
+    let mut query = format!(
+        "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
+        chunk_size, col_list, table_ref
+    );
+
+    let mut conditions = Vec::new();
+    if let Some(pk) = last_pk {
+        let op = if first_chunk { ">=" } else { ">" };
+        conditions.push(format!("{} {} {}", pk_quoted, op, pk));
+    }
+    if let Some(pk) = max_pk {
+        conditions.push(format!("{} <= {}", pk_quoted, pk));
+    }
+
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+
+    query.push_str(&format!(" ORDER BY {}", pk_quoted));
+
+    // Find PK column index for tracking
+    let pk_idx = columns.iter().position(|c| c == pk_col);
+
+    // Query and encode directly to COPY binary format
+    source
+        .query_rows_direct_copy(&query, col_types, pk_idx)
+        .await
 }
 
 /// Read a chunk using OFFSET pagination (for composite PKs).
@@ -1120,7 +1494,7 @@ async fn read_table_chunks_copy_binary(
         });
 
         let chunk = RowChunk {
-            rows: batch,
+            data: ChunkData::Rows(batch),
             first_pk,
             last_pk,
             read_time: Duration::ZERO, // COPY doesn't provide per-chunk timing
@@ -1163,7 +1537,22 @@ async fn read_table_chunks_copy_binary(
 }
 
 /// Quote a PostgreSQL identifier.
+///
+/// Escapes double quotes by doubling them and wraps in double quotes.
+/// Includes defensive validation for suspicious patterns.
 fn quote_pg_ident(name: &str) -> String {
+    // Defensive validation: reject suspicious patterns
+    debug_assert!(
+        !name.contains('\0'),
+        "Identifier contains null byte: {:?}",
+        name
+    );
+    debug_assert!(
+        name.len() <= 128,
+        "Identifier exceeds maximum length (128): {}",
+        name.len()
+    );
+
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -1191,6 +1580,21 @@ fn is_pk_sortable(table: &Table) -> bool {
     )
 }
 
+/// Check if a column type is an integer type suitable for PK tracking in direct copy.
+/// Direct copy requires integer PKs because the encoder can only track i64 PK values.
+fn is_integer_type(col_type: &str) -> bool {
+    let t = col_type.to_lowercase();
+    matches!(
+        t.as_str(),
+        // MSSQL types
+        "int" | "bigint" | "smallint" | "tinyint" |
+        // PostgreSQL types
+        "integer" | "int4" | "int8" | "int2" |
+        // PostgreSQL aliases
+        "serial" | "bigserial" | "smallserial"
+    )
+}
+
 /// Quote a SQL Server identifier, escaping closing brackets.
 ///
 /// # SQL Identifier Parameterization
@@ -1205,7 +1609,26 @@ fn is_pk_sortable(table: &Table) -> bool {
 ///
 /// This prevents SQL injection through identifier names while allowing dynamic
 /// table/column selection required for a generic migration tool.
+///
+/// ## Security Note
+///
+/// Identifier names come from database schema metadata, which is trusted.
+/// However, we add defensive validation to reject suspicious patterns that
+/// could indicate tampering or corruption.
 fn quote_mssql_ident(name: &str) -> String {
+    // Defensive validation: reject suspicious patterns
+    // These should never appear in legitimate identifier names
+    debug_assert!(
+        !name.contains('\0'),
+        "Identifier contains null byte: {:?}",
+        name
+    );
+    debug_assert!(
+        name.len() <= 128,
+        "Identifier exceeds maximum length (128): {}",
+        name.len()
+    );
+
     format!("[{}]", name.replace(']', "]]"))
 }
 

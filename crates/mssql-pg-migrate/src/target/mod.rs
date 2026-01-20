@@ -149,6 +149,30 @@ pub trait UpsertWriter: Send {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64>;
+
+    /// Upsert pre-encoded COPY binary data directly.
+    ///
+    /// This is the high-performance path that bypasses SqlValue encoding.
+    /// The `copy_data` must be valid PostgreSQL COPY binary format.
+    /// Default implementation falls back to upsert_chunk (for MSSQL target).
+    async fn upsert_chunk_direct(
+        &mut self,
+        _cols: &[String],
+        _pk_cols: &[String],
+        _copy_data: bytes::Bytes,
+        _row_count: usize,
+    ) -> Result<u64> {
+        // Default: not supported, caller should use upsert_chunk
+        Err(MigrateError::Transfer {
+            table: "unknown".to_string(),
+            message: "Direct copy not supported for this target".to_string(),
+        })
+    }
+
+    /// Returns true if this writer supports direct copy.
+    fn supports_direct_copy(&self) -> bool {
+        false
+    }
 }
 
 /// SQL value enum for type-safe row handling.
@@ -1459,7 +1483,8 @@ impl TargetPool for PgPool {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
+        let merge_sql =
+            build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, false);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1676,8 +1701,14 @@ impl UpsertWriter for PgUpsertWriter {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql =
-            build_staging_merge_sql(&self.schema, &self.table, &staging_table, cols, pk_cols);
+        let merge_sql = build_staging_merge_sql(
+            &self.schema,
+            &self.table,
+            &staging_table,
+            cols,
+            pk_cols,
+            false,
+        );
         tx.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", self.schema, self.table),
@@ -1711,6 +1742,159 @@ impl UpsertWriter for PgUpsertWriter {
         }
 
         Ok(row_count)
+    }
+
+    /// Upsert pre-encoded COPY binary data directly.
+    ///
+    /// This is the high-performance path that bypasses SqlValue encoding entirely.
+    /// The `copy_data` must be valid PostgreSQL COPY binary format (header + rows + trailer).
+    async fn upsert_chunk_direct(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        copy_data: bytes::Bytes,
+        row_count: usize,
+    ) -> Result<u64> {
+        use std::time::Instant;
+
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        if pk_cols.is_empty() {
+            return Err(MigrateError::NoPrimaryKey(self.table.clone()));
+        }
+
+        let chunk_start = Instant::now();
+
+        // Get staging table name
+        let staging_table =
+            pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
+
+        // Start a transaction for the entire chunk
+        let tx = self.client.transaction().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("starting direct upsert transaction: {}", e),
+            )
+        })?;
+
+        // 1. Create or reuse staging table
+        if !self.staging_table_created {
+            let create_staging_sql = format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
+                pg_quote_ident(&staging_table),
+                pg_qualify_table(&self.schema, &self.table)
+            );
+            tx.execute(&create_staging_sql, &[]).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("creating staging table: {}", e),
+                )
+            })?;
+            self.staging_table_created = true;
+        }
+
+        // Truncate to clear any previous batch data
+        let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
+        tx.execute(&truncate_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("truncating staging table: {}", e),
+            )
+        })?;
+
+        let staging_time = chunk_start.elapsed();
+        let copy_start = Instant::now();
+
+        // 2. COPY pre-encoded binary data directly to staging
+        let col_list: String = cols
+            .iter()
+            .map(|c| pg_quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let copy_stmt = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            pg_quote_ident(&staging_table),
+            col_list
+        );
+
+        // Execute COPY within the transaction - send pre-encoded data directly
+        let sink = tx.copy_in(&copy_stmt).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("initiating direct COPY to staging: {}", e),
+            )
+        })?;
+
+        futures::pin_mut!(sink);
+
+        // Send the pre-encoded data in one shot
+        sink.send(copy_data).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("sending direct COPY data to staging: {}", e),
+            )
+        })?;
+
+        // Finish COPY
+        sink.finish().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("finishing direct COPY to staging: {}", e),
+            )
+        })?;
+
+        let copy_time = copy_start.elapsed();
+        let merge_start = Instant::now();
+
+        // 3. Merge staging into target
+        let merge_sql = build_staging_merge_sql(
+            &self.schema,
+            &self.table,
+            &staging_table,
+            cols,
+            pk_cols,
+            false,
+        );
+        tx.execute(&merge_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("merging staging to target: {}", e),
+            )
+        })?;
+
+        // Commit the transaction
+        tx.commit().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("committing direct upsert transaction: {}", e),
+            )
+        })?;
+
+        let merge_time = merge_start.elapsed();
+        let total_time = chunk_start.elapsed();
+
+        // Log detailed timing for profiling
+        if row_count >= UPSERT_PROFILING_ROW_THRESHOLD as usize {
+            tracing::debug!(
+                "{}.{}: DIRECT upsert {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
+                self.schema,
+                self.table,
+                row_count,
+                staging_time,
+                copy_time,
+                merge_time,
+                total_time
+            );
+        }
+
+        Ok(row_count as u64)
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        true
     }
 }
 
@@ -2451,6 +2635,7 @@ fn build_staging_merge_sql(
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
+    skip_change_detection: bool,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -2480,6 +2665,19 @@ fn build_staging_merge_sql(
             col_list,
             pg_quote_ident(staging_table),
             pk_list
+        )
+    } else if skip_change_detection {
+        // Fast upsert without change detection.
+        // Updates all conflicting rows regardless of whether data changed.
+        // Faster merge but generates more WAL and index updates.
+        format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+            pg_qualify_table(schema, table),
+            col_list,
+            col_list,
+            pg_quote_ident(staging_table),
+            pk_list,
+            update_cols.join(", ")
         )
     } else {
         // High-performance upsert with change detection.
@@ -2518,11 +2716,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_staging_merge_sql() {
+    fn test_build_staging_merge_sql_with_change_detection() {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql = build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols);
+        let sql =
+            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, false);
         assert!(sql.contains("DO UPDATE SET"));
         // Should update name and value columns
         assert!(sql.contains(r#""name" = EXCLUDED."name""#));
@@ -2534,12 +2733,35 @@ mod tests {
     }
 
     #[test]
+    fn test_build_staging_merge_sql_skip_change_detection() {
+        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
+        let pk_cols = vec!["id".to_string()];
+
+        let sql =
+            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, true);
+        assert!(sql.contains("DO UPDATE SET"));
+        // Should update name and value columns
+        assert!(sql.contains(r#""name" = EXCLUDED."name""#));
+        assert!(sql.contains(r#""value" = EXCLUDED."value""#));
+        // Should NOT have change detection
+        assert!(!sql.contains("IS DISTINCT FROM"));
+        assert!(!sql.contains("WHERE"));
+    }
+
+    #[test]
     fn test_build_staging_merge_sql_pk_only_table() {
         // For PK-only tables, should use DO NOTHING (no columns to update)
         let cols = vec!["id".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql = build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols);
+        let sql = build_staging_merge_sql(
+            "public",
+            "lookup",
+            "_staging_lookup",
+            &cols,
+            &pk_cols,
+            false,
+        );
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
     }

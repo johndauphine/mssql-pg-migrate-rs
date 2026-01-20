@@ -160,6 +160,33 @@ impl SourcePoolImpl {
         }
     }
 
+    /// Query rows and encode directly to PostgreSQL COPY binary format.
+    ///
+    /// This is the high-performance path for MSSQL->PG upsert that bypasses
+    /// SqlValue entirely. Returns (encoded_bytes, first_pk, last_pk, row_count).
+    ///
+    /// Only supported for MSSQL sources - returns None for PostgreSQL.
+    pub async fn query_rows_direct_copy(
+        &self,
+        sql: &str,
+        col_types: &[String],
+        pk_idx: Option<usize>,
+    ) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
+        match self {
+            Self::Mssql(p) => {
+                let result = p.query_rows_direct_copy(sql, col_types, pk_idx).await?;
+                Ok(Some(result))
+            }
+            // Direct copy is only optimized for MSSQL sources
+            Self::Postgres(_) => Ok(None),
+        }
+    }
+
+    /// Returns true if this source supports direct copy encoding.
+    pub fn supports_direct_copy(&self) -> bool {
+        matches!(self, Self::Mssql(_))
+    }
+
     /// Stream rows using PostgreSQL COPY TO BINARY protocol.
     /// Returns the total number of rows read.
     /// Only supported for PostgreSQL sources - returns an error for other sources.
