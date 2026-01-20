@@ -568,8 +568,7 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use subquery approach for ordered string aggregation
-        let query = format!(
-            r#"
+        let query = r#"
             SELECT
                 i.name AS index_name,
                 i.is_unique,
@@ -598,8 +597,7 @@ impl SourcePool for MssqlPool {
               AND i.is_primary_key = 0
               AND i.type > 0
             ORDER BY i.name
-        "#
-        );
+        "#.to_string();
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
@@ -643,8 +641,7 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use STUFF/FOR XML PATH for ordered string aggregation
-        let query = format!(
-            r#"
+        let query = r#"
             SELECT
                 fk.name AS fk_name,
                 STUFF((
@@ -674,8 +671,7 @@ impl SourcePool for MssqlPool {
             JOIN sys.schemas rs ON rt.schema_id = rs.schema_id
             WHERE ps.name = @P1 AND pt.name = @P2
             ORDER BY fk.name
-        "#
-        );
+        "#.to_string();
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
@@ -958,7 +954,6 @@ impl MssqlPool {
 
         self.query_rows_fast(&query, &columns, &col_types).await
     }
-
 }
 
 /// Convert a row value to SqlValue based on the column type.

@@ -150,6 +150,7 @@ struct WriteJob {
     /// Row data to write.
     rows: Vec<Vec<SqlValue>>,
     /// Partition ID for partition-aware staging tables (None for non-partitioned jobs).
+    #[allow(dead_code)] // Reserved for partition-aware write routing
     partition_id: Option<i32>,
 }
 
@@ -219,10 +220,7 @@ impl TransferEngine {
         let table_name = job.table.full_name();
         info!(
             "Starting transfer for {} (mode: {:?}, readers: {}, writers: {})",
-            table_name,
-            job.target_mode,
-            self.config.parallel_readers,
-            self.config.parallel_writers,
+            table_name, job.target_mode, self.config.parallel_readers, self.config.parallel_writers,
         );
 
         let start = Instant::now();
@@ -247,8 +245,7 @@ impl TransferEngine {
         };
 
         // Check if we can use COPY TO BINARY (PostgreSQL source only)
-        let use_copy_binary =
-            self.config.use_copy_binary && self.source.supports_copy_binary();
+        let use_copy_binary = self.config.use_copy_binary && self.source.supports_copy_binary();
 
         if !use_keyset && !use_copy_binary {
             warn!(
@@ -327,15 +324,12 @@ impl TransferEngine {
 
                 // For Upsert mode, create a dedicated writer that holds the connection
                 // and reuses the staging table to prevent catalog churn.
-                let mut upsert_writer: Option<Box<dyn crate::target::UpsertWriter>> = if target_mode == TargetMode::Upsert {
+                let mut upsert_writer: Option<Box<dyn crate::target::UpsertWriter>> = if target_mode
+                    == TargetMode::Upsert
+                {
                     Some(
                         target
-                            .get_upsert_writer(
-                                &schema,
-                                &table_name_clone,
-                                writer_id,
-                                partition_id,
-                            )
+                            .get_upsert_writer(&schema, &table_name_clone, writer_id, partition_id)
                             .await?,
                     )
                 } else {
@@ -514,12 +508,7 @@ impl TransferEngine {
 
         info!(
             "{}: transferred {} rows in {:?} ({} rows/sec, read: {:?}, write: {:?})",
-            table_name,
-            stats.rows,
-            total_elapsed,
-            rows_per_sec,
-            stats.query_time,
-            stats.write_time
+            table_name, stats.rows, total_elapsed, rows_per_sec, stats.query_time, stats.write_time
         );
 
         Ok(stats)
@@ -629,16 +618,8 @@ async fn read_table_chunks_parallel(
 
         let handle = tokio::spawn(async move {
             read_chunk_range(
-                source,
-                table,
-                columns,
-                col_types,
-                start_pk,
-                range_max,
-                chunk_size,
-                reader_id,
-                is_resume,
-                tx,
+                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
+                is_resume, tx,
             )
             .await
         });
@@ -1106,7 +1087,9 @@ async fn read_table_chunks_copy_binary(
     // Receive batches and forward as RowChunks
     let mut total_rows = 0i64;
     let mut chunk_num = 0;
-    let pk_idx = pk_col_name.as_ref().and_then(|pk| columns.iter().position(|c| c == pk));
+    let pk_idx = pk_col_name
+        .as_ref()
+        .and_then(|pk| columns.iter().position(|c| c == pk));
 
     while let Some(batch) = copy_rx.recv().await {
         if batch.is_empty() {

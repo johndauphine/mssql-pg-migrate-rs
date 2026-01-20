@@ -149,10 +149,8 @@ impl BinaryRowParser {
     /// - `Err(...)` if parsing failed
     pub fn next_row(&mut self) -> Result<Option<Vec<SqlValue>>> {
         // Parse header first if not yet done
-        if !self.header_parsed {
-            if !self.try_parse_header()? {
-                return Ok(None); // Need more data for header
-            }
+        if !self.header_parsed && !self.try_parse_header()? {
+            return Ok(None); // Need more data for header
         }
 
         // Check for trailer (end of data)
@@ -356,7 +354,7 @@ impl BinaryRowParser {
                 let secs = (micros / 1_000_000) as u32;
                 let nanos = ((micros % 1_000_000) * 1000) as u32;
                 let time = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
-                    .unwrap_or_else(chrono::NaiveTime::default);
+                    .unwrap_or_default();
                 SqlValue::Time(time)
             }
 
@@ -367,8 +365,7 @@ impl BinaryRowParser {
                 let unix_micros = micros + PG_EPOCH_MICROS;
                 let secs = unix_micros / 1_000_000;
                 let nsecs = ((unix_micros % 1_000_000) * 1000) as u32;
-                let dt =
-                    chrono::DateTime::from_timestamp(secs, nsecs).map(|dt| dt.naive_utc());
+                let dt = chrono::DateTime::from_timestamp(secs, nsecs).map(|dt| dt.naive_utc());
                 SqlValue::DateTime(dt.unwrap_or_default())
             }
 
@@ -379,18 +376,13 @@ impl BinaryRowParser {
                 let unix_micros = micros + PG_EPOCH_MICROS;
                 let secs = unix_micros / 1_000_000;
                 let nsecs = ((unix_micros % 1_000_000) * 1000) as u32;
-                let dt = chrono::DateTime::from_timestamp(secs, nsecs)
-                    .map(|dt| dt.fixed_offset());
+                let dt = chrono::DateTime::from_timestamp(secs, nsecs).map(|dt| dt.fixed_offset());
                 SqlValue::DateTimeOffset(dt.unwrap_or_else(|| {
-                    chrono::DateTime::<chrono::FixedOffset>::from(
-                        chrono::DateTime::UNIX_EPOCH
-                    )
+                    chrono::DateTime::<chrono::FixedOffset>::from(chrono::DateTime::UNIX_EPOCH)
                 }))
             }
 
-            BinaryColumnType::Numeric => {
-                self.parse_numeric(len)?
-            }
+            BinaryColumnType::Numeric => self.parse_numeric(len)?,
         };
 
         Ok(value)
@@ -451,8 +443,10 @@ impl BinaryRowParser {
 
         // Build integer part
         let int_positions = total_base10000_positions.max(0) as usize;
-        for i in 0..int_positions {
-            let digit = if i < ndigits { digits[i] } else { 0 };
+        for (i, digit) in (0..int_positions)
+            .map(|i| if i < ndigits { digits[i] } else { 0 })
+            .enumerate()
+        {
             if i == 0 {
                 // First digit: no leading zeros
                 result.push_str(&digit.to_string());
@@ -471,7 +465,11 @@ impl BinaryRowParser {
             result.push('.');
 
             // How many leading zeros before our digits?
-            let leading_zero_groups = if weight < -1 { (-weight - 1) as usize } else { 0 };
+            let leading_zero_groups = if weight < -1 {
+                (-weight - 1) as usize
+            } else {
+                0
+            };
 
             for _ in 0..leading_zero_groups {
                 result.push_str("0000");
@@ -479,8 +477,8 @@ impl BinaryRowParser {
 
             // Add remaining digits
             let frac_start = int_positions;
-            for i in frac_start..ndigits {
-                result.push_str(&format!("{:04}", digits[i]));
+            for digit in &digits[frac_start..ndigits] {
+                result.push_str(&format!("{:04}", digit));
             }
 
             // Trim to dscale
@@ -608,14 +606,8 @@ mod tests {
         let mut parser = BinaryRowParser::new(col_types);
 
         let mut data = build_test_header();
-        data.extend(build_test_row(&[
-            Some(&100i64.to_be_bytes()),
-            Some(&[1u8]),
-        ]));
-        data.extend(build_test_row(&[
-            Some(&200i64.to_be_bytes()),
-            Some(&[0u8]),
-        ]));
+        data.extend(build_test_row(&[Some(&100i64.to_be_bytes()), Some(&[1u8])]));
+        data.extend(build_test_row(&[Some(&200i64.to_be_bytes()), Some(&[0u8])]));
         data.extend(build_trailer());
 
         parser.extend(&data);

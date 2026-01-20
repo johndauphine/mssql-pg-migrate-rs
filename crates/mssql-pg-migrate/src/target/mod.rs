@@ -423,7 +423,7 @@ impl PgPool {
             ));
         }
 
-        ddl.push_str(")");
+        ddl.push(')');
         ddl
     }
 
@@ -1299,8 +1299,7 @@ impl TargetPool for PgPool {
             return Ok(0);
         }
 
-        // Use batched INSERT statements
-        // TODO: Implement COPY protocol for better performance
+        // Use COPY protocol for high-performance bulk inserts
         let count = self.insert_batch(schema, table, cols, rows).await?;
         Ok(count)
     }
@@ -1508,11 +1507,9 @@ impl TargetPool for PgPool {
         writer_id: usize,
         partition_id: Option<i32>,
     ) -> Result<Box<dyn UpsertWriter>> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection for upsert writer"))?;
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(e, "getting PostgreSQL connection for upsert writer")
+        })?;
 
         Ok(Box::new(PgUpsertWriter {
             client,
@@ -1535,6 +1532,7 @@ pub struct PgUpsertWriter {
     writer_id: usize,
     partition_id: Option<i32>,
     staging_table_created: bool,
+    #[allow(dead_code)] // Reserved for future buffer tuning
     copy_buffer_rows: usize,
 }
 
@@ -1560,7 +1558,8 @@ impl UpsertWriter for PgUpsertWriter {
         let chunk_start = Instant::now();
 
         // Use per-writer staging table to avoid conflicts between parallel writers.
-        let staging_table = pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
+        let staging_table =
+            pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
 
         // Start a transaction for the entire chunk to ensure atomicity and connection stability
         let tx = self.client.transaction().await.map_err(|e| {
@@ -1578,14 +1577,12 @@ impl UpsertWriter for PgUpsertWriter {
                 pg_quote_ident(&staging_table),
                 pg_qualify_table(&self.schema, &self.table)
             );
-            tx.execute(&create_staging_sql, &[])
-                .await
-                .map_err(|e| {
-                    MigrateError::transfer(
-                        format!("{}.{}", self.schema, self.table),
-                        format!("creating staging table: {}", e),
-                    )
-                })?;
+            tx.execute(&create_staging_sql, &[]).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("creating staging table: {}", e),
+                )
+            })?;
             self.staging_table_created = true;
         }
 
@@ -1679,7 +1676,8 @@ impl UpsertWriter for PgUpsertWriter {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(&self.schema, &self.table, &staging_table, cols, pk_cols);
+        let merge_sql =
+            build_staging_merge_sql(&self.schema, &self.table, &staging_table, cols, pk_cols);
         tx.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", self.schema, self.table),
@@ -1903,13 +1901,13 @@ impl PgPool {
 
                 // Adaptive flush: send when buffer approaches target size
                 // Leave room for the largest row we've seen
-                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
-                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: "Receiver dropped".into(),
-                        });
-                    }
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len)
+                    && chunk_tx.send(buf.split().freeze()).await.is_err()
+                {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped".into(),
+                    });
                 }
             }
 
@@ -1917,13 +1915,11 @@ impl PgPool {
             buf.put_i16(-1);
 
             // Send remaining data
-            if !buf.is_empty() {
-                if chunk_tx.send(buf.freeze()).await.is_err() {
-                    return Err(MigrateError::Transfer {
-                        table: table_name_clone.clone(),
-                        message: "Receiver dropped (final)".into(),
-                    });
-                }
+            if !buf.is_empty() && chunk_tx.send(buf.freeze()).await.is_err() {
+                return Err(MigrateError::Transfer {
+                    table: table_name_clone.clone(),
+                    message: "Receiver dropped (final)".into(),
+                });
             }
 
             Ok::<usize, MigrateError>(largest_row_len)
@@ -2039,26 +2035,24 @@ impl PgPool {
                 row_count += 1;
 
                 // Adaptive flush
-                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
-                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: "Receiver dropped".into(),
-                        });
-                    }
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len)
+                    && chunk_tx.send(buf.split().freeze()).await.is_err()
+                {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped".into(),
+                    });
                 }
             }
 
             // Write trailer
             buf.put_i16(-1);
 
-            if !buf.is_empty() {
-                if chunk_tx.send(buf.freeze()).await.is_err() {
-                    return Err(MigrateError::Transfer {
-                        table: table_name_clone.clone(),
-                        message: "Receiver dropped (final)".into(),
-                    });
-                }
+            if !buf.is_empty() && chunk_tx.send(buf.freeze()).await.is_err() {
+                return Err(MigrateError::Transfer {
+                    table: table_name_clone.clone(),
+                    message: "Receiver dropped (final)".into(),
+                });
             }
 
             Ok::<u64, MigrateError>(row_count)
@@ -2414,7 +2408,7 @@ fn pg_staging_table_name(
 
     // Build the ideal name
     let prefix = "_staging";
-    let ideal_name = format!("{}_{}_{}{}",prefix, schema, table, suffix);
+    let ideal_name = format!("{}_{}_{}{}", prefix, schema, table, suffix);
 
     if ideal_name.len() <= PG_MAX_IDENTIFIER_LEN {
         return ideal_name;
@@ -2577,9 +2571,16 @@ mod tests {
             PG_MAX_IDENTIFIER_LEN
         );
         // Should still end with the partition/writer suffix for uniqueness
-        assert!(name.ends_with("_p7_0"), "Name '{}' should end with _p7_0", name);
+        assert!(
+            name.ends_with("_p7_0"),
+            "Name '{}' should end with _p7_0",
+            name
+        );
         // Should contain hash (8 hex chars)
-        assert!(name.contains("_staging_"), "Name should start with _staging_");
+        assert!(
+            name.contains("_staging_"),
+            "Name should start with _staging_"
+        );
     }
 
     #[test]
@@ -2592,8 +2593,14 @@ mod tests {
         let name2 = pg_staging_table_name(long_schema, long_table, 0, Some(1));
         let name3 = pg_staging_table_name(long_schema, long_table, 1, Some(0));
 
-        assert_ne!(name1, name2, "Different partitions should have different names");
-        assert_ne!(name1, name3, "Different writers should have different names");
+        assert_ne!(
+            name1, name2,
+            "Different partitions should have different names"
+        );
+        assert_ne!(
+            name1, name3,
+            "Different writers should have different names"
+        );
         assert!(name1.len() <= PG_MAX_IDENTIFIER_LEN);
         assert!(name2.len() <= PG_MAX_IDENTIFIER_LEN);
         assert!(name3.len() <= PG_MAX_IDENTIFIER_LEN);

@@ -356,13 +356,11 @@ impl PgSourcePool {
         }
 
         // Send remaining rows
-        if !batch.is_empty() {
-            if tx.send(batch).await.is_err() {
-                return Err(MigrateError::transfer(
-                    format!("{}.{}", schema, table),
-                    "channel closed while sending final COPY batch".to_string(),
-                ));
-            }
+        if !batch.is_empty() && tx.send(batch).await.is_err() {
+            return Err(MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                "channel closed while sending final COPY batch".to_string(),
+            ));
         }
 
         let total_time = t0.elapsed();

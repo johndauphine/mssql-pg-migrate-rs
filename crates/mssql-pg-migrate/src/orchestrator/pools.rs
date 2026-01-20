@@ -58,7 +58,8 @@ impl SourcePoolImpl {
                          - Linux: apt install libgssapi-krb5-2\n\
                          - macOS: Uses GSS.framework (built-in on macOS 10.14+)\n\
                          - Windows: Uses SSPI (built-in)\n\n\
-                         Obtain a ticket before running: kinit user@REALM".into()
+                         Obtain a ticket before running: kinit user@REALM"
+                            .into(),
                     ));
                 }
             }
@@ -256,7 +257,8 @@ impl TargetPoolImpl {
                          - Linux: apt install libgssapi-krb5-2\n\
                          - macOS: Uses GSS.framework (built-in on macOS 10.14+)\n\
                          - Windows: Uses SSPI (built-in)\n\n\
-                         Obtain a ticket before running: kinit user@REALM".into()
+                         Obtain a ticket before running: kinit user@REALM"
+                            .into(),
                     ));
                 }
             }
@@ -473,8 +475,14 @@ impl TargetPoolImpl {
         partition_id: Option<i32>,
     ) -> Result<Box<dyn UpsertWriter>> {
         match self {
-            Self::Mssql(p) => p.get_upsert_writer(schema, table, writer_id, partition_id).await,
-            Self::Postgres(p) => p.get_upsert_writer(schema, table, writer_id, partition_id).await,
+            Self::Mssql(p) => {
+                p.get_upsert_writer(schema, table, writer_id, partition_id)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.get_upsert_writer(schema, table, writer_id, partition_id)
+                    .await
+            }
         }
     }
 
