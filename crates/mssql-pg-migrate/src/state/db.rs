@@ -39,41 +39,28 @@ impl DbStateBackend {
         )
         .await?;
 
-        // Create migration_runs table
-        conn.execute(
-            &format!(
-                "CREATE TABLE IF NOT EXISTS {}.migration_runs (
-                    run_id TEXT PRIMARY KEY,
-                    config_hash TEXT NOT NULL,
-                    started_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ,
-                    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )",
-                self.schema
-            ),
-            &[],
-        )
-        .await?;
-
-        // Create table_state table
+        // Create denormalized table_state table (includes run-level fields)
         conn.execute(
             &format!(
                 "CREATE TABLE IF NOT EXISTS {}.table_state (
-                    run_id TEXT NOT NULL REFERENCES {}.migration_runs(run_id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    run_started_at TIMESTAMPTZ NOT NULL,
+                    run_completed_at TIMESTAMPTZ,
+                    run_status TEXT NOT NULL CHECK (run_status IN ('running', 'completed', 'failed', 'cancelled')),
                     table_name TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+                    table_status TEXT NOT NULL CHECK (table_status IN ('pending', 'in_progress', 'completed', 'failed')),
                     rows_total BIGINT NOT NULL DEFAULT 0,
                     rows_transferred BIGINT NOT NULL DEFAULT 0,
                     rows_skipped BIGINT NOT NULL DEFAULT 0,
                     last_pk BIGINT,
                     last_sync_timestamp TIMESTAMPTZ,
-                    completed_at TIMESTAMPTZ,
+                    table_completed_at TIMESTAMPTZ,
                     error TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (run_id, table_name)
                 )",
-                self.schema, self.schema
+                self.schema
             ),
             &[],
         )
@@ -83,8 +70,8 @@ impl DbStateBackend {
         conn.execute(
             &format!(
                 "CREATE INDEX IF NOT EXISTS idx_table_state_incremental_sync
-                    ON {}.table_state(table_name, status, last_sync_timestamp)
-                    WHERE status = 'completed' AND last_sync_timestamp IS NOT NULL",
+                    ON {}.table_state(table_name, table_status, last_sync_timestamp)
+                    WHERE table_status = 'completed' AND last_sync_timestamp IS NOT NULL",
                 self.schema
             ),
             &[],
@@ -94,8 +81,8 @@ impl DbStateBackend {
         // Create index for latest run lookups
         conn.execute(
             &format!(
-                "CREATE INDEX IF NOT EXISTS idx_migration_runs_latest
-                    ON {}.migration_runs(started_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_table_state_latest_run
+                    ON {}.table_state(config_hash, run_started_at DESC)",
                 self.schema
             ),
             &[],
@@ -110,48 +97,37 @@ impl DbStateBackend {
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await?;
 
-        // Upsert migration run
-        tx.execute(
-            &format!(
-                "INSERT INTO {}.migration_runs (run_id, config_hash, started_at, completed_at, status)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (run_id) DO UPDATE SET
-                    completed_at = EXCLUDED.completed_at,
-                    status = EXCLUDED.status",
-                self.schema
-            ),
-            &[
-                &state.run_id,
-                &state.config_hash,
-                &state.started_at,
-                &state.completed_at,
-                &status_to_str(state.status),
-            ],
-        )
-        .await?;
-
-        // Upsert table states
+        // Upsert table states with denormalized run-level fields
         for (table_name, table_state) in &state.tables {
             tx.execute(
                 &format!(
                     "INSERT INTO {}.table_state
-                     (run_id, table_name, status, rows_total, rows_transferred, rows_skipped,
-                      last_pk, last_sync_timestamp, completed_at, error, updated_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                     (run_id, config_hash, run_started_at, run_completed_at, run_status,
+                      table_name, table_status, rows_total, rows_transferred, rows_skipped,
+                      last_pk, last_sync_timestamp, table_completed_at, error, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
                      ON CONFLICT (run_id, table_name) DO UPDATE SET
-                        status = EXCLUDED.status,
+                        config_hash = EXCLUDED.config_hash,
+                        run_started_at = EXCLUDED.run_started_at,
+                        run_completed_at = EXCLUDED.run_completed_at,
+                        run_status = EXCLUDED.run_status,
+                        table_status = EXCLUDED.table_status,
                         rows_total = EXCLUDED.rows_total,
                         rows_transferred = EXCLUDED.rows_transferred,
                         rows_skipped = EXCLUDED.rows_skipped,
                         last_pk = EXCLUDED.last_pk,
                         last_sync_timestamp = EXCLUDED.last_sync_timestamp,
-                        completed_at = EXCLUDED.completed_at,
+                        table_completed_at = EXCLUDED.table_completed_at,
                         error = EXCLUDED.error,
                         updated_at = NOW()",
                     self.schema
                 ),
                 &[
                     &state.run_id,
+                    &state.config_hash,
+                    &state.started_at,
+                    &state.completed_at,
+                    &status_to_str(state.status),
                     &table_name,
                     &task_status_to_str(table_state.status),
                     &table_state.rows_total,
@@ -175,68 +151,62 @@ impl DbStateBackend {
     pub async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
         let conn = self.pool.get().await?;
 
-        // Find latest run with matching config hash
-        let row = conn
-            .query_opt(
+        // Load all table states for the latest run with matching config hash
+        let table_rows = conn
+            .query(
                 &format!(
-                    "SELECT run_id, config_hash, started_at, completed_at, status
-                     FROM {}.migration_runs
+                    "SELECT run_id, config_hash, run_started_at, run_completed_at, run_status,
+                            table_name, table_status, rows_total, rows_transferred, rows_skipped,
+                            last_pk, last_sync_timestamp, table_completed_at, error
+                     FROM {}.table_state
                      WHERE config_hash = $1
-                     ORDER BY started_at DESC
-                     LIMIT 1",
-                    self.schema
+                       AND run_id = (
+                           SELECT run_id FROM {}.table_state
+                           WHERE config_hash = $1
+                           ORDER BY run_started_at DESC
+                           LIMIT 1
+                       )",
+                    self.schema, self.schema
                 ),
                 &[&config_hash],
             )
             .await?;
 
-        let run_row = match row {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+        if table_rows.is_empty() {
+            return Ok(None);
+        }
 
-        let run_id: String = run_row.get(0);
-        let config_hash: String = run_row.get(1);
-        let started_at: DateTime<Utc> = run_row.get(2);
-        let completed_at: Option<DateTime<Utc>> = run_row.get(3);
-        let status_str: String = run_row.get(4);
+        // Extract run-level fields from first row (all rows have same values)
+        let first_row = &table_rows[0];
+        let run_id: String = first_row.get(0);
+        let config_hash: String = first_row.get(1);
+        let started_at: DateTime<Utc> = first_row.get(2);
+        let completed_at: Option<DateTime<Utc>> = first_row.get(3);
+        let status_str: String = first_row.get(4);
 
-        // Load table states for this run
-        let table_rows = conn
-            .query(
-                &format!(
-                    "SELECT table_name, status, rows_total, rows_transferred, rows_skipped,
-                            last_pk, last_sync_timestamp, completed_at, error
-                     FROM {}.table_state
-                     WHERE run_id = $1",
-                    self.schema
-                ),
-                &[&run_id],
-            )
-            .await?;
-
+        // Extract table states
         let mut tables = HashMap::new();
         for row in table_rows {
-            let table_name: String = row.get(0);
-            let status_str: String = row.get(1);
-            let rows_total: i64 = row.get(2);
-            let rows_transferred: i64 = row.get(3);
-            let rows_skipped: i64 = row.get(4);
-            let last_pk: Option<i64> = row.get(5);
-            let last_sync_timestamp: Option<DateTime<Utc>> = row.get(6);
-            let completed_at: Option<DateTime<Utc>> = row.get(7);
-            let error: Option<String> = row.get(8);
+            let table_name: String = row.get(5);
+            let table_status_str: String = row.get(6);
+            let rows_total: i64 = row.get(7);
+            let rows_transferred: i64 = row.get(8);
+            let rows_skipped: i64 = row.get(9);
+            let last_pk: Option<i64> = row.get(10);
+            let last_sync_timestamp: Option<DateTime<Utc>> = row.get(11);
+            let table_completed_at: Option<DateTime<Utc>> = row.get(12);
+            let error: Option<String> = row.get(13);
 
             tables.insert(
                 table_name,
                 TableState {
-                    status: str_to_task_status(&status_str)?,
+                    status: str_to_task_status(&table_status_str)?,
                     rows_total,
                     rows_transferred,
                     rows_skipped,
                     last_pk,
                     partitions: None, // Partitions not stored in DB (in-memory only)
-                    completed_at,
+                    completed_at: table_completed_at,
                     error,
                     last_sync_timestamp,
                 },
@@ -268,7 +238,7 @@ impl DbStateBackend {
                     "SELECT last_sync_timestamp
                      FROM {}.table_state
                      WHERE table_name = $1
-                       AND status = 'completed'
+                       AND table_status = 'completed'
                        AND last_sync_timestamp IS NOT NULL
                      ORDER BY updated_at DESC
                      LIMIT 1",

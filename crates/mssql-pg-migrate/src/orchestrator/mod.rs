@@ -7,7 +7,7 @@ pub use pools::{SourcePoolImpl, TargetPoolImpl};
 use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
-use crate::state::{DbStateBackend, MigrationState, RunStatus, TableState, TaskStatus};
+use crate::state::{MigrationState, RunStatus, StateBackend, TableState, TaskStatus};
 use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Migration orchestrator.
 pub struct Orchestrator {
     config: Config,
-    state_backend: DbStateBackend,
+    state_backend: StateBackend,
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
@@ -284,8 +284,8 @@ impl Orchestrator {
         let target = TargetPoolImpl::from_config(&config).await?;
         info!("Connected to {} target database", target.db_type());
 
-        // Initialize database state backend (requires PostgreSQL target)
-        let state_backend = DbStateBackend::new(target.postgres_pool()?);
+        // Initialize database state backend (supports both PostgreSQL and MSSQL)
+        let state_backend = target.create_state_backend()?;
         state_backend.init_schema().await?;
         info!("Initialized migration state schema in target database");
 
@@ -953,15 +953,17 @@ impl Orchestrator {
 
             let table_name = table.full_name();
 
+            // Record sync start time for watermarking (capture before transfer starts)
+            // This enables incremental sync later, even if switching from drop_recreate to upsert
+            let sync_start_time = Utc::now();
+            table_sync_start_times.insert(table_name.clone(), sync_start_time);
+
             // Determine date filter for incremental sync (if enabled)
             let date_filter = if date_incremental_enabled {
                 // Try to find a matching date column in this table
                 if let Some((col_name, col_type)) =
                     table.find_date_column(&self.config.migration.date_updated_columns)
                 {
-                    // Record sync start time (capture before transfer starts)
-                    let sync_start_time = Utc::now();
-                    table_sync_start_times.insert(table_name.clone(), sync_start_time);
 
                     // Get last sync timestamp from state
                     let last_sync = state.get_last_sync_timestamp(&table_name);

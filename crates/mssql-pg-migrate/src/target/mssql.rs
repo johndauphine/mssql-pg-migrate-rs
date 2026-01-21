@@ -43,7 +43,7 @@ const TDS_MAX_PACKET_SIZE: u32 = 32767;
 
 /// Connection manager for bb8 pool with tiberius for MSSQL target.
 #[derive(Clone)]
-struct TiberiusTargetConnectionManager {
+pub struct TiberiusTargetConnectionManager {
     config: TargetConfig,
 }
 
@@ -156,7 +156,7 @@ impl MssqlTargetPool {
     }
 
     /// Get a connection from the pool.
-    async fn get_conn(&self) -> Result<PooledConnection<'_, TiberiusTargetConnectionManager>> {
+    pub async fn get_conn(&self) -> Result<PooledConnection<'_, TiberiusTargetConnectionManager>> {
         self.pool
             .get()
             .await

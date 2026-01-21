@@ -15,8 +15,8 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
+use crate::state::{DbStateBackend, MssqlStateBackend, StateBackend};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
-use deadpool_postgres::Pool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -314,13 +314,11 @@ impl TargetPoolImpl {
         }
     }
 
-    /// Get the PostgreSQL pool (only available for Postgres targets).
-    pub fn postgres_pool(&self) -> Result<Pool> {
+    /// Create a state backend appropriate for this target database type.
+    pub fn create_state_backend(&self) -> Result<StateBackend> {
         match self {
-            Self::Postgres(p) => Ok(p.pool().clone()),
-            Self::Mssql(_) => Err(MigrateError::Config(
-                "Migration state storage requires PostgreSQL target database".to_string(),
-            )),
+            Self::Postgres(p) => Ok(StateBackend::Postgres(DbStateBackend::new(p.pool().clone()))),
+            Self::Mssql(p) => Ok(StateBackend::Mssql(MssqlStateBackend::new(Arc::clone(p)))),
         }
     }
 

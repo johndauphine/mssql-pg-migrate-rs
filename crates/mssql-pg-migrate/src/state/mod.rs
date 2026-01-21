@@ -1,10 +1,11 @@
 //! State management for migration runs.
 //!
 //! Supports both database and file-based storage:
-//! - **Database** (recommended): Stores state in PostgreSQL `_mssql_pg_migrate` schema
+//! - **Database** (recommended): Stores state in target database `_mssql_pg_migrate` schema
 //! - **File**: Legacy file-based state for backwards compatibility
 
 pub mod db;
+pub mod mssql_db;
 
 use crate::error::{MigrateError, Result};
 use chrono::{DateTime, Utc};
@@ -17,6 +18,50 @@ use std::path::Path;
 type HmacSha256 = Hmac<Sha256>;
 
 pub use db::DbStateBackend;
+pub use mssql_db::MssqlStateBackend;
+
+/// Enum wrapper for database state backend implementations.
+pub enum StateBackend {
+    Postgres(DbStateBackend),
+    Mssql(MssqlStateBackend),
+}
+
+impl StateBackend {
+    /// Initialize the state schema.
+    pub async fn init_schema(&self) -> Result<()> {
+        match self {
+            Self::Postgres(backend) => backend.init_schema().await,
+            Self::Mssql(backend) => backend.init_schema().await,
+        }
+    }
+
+    /// Save migration state.
+    pub async fn save(&self, state: &MigrationState) -> Result<()> {
+        match self {
+            Self::Postgres(backend) => backend.save(state).await,
+            Self::Mssql(backend) => backend.save(state).await,
+        }
+    }
+
+    /// Load the latest migration state for a given config hash.
+    pub async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        match self {
+            Self::Postgres(backend) => backend.load_latest(config_hash).await,
+            Self::Mssql(backend) => backend.load_latest(config_hash).await,
+        }
+    }
+
+    /// Get the last sync timestamp for a specific table.
+    pub async fn get_last_sync_timestamp(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        match self {
+            Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
+            Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
+        }
+    }
+}
 
 /// Migration state for resume capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
