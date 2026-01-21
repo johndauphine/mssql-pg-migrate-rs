@@ -25,10 +25,6 @@ struct Cli {
     #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
 
-    /// Path to state file for resume capability
-    #[arg(long)]
-    state_file: Option<PathBuf>,
-
     /// Output JSON result to stdout
     #[arg(long)]
     output_json: bool,
@@ -55,7 +51,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a new migration
+    /// Start a migration (idempotent: auto-resumes from database state if it exists)
+    ///
+    /// State is automatically stored in the target PostgreSQL database (_mssql_pg_migrate schema):
+    /// - First run: Creates new migration state in database
+    /// - Subsequent runs: Automatically resumes from database state (enables incremental sync with date watermarks)
+    ///
+    /// Use 'resume' command for explicit crash recovery.
     Run {
         /// Override source schema
         #[arg(long)]
@@ -74,7 +76,12 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Resume a previously interrupted migration
+    /// Resume from database state (explicit crash recovery - requires existing state)
+    ///
+    /// Unlike 'run', this command errors if no state exists in the database.
+    /// Use this for crash recovery scenarios where you know migration was interrupted.
+    ///
+    /// State is stored in the target PostgreSQL database (_mssql_pg_migrate schema).
     Resume {
         /// Override source schema
         #[arg(long)]
@@ -183,20 +190,21 @@ async fn run() -> Result<(), MigrateError> {
                 config.migration.workers = Some(w);
             }
 
-            // Create orchestrator
+            // Create orchestrator (automatically initializes database state schema)
             let mut orchestrator = Orchestrator::new(config).await?;
 
-            // Apply global state_file if provided
-            if let Some(ref path) = cli.state_file {
-                orchestrator = orchestrator.with_state_file(path.clone());
-            }
+            // Auto-resume from database state if it exists
+            // This makes 'run' idempotent and enables incremental sync workflows:
+            // - First run: Creates new state in database, saves last_sync_timestamp
+            // - Subsequent runs: Loads state from database, uses last_sync_timestamp for date filters
+            orchestrator = orchestrator.resume().await?;
 
             // Enable progress reporting if requested
             if cli.progress {
                 orchestrator = orchestrator.with_progress(true);
             }
 
-            // Run fresh migration (or dry-run)
+            // Run migration (or dry-run)
             let result = orchestrator.run(cancel_token, dry_run).await?;
 
             if cli.output_json {
@@ -227,19 +235,6 @@ async fn run() -> Result<(), MigrateError> {
             target_schema,
             workers,
         } => {
-            // State file is required for resume
-            let state_file = cli.state_file.ok_or_else(|| {
-                MigrateError::Config("--state-file is required for resume".to_string())
-            })?;
-
-            // Verify state file exists
-            if !state_file.exists() {
-                return Err(MigrateError::Config(format!(
-                    "State file not found: {:?}",
-                    state_file
-                )));
-            }
-
             // Apply overrides
             if let Some(schema) = source_schema {
                 config.source.schema = schema;
@@ -251,18 +246,15 @@ async fn run() -> Result<(), MigrateError> {
                 config.migration.workers = Some(w);
             }
 
-            // Create orchestrator with resume
-            let mut orchestrator = Orchestrator::new(config)
-                .await?
-                .with_state_file(state_file)
-                .resume()?;
+            // Create orchestrator and load state from database
+            let mut orchestrator = Orchestrator::new(config).await?.resume().await?;
 
             // Enable progress reporting if requested
             if cli.progress {
                 orchestrator = orchestrator.with_progress(true);
             }
 
-            info!("Resuming from previous state");
+            info!("Resuming from database state");
 
             // Run migration (not dry-run for resume)
             let result = orchestrator.run(cancel_token, false).await?;

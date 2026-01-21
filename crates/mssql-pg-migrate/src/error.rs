@@ -77,6 +77,12 @@ pub enum MigrateError {
     Cancelled,
 }
 
+impl From<deadpool_postgres::PoolError> for MigrateError {
+    fn from(err: deadpool_postgres::PoolError) -> Self {
+        MigrateError::pool(err, "PostgreSQL connection pool")
+    }
+}
+
 impl MigrateError {
     /// Create a Pool error with context about where it occurred, preserving the source error
     pub fn pool<E>(error: E, context: impl Into<String>) -> Self

@@ -1,0 +1,33 @@
+# Test date watermark feature with Posts table (has date columns)
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: StackOverflow2010
+  user: sa
+  password: "YourStrong@Passw0rd"
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow
+  user: postgres
+  password: "PostgresPassword123"
+  schema: public
+  ssl_mode: disable
+
+migration:
+  target_mode: upsert
+  # Date-based incremental sync
+  date_updated_columns:
+    - LastActivityDate
+    - CreationDate
+  workers: 1
+  chunk_size: 50000
+  # Only process Posts to demonstrate timestamp tracking
+  include_tables:
+    - Posts

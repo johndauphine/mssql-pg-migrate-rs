@@ -7,13 +7,12 @@ pub use pools::{SourcePoolImpl, TargetPoolImpl};
 use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
-use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
-use crate::transfer::{TransferConfig, TransferEngine, TransferJob};
+use crate::state::{MigrationState, RunStatus, StateBackend, TableState, TaskStatus};
+use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,7 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Migration orchestrator.
 pub struct Orchestrator {
     config: Config,
-    state_file: Option<PathBuf>,
+    state_backend: StateBackend,
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
@@ -285,21 +284,20 @@ impl Orchestrator {
         let target = TargetPoolImpl::from_config(&config).await?;
         info!("Connected to {} target database", target.db_type());
 
+        // Initialize database state backend (supports both PostgreSQL and MSSQL)
+        let state_backend = target.create_state_backend()?;
+        state_backend.init_schema().await?;
+        info!("Initialized migration state schema in target database");
+
         Ok(Self {
             config,
-            state_file: None,
+            state_backend,
             state: None,
             source,
             target,
             progress_enabled: false,
             progress_tx: None,
         })
-    }
-
-    /// Set the state file path for resume capability.
-    pub fn with_state_file(mut self, path: PathBuf) -> Self {
-        self.state_file = Some(path);
-        self
     }
 
     /// Enable progress reporting to stderr as JSON lines.
@@ -341,16 +339,20 @@ impl Orchestrator {
         }
     }
 
-    /// Load existing state for resume.
-    pub fn resume(mut self) -> Result<Self> {
-        if let Some(ref path) = self.state_file {
-            if path.exists() {
-                let state = MigrationState::load(path)?;
-                state.validate_config(&self.config.hash())?;
-                self.state = Some(state);
-                info!("Resuming from state file: {:?}", path);
-            }
+    /// Load existing state for resume from database.
+    pub async fn resume(mut self) -> Result<Self> {
+        let config_hash = self.config.hash();
+
+        // Try to load latest state from database
+        if let Some(state) = self.state_backend.load_latest(&config_hash).await? {
+            info!(
+                "Resuming from database state: run_id={}, started={}",
+                state.run_id,
+                state.started_at.format("%Y-%m-%d %H:%M:%S")
+            );
+            self.state = Some(state);
         }
+
         Ok(self)
     }
 
@@ -529,7 +531,7 @@ impl Orchestrator {
             self.prepare_target(&tables, &mut state).await?;
 
             // Save state after preparation
-            self.save_state(&state)?;
+            self.save_state(&state).await?;
         } else {
             info!(
                 "Phase 2: [DRY RUN] Would prepare target database (mode: {:?})",
@@ -632,7 +634,7 @@ impl Orchestrator {
 
         // Save final state (skip in dry-run)
         if !dry_run {
-            self.save_state(&state)?;
+            self.save_state(&state).await?;
         }
 
         let result = MigrationResult {
@@ -900,16 +902,28 @@ impl Orchestrator {
                 .with_progress_counter(progress.rows_counter()),
         );
 
+        // Check if date-based incremental sync is enabled (upsert mode + date_updated_columns configured)
+        let date_incremental_enabled = self.config.migration.target_mode == TargetMode::Upsert
+            && !self.config.migration.date_updated_columns.is_empty();
+
         // Filter tables that need processing
+        // For incremental sync: process all tables (using date filters for completed ones)
+        // For resume: skip completed tables (crash recovery)
         let pending_tables: Vec<_> = tables
             .iter()
             .filter(|t| {
-                let table_name = t.full_name();
-                state
-                    .tables
-                    .get(&table_name)
-                    .map(|ts| ts.status != TaskStatus::Completed)
-                    .unwrap_or(true)
+                if date_incremental_enabled {
+                    // Incremental sync: process all tables
+                    true
+                } else {
+                    // Resume: skip completed tables
+                    let table_name = t.full_name();
+                    state
+                        .tables
+                        .get(&table_name)
+                        .map(|ts| ts.status != TaskStatus::Completed)
+                        .unwrap_or(true)
+                }
             })
             .collect();
 
@@ -927,6 +941,9 @@ impl Orchestrator {
         // Track expected partition counts per table (populated during spawning)
         let mut expected_partitions: HashMap<String, usize> = HashMap::new();
 
+        // Track sync start times per table (for updating watermark after successful completion)
+        let mut table_sync_start_times: HashMap<String, DateTime<Utc>> = HashMap::new();
+
         for table in pending_tables {
             // Check for cancellation
             if cancel.is_cancelled() {
@@ -935,6 +952,62 @@ impl Orchestrator {
             }
 
             let table_name = table.full_name();
+
+            // Record sync start time for watermarking (capture before transfer starts)
+            // This enables incremental sync later, even if switching from drop_recreate to upsert
+            let sync_start_time = Utc::now();
+            table_sync_start_times.insert(table_name.clone(), sync_start_time);
+
+            // Determine date filter for incremental sync (if enabled)
+            let date_filter = if date_incremental_enabled {
+                // Try to find a matching date column in this table
+                if let Some((col_name, col_type)) =
+                    table.find_date_column(&self.config.migration.date_updated_columns)
+                {
+
+                    // Get last sync timestamp from state
+                    let last_sync = state.get_last_sync_timestamp(&table_name);
+
+                    if let Some(last_sync_ts) = last_sync {
+                        // Incremental sync: only rows modified after last sync
+                        match DateFilter::new(col_name.clone(), last_sync_ts) {
+                            Ok(filter) => {
+                                info!(
+                                    "{}: incremental sync from {} using {} ({})",
+                                    table_name,
+                                    last_sync_ts.to_rfc3339(),
+                                    col_name,
+                                    col_type
+                                );
+                                Some(filter)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "{}: invalid sync timestamp, falling back to full sync: {}",
+                                    table_name, e
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        // First sync: full load, but record timestamp for next run
+                        info!(
+                            "{}: first sync (full load), date column {} found",
+                            table_name, col_name
+                        );
+                        None
+                    }
+                } else {
+                    // No matching date column found, use full sync
+                    debug!(
+                        "{}: no date column found in {:?}, using full sync",
+                        table_name, self.config.migration.date_updated_columns
+                    );
+                    None
+                }
+            } else {
+                None
+            };
 
             // Check if table should be partitioned for parallel reads
             let num_partitions = self.partition_count(table);
@@ -960,7 +1033,7 @@ impl Orchestrator {
                         if let Some(ts) = state.tables.get_mut(&table_name) {
                             ts.status = TaskStatus::InProgress;
                         }
-                        self.save_state(state)?;
+                        self.save_state(state).await?;
 
                         // Emit "started" progress event for the table
                         progress.emit("transferring", Some(table_name.clone()), Some("started"));
@@ -980,6 +1053,7 @@ impl Orchestrator {
                                 resume_from_pk: None, // Partitions don't support resume yet
                                 target_mode: self.config.migration.target_mode,
                                 target_schema: self.config.target.schema.clone(),
+                                date_filter: date_filter.clone(),
                             };
 
                             let engine_clone = engine.clone();
@@ -1012,7 +1086,7 @@ impl Orchestrator {
             if let Some(ts) = state.tables.get_mut(&table_name) {
                 ts.status = TaskStatus::InProgress;
             }
-            self.save_state(state)?;
+            self.save_state(state).await?;
 
             // Emit "started" progress event
             progress.emit("transferring", Some(table_name.clone()), Some("started"));
@@ -1025,6 +1099,7 @@ impl Orchestrator {
                 resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
                 target_mode: self.config.migration.target_mode,
                 target_schema: self.config.target.schema.clone(),
+                date_filter: date_filter.clone(),
             };
 
             let engine_clone = engine.clone();
@@ -1055,7 +1130,7 @@ impl Orchestrator {
                 );
                 join_set.abort_all();
                 // Save current state before breaking
-                self.save_state(state)?;
+                self.save_state(state).await?;
                 break;
             }
 
@@ -1103,6 +1178,8 @@ impl Orchestrator {
                 // When all partitions of a table are done, determine final status
                 if completed == expected {
                     let total_rows = table_rows.get(&base_table).copied().unwrap_or(0);
+                    let mut should_update_timestamp = false;
+
                     if let Some(ts) = state.tables.get_mut(&base_table) {
                         // Check for any errors across all partitions
                         if table_errors.contains_key(&base_table) {
@@ -1111,10 +1188,24 @@ impl Orchestrator {
                         } else {
                             ts.status = TaskStatus::Completed;
                             ts.completed_at = Some(Utc::now());
+                            should_update_timestamp = true;
                         }
                         ts.rows_transferred = total_rows;
                     }
-                    self.save_state(state)?;
+
+                    // Update sync timestamp for incremental sync (after releasing table state borrow)
+                    if should_update_timestamp {
+                        if let Some(sync_start) = table_sync_start_times.get(&base_table) {
+                            state.update_sync_timestamp(&base_table, *sync_start);
+                            debug!(
+                                "{}: updated sync timestamp to {}",
+                                base_table,
+                                sync_start.to_rfc3339()
+                            );
+                        }
+                    }
+
+                    self.save_state(state).await?;
                     // Progress tracking
                     if table_errors.contains_key(&base_table) {
                         progress.increment_table_count();
@@ -1129,6 +1220,7 @@ impl Orchestrator {
                 // Non-partitioned table - update state directly based on result
                 let is_success = task_result.is_ok();
                 let rows = task_result.as_ref().map(|s| s.rows).unwrap_or(0);
+                let mut should_update_timestamp = false;
 
                 if let Some(ts) = state.tables.get_mut(&base_table) {
                     match task_result {
@@ -1137,6 +1229,7 @@ impl Orchestrator {
                             ts.rows_transferred = stats.rows;
                             ts.last_pk = stats.last_pk;
                             ts.completed_at = Some(Utc::now());
+                            should_update_timestamp = true;
                         }
                         Err(e) => {
                             ts.status = TaskStatus::Failed;
@@ -1144,7 +1237,20 @@ impl Orchestrator {
                         }
                     }
                 }
-                self.save_state(state)?;
+
+                // Update sync timestamp for incremental sync (after releasing table state borrow)
+                if should_update_timestamp {
+                    if let Some(sync_start) = table_sync_start_times.get(&base_table) {
+                        state.update_sync_timestamp(&base_table, *sync_start);
+                        debug!(
+                            "{}: updated sync timestamp to {}",
+                            base_table,
+                            sync_start.to_rfc3339()
+                        );
+                    }
+                }
+
+                self.save_state(state).await?;
                 if is_success {
                     progress.complete_table(rows);
                 } else {
@@ -1188,7 +1294,7 @@ impl Orchestrator {
         progress_handle.abort();
 
         // Save final state
-        self.save_state(state)?;
+        self.save_state(state).await?;
 
         // Check for failures
         let failed: Vec<_> = state
@@ -1301,12 +1407,9 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Save state to file.
-    fn save_state(&self, state: &MigrationState) -> Result<()> {
-        if let Some(ref path) = self.state_file {
-            state.save(path)?;
-        }
-        Ok(())
+    /// Save state to database.
+    async fn save_state(&self, state: &MigrationState) -> Result<()> {
+        self.state_backend.save(state).await
     }
 
     /// Validate row counts between source and target.

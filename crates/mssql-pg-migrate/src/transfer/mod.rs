@@ -10,6 +10,7 @@ use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::SqlValue;
+use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -17,6 +18,71 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Date-based incremental sync filter.
+/// Only sync rows where the specified column is greater than the timestamp (or is NULL).
+#[derive(Debug, Clone)]
+pub struct DateFilter {
+    /// Date column name to filter on.
+    pub column: String,
+    /// Only sync rows where column > timestamp (or column IS NULL).
+    pub timestamp: DateTime<Utc>,
+}
+
+impl DateFilter {
+    /// Create a new DateFilter with validation.
+    ///
+    /// # Security
+    ///
+    /// Validates timestamp bounds to prevent injection and invalid date ranges:
+    /// - Rejects future timestamps (clock skew or tampering)
+    /// - Rejects very old timestamps (likely corruption or tampering)
+    /// - Column name validated separately during query building
+    pub fn new(column: String, timestamp: DateTime<Utc>) -> Result<Self> {
+        let now = Utc::now();
+
+        // Reject timestamps more than 1 hour in the future (allows for clock skew)
+        if timestamp > now + chrono::Duration::hours(1) {
+            return Err(MigrateError::Config(format!(
+                "Invalid sync timestamp for column '{}': timestamp {} is in the future (now: {})",
+                column,
+                timestamp.to_rfc3339(),
+                now.to_rfc3339()
+            )));
+        }
+
+        // Reject timestamps older than 100 years (likely corruption)
+        let min_timestamp = now - chrono::Duration::days(36500); // ~100 years
+        if timestamp < min_timestamp {
+            return Err(MigrateError::Config(format!(
+                "Invalid sync timestamp for column '{}': timestamp {} is too old (more than 100 years)",
+                column,
+                timestamp.to_rfc3339()
+            )));
+        }
+
+        Ok(Self { column, timestamp })
+    }
+
+    /// Get the timestamp as a validated ISO 8601 string suitable for SQL.
+    ///
+    /// # Security
+    ///
+    /// Returns a validated ISO 8601 timestamp that has been bounds-checked.
+    /// The ISO 8601 format is guaranteed to not contain SQL metacharacters.
+    ///
+    /// # Format
+    ///
+    /// Returns "YYYY-MM-DD HH:MM:SS.fff" format compatible with both:
+    /// - SQL Server datetime/datetime2 (timezone-naive)
+    /// - PostgreSQL timestamp (with implicit UTC assumption)
+    pub fn timestamp_sql_safe(&self) -> String {
+        // ISO 8601 format without timezone: YYYY-MM-DD HH:MM:SS.fff
+        // Compatible with SQL Server datetime and PostgreSQL timestamp
+        // No single quotes, no semicolons, no SQL injection risk
+        self.timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    }
+}
 
 /// Transfer job for a single table or partition.
 #[derive(Debug, Clone)]
@@ -41,6 +107,9 @@ pub struct TransferJob {
 
     /// Target schema name.
     pub target_schema: String,
+
+    /// Date filter for incremental sync (upsert mode only).
+    pub date_filter: Option<DateFilter>,
 }
 
 /// Statistics from a transfer job.
@@ -706,6 +775,7 @@ async fn read_table_chunks_parallel(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let date_filter = job.date_filter.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
         // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
@@ -724,7 +794,7 @@ async fn read_table_chunks_parallel(
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, date_filter,
             )
             .await
         });
@@ -811,6 +881,7 @@ async fn read_table_chunks_direct(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let date_filter = job.date_filter.clone();
 
         let (start_pk, is_resume) = if reader_id == 0 {
             if job.resume_from_pk.is_some() {
@@ -825,7 +896,7 @@ async fn read_table_chunks_direct(
         let handle = tokio::spawn(async move {
             read_chunk_range_direct(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, date_filter,
             )
             .await
         });
@@ -867,6 +938,7 @@ async fn read_chunk_range_direct(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    date_filter: Option<DateFilter>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -888,6 +960,7 @@ async fn read_chunk_range_direct(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            date_filter.as_ref(),
         )
         .await?;
 
@@ -978,6 +1051,7 @@ async fn read_chunk_range(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    date_filter: Option<DateFilter>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -999,6 +1073,7 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            date_filter.as_ref(),
         )
         .await?;
 
@@ -1096,6 +1171,7 @@ async fn read_table_chunks(
                 max_pk,
                 chunk_size,
                 is_first_chunk,
+                job.date_filter.as_ref(),
             )
             .await?
         } else {
@@ -1182,6 +1258,7 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    date_filter: Option<&DateFilter>,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let is_postgres = source.db_type() == "postgres";
@@ -1231,6 +1308,23 @@ async fn read_chunk_keyset_fast(
         conditions.push(format!("{} <= {}", pk_quoted, pk));
     }
 
+    // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
+    if let Some(filter) = date_filter {
+        let date_quoted = if is_postgres {
+            quote_pg_ident(&filter.column)
+        } else {
+            quote_mssql_ident(&filter.column)
+        };
+        // SECURITY: timestamp_sql_safe() returns bounds-validated ISO 8601 string
+        // ISO 8601 format (YYYY-MM-DD HH:MM:SS.fff) contains no SQL metacharacters
+        let timestamp_str = filter.timestamp_sql_safe();
+        // Include NULL values to catch rows without timestamps
+        conditions.push(format!(
+            "({} > '{}' OR {} IS NULL)",
+            date_quoted, timestamp_str, date_quoted
+        ));
+    }
+
     if !conditions.is_empty() {
         query.push_str(" WHERE ");
         query.push_str(&conditions.join(" AND "));
@@ -1275,6 +1369,7 @@ async fn read_chunk_keyset_direct(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    date_filter: Option<&DateFilter>,
 ) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
     // Only MSSQL supports direct copy
     if !source.supports_direct_copy() {
@@ -1306,6 +1401,19 @@ async fn read_chunk_keyset_direct(
     }
     if let Some(pk) = max_pk {
         conditions.push(format!("{} <= {}", pk_quoted, pk));
+    }
+
+    // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
+    if let Some(filter) = date_filter {
+        let date_quoted = quote_mssql_ident(&filter.column);
+        // SECURITY: timestamp_sql_safe() returns bounds-validated ISO 8601 string
+        // ISO 8601 format (YYYY-MM-DD HH:MM:SS.fff) contains no SQL metacharacters
+        let timestamp_str = filter.timestamp_sql_safe();
+        // Include NULL values to catch rows without timestamps
+        conditions.push(format!(
+            "({} > '{}' OR {} IS NULL)",
+            date_quoted, timestamp_str, date_quoted
+        ));
     }
 
     if !conditions.is_empty() {
@@ -1540,18 +1648,29 @@ async fn read_table_chunks_copy_binary(
 ///
 /// Escapes double quotes by doubling them and wraps in double quotes.
 /// Includes defensive validation for suspicious patterns.
+///
+/// # Security
+///
+/// Runtime validation prevents SQL injection via identifier manipulation.
+/// Panics on invalid identifiers (null bytes, excessive length) as these
+/// indicate corruption or attack attempts.
 fn quote_pg_ident(name: &str) -> String {
-    // Defensive validation: reject suspicious patterns
-    debug_assert!(
-        !name.contains('\0'),
-        "Identifier contains null byte: {:?}",
-        name
-    );
-    debug_assert!(
-        name.len() <= 128,
-        "Identifier exceeds maximum length (128): {}",
-        name.len()
-    );
+    // SECURITY: Runtime validation (not debug-only)
+    // Null bytes should never appear in legitimate identifiers
+    if name.contains('\0') {
+        panic!(
+            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
+            name
+        );
+    }
+
+    // PostgreSQL identifier length limit is 63 bytes, but we're more conservative
+    if name.len() > 128 {
+        panic!(
+            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
+            name.len()
+        );
+    }
 
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -1616,18 +1735,22 @@ fn is_integer_type(col_type: &str) -> bool {
 /// However, we add defensive validation to reject suspicious patterns that
 /// could indicate tampering or corruption.
 fn quote_mssql_ident(name: &str) -> String {
-    // Defensive validation: reject suspicious patterns
-    // These should never appear in legitimate identifier names
-    debug_assert!(
-        !name.contains('\0'),
-        "Identifier contains null byte: {:?}",
-        name
-    );
-    debug_assert!(
-        name.len() <= 128,
-        "Identifier exceeds maximum length (128): {}",
-        name.len()
-    );
+    // SECURITY: Runtime validation (not debug-only)
+    // Null bytes should never appear in legitimate identifiers
+    if name.contains('\0') {
+        panic!(
+            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
+            name
+        );
+    }
+
+    // SQL Server identifier length limit is 128 characters
+    if name.len() > 128 {
+        panic!(
+            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
+            name.len()
+        );
+    }
 
     format!("[{}]", name.replace(']', "]]"))
 }

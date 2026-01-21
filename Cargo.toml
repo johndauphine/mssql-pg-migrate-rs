@@ -65,6 +65,7 @@ bytes = "1.7"
 
 # Hashing for config validation
 sha2 = "0.10"
+hmac = "0.12"
 
 # Hex encoding
 hex = "0.4"

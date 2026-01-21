@@ -43,6 +43,17 @@ migration:
   #   - upsert: Insert or update based on primary key (incremental sync)
   target_mode: drop_recreate
 
+  # Date-based incremental sync (upsert mode only)
+  # When set, the tool will look for these columns in each table (in priority order)
+  # and only sync rows where column > last_sync_timestamp.
+  # This significantly speeds up incremental syncs by filtering at the source.
+  # Common examples: LastActivityDate, ModifiedDate, UpdatedAt, CreationDate
+  # date_updated_columns:
+  #   - LastActivityDate
+  #   - ModifiedDate
+  #   - UpdatedAt
+  #   - CreationDate
+
   # Parallel readers per large table (auto-tuned if not set)
   # parallel_readers: 24
 

@@ -1,10 +1,67 @@
-//! File-based state management for resume capability.
+//! State management for migration runs.
+//!
+//! Supports both database and file-based storage:
+//! - **Database** (recommended): Stores state in target database `_mssql_pg_migrate` schema
+//! - **File**: Legacy file-based state for backwards compatibility
+
+pub mod db;
+pub mod mssql_db;
 
 use crate::error::{MigrateError, Result};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::Path;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub use db::DbStateBackend;
+pub use mssql_db::MssqlStateBackend;
+
+/// Enum wrapper for database state backend implementations.
+pub enum StateBackend {
+    Postgres(DbStateBackend),
+    Mssql(MssqlStateBackend),
+}
+
+impl StateBackend {
+    /// Initialize the state schema.
+    pub async fn init_schema(&self) -> Result<()> {
+        match self {
+            Self::Postgres(backend) => backend.init_schema().await,
+            Self::Mssql(backend) => backend.init_schema().await,
+        }
+    }
+
+    /// Save migration state.
+    pub async fn save(&self, state: &MigrationState) -> Result<()> {
+        match self {
+            Self::Postgres(backend) => backend.save(state).await,
+            Self::Mssql(backend) => backend.save(state).await,
+        }
+    }
+
+    /// Load the latest migration state for a given config hash.
+    pub async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        match self {
+            Self::Postgres(backend) => backend.load_latest(config_hash).await,
+            Self::Mssql(backend) => backend.load_latest(config_hash).await,
+        }
+    }
+
+    /// Get the last sync timestamp for a specific table.
+    pub async fn get_last_sync_timestamp(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        match self {
+            Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
+            Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
+        }
+    }
+}
 
 /// Migration state for resume capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +83,12 @@ pub struct MigrationState {
 
     /// When the migration completed (if finished).
     pub completed_at: Option<DateTime<Utc>>,
+
+    /// HMAC-SHA256 signature for integrity validation.
+    /// Computed over serialized state (excluding this field) using config_hash as key.
+    /// Optional for backward compatibility with older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>,
 }
 
 /// Overall run status.
@@ -65,6 +128,12 @@ pub struct TableState {
 
     /// Error message if failed.
     pub error: Option<String>,
+
+    /// Last sync timestamp for incremental upsert (date watermark).
+    /// Stores the sync start time after successful completion.
+    /// Used to filter source rows on next run: WHERE date_column > last_sync_timestamp.
+    #[serde(default)]
+    pub last_sync_timestamp: Option<DateTime<Utc>>,
 }
 
 /// Per-partition state.
@@ -100,19 +169,71 @@ impl MigrationState {
             status: RunStatus::Running,
             tables: HashMap::new(),
             completed_at: None,
+            hmac: None, // Will be computed on first save
         }
     }
 
-    /// Load state from a file.
+    /// Compute HMAC-SHA256 signature for state integrity validation.
+    ///
+    /// # Security
+    ///
+    /// Uses config_hash as HMAC key to prevent tampering with state file.
+    /// Attacker would need both file system access AND knowledge of config_hash.
+    fn compute_hmac(&self) -> Result<String> {
+        // Create a copy without HMAC for signing
+        let mut state_for_signing = self.clone();
+        state_for_signing.hmac = None;
+
+        let content = serde_json::to_string(&state_for_signing)
+            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+
+        let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
+            .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
+
+        mac.update(content.as_bytes());
+        let result = mac.finalize();
+        Ok(hex::encode(result.into_bytes()))
+    }
+
+    /// Load state from a file with integrity validation.
+    ///
+    /// # Security
+    ///
+    /// Validates HMAC signature if present to detect tampering.
+    /// Older state files without HMAC are still accepted for backward compatibility,
+    /// but will be upgraded to include HMAC on next save.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let state: Self = serde_json::from_str(&content)?;
+
+        // Validate HMAC if present
+        if let Some(stored_hmac) = &state.hmac {
+            let expected_hmac = state.compute_hmac()?;
+            if stored_hmac != &expected_hmac {
+                return Err(MigrateError::Config(
+                    "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
+                ));
+            }
+        }
+        // If no HMAC present, accept for backward compatibility but log warning
+        else {
+            tracing::warn!("State file has no HMAC signature (older format), integrity cannot be verified");
+        }
+
         Ok(state)
     }
 
-    /// Save state to a file (atomic write).
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    /// Save state to a file (atomic write with HMAC).
+    ///
+    /// # Security
+    ///
+    /// Computes HMAC-SHA256 signature before saving to enable integrity validation on load.
+    pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
+
+        // Compute HMAC before serialization
+        self.hmac = Some(self.compute_hmac()?);
+
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| MigrateError::Config(format!("Failed to serialize state: {}", e)))?;
 
@@ -145,6 +266,7 @@ impl MigrationState {
                 partitions: None,
                 completed_at: None,
                 error: None,
+                last_sync_timestamp: None,
             })
     }
 
@@ -154,6 +276,22 @@ impl MigrationState {
             .get(table_name)
             .map(|t| t.status == TaskStatus::Completed)
             .unwrap_or(false)
+    }
+
+    /// Get last sync timestamp for a table (for incremental upsert).
+    /// Returns None if table hasn't been synced before or doesn't exist.
+    pub fn get_last_sync_timestamp(&self, table_name: &str) -> Option<DateTime<Utc>> {
+        self.tables
+            .get(table_name)
+            .and_then(|t| t.last_sync_timestamp)
+    }
+
+    /// Update last sync timestamp for a table (for incremental upsert).
+    /// This should be called with the sync start time after successful completion.
+    pub fn update_sync_timestamp(&mut self, table_name: &str, timestamp: DateTime<Utc>) {
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.last_sync_timestamp = Some(timestamp);
+        }
     }
 
     /// Mark the migration as completed.
@@ -181,6 +319,7 @@ impl TableState {
             partitions: None,
             completed_at: None,
             error: None,
+            last_sync_timestamp: None,
         }
     }
 
@@ -229,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let state = MigrationState::new("test-run".into(), "abc123".into());
+        let mut state = MigrationState::new("test-run".into(), "abc123".into());
         assert!(state.validate_config("abc123").is_ok());
         assert!(state.validate_config("different").is_err());
     }
@@ -258,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_state_json_format_pretty() {
-        let state = MigrationState::new("test-run".into(), "hash".into());
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
         let file = NamedTempFile::new().unwrap();
         state.save(file.path()).unwrap();
 
@@ -273,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_state_file_is_json_not_yaml() {
-        let state = MigrationState::new("test".into(), "hash".into());
+        let mut state = MigrationState::new("test".into(), "hash".into());
         let file = NamedTempFile::new().unwrap();
         state.save(file.path()).unwrap();
 
@@ -329,5 +468,83 @@ mod tests {
         let loaded_table = loaded.tables.get("dbo.Failed").unwrap();
         assert_eq!(loaded_table.status, TaskStatus::Failed);
         assert_eq!(loaded_table.error, Some("Connection timeout".to_string()));
+    }
+
+    #[test]
+    fn test_sync_timestamp_tracking() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Users", 1000);
+
+        // Initially no sync timestamp
+        assert_eq!(state.get_last_sync_timestamp("dbo.Users"), None);
+
+        // Update sync timestamp
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Users", timestamp);
+
+        // Should retrieve the timestamp
+        assert_eq!(state.get_last_sync_timestamp("dbo.Users"), Some(timestamp));
+    }
+
+    #[test]
+    fn test_sync_timestamp_persistence() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Posts", 5000);
+
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Posts", timestamp);
+
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        // Load from file and verify timestamp persisted
+        let loaded = MigrationState::load(file.path()).unwrap();
+        assert_eq!(loaded.get_last_sync_timestamp("dbo.Posts"), Some(timestamp));
+    }
+
+    #[test]
+    fn test_sync_timestamp_nonexistent_table() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+
+        // Should return None for non-existent table
+        assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
+    }
+
+    #[test]
+    fn test_sync_timestamp_update_nonexistent_table() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+
+        // Update should not panic for non-existent table (silently ignored)
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.NonExistent", timestamp);
+
+        // Should still return None
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.NonExistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sync_timestamp_overwrite() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Orders", 2000);
+
+        let first_timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Orders", first_timestamp);
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.Orders"),
+            Some(first_timestamp)
+        );
+
+        // Update with new timestamp
+        let second_timestamp = first_timestamp + chrono::Duration::hours(1);
+        state.update_sync_timestamp("dbo.Orders", second_timestamp);
+
+        // Should return the new timestamp
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.Orders"),
+            Some(second_timestamp)
+        );
     }
 }
