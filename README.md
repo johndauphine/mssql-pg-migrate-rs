@@ -140,6 +140,10 @@ migration:
   create_indexes: true
   create_foreign_keys: true
   create_check_constraints: true
+  # date_updated_columns:     # For upsert mode: date watermark columns (priority order)
+  #   - LastActivityDate
+  #   - ModifiedDate
+  #   - UpdatedAt
 ```
 
 ### Auto-Tuning
@@ -169,6 +173,31 @@ Upsert mode streams all rows to PostgreSQL:
 3. **Optimization**: PostgreSQL's MVCC handles unchanged rows efficiently
 
 No deletes are performed for safety. Tables require a primary key for upsert mode.
+
+#### Date-Based Incremental Sync (High-Water Mark)
+
+For incremental syncs in upsert mode, configure date watermark columns to dramatically reduce processing time:
+
+```yaml
+migration:
+  target_mode: upsert
+  date_updated_columns:
+    - LastActivityDate  # Check these columns in priority order
+    - ModifiedDate
+    - UpdatedAt
+    - CreationDate
+```
+
+How it works:
+
+1. **First sync**: Full table load, records current timestamp
+2. **Subsequent syncs**: Only processes rows where `date_column > last_sync_timestamp`
+3. **NULL-safe**: Includes rows with NULL timestamps to avoid missing data
+4. **Per-table tracking**: Each table uses its own watermark column and timestamp
+
+Example: With 19.3M rows and no changes, full sync takes ~84s. With date watermarks, incremental sync completes in seconds by filtering at the source.
+
+The tool automatically discovers the first matching date/timestamp column for each table. If no match is found, the table falls back to full sync.
 
 ## Type Mapping
 
