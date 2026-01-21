@@ -14,6 +14,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::config::{SourceConfig, TargetConfig};
+use crate::drivers::{
+    MssqlReader, MssqlWriter, PostgresReader, PostgresWriter, SourceReaderImpl, TargetWriterImpl,
+};
+#[cfg(feature = "mysql")]
+use crate::drivers::{MysqlReader, MysqlWriter};
 use crate::error::{MigrateError, Result};
 
 use super::traits::{Dialect, TypeMapper};
@@ -58,7 +64,8 @@ impl DriverCatalog {
     /// Create a catalog with the standard built-in drivers registered.
     ///
     /// This is a convenience method that registers MSSQL and PostgreSQL
-    /// dialects and their type mappers.
+    /// dialects and their type mappers. When the `mysql` feature is enabled,
+    /// MySQL/MariaDB support is also registered.
     pub fn with_builtins() -> Self {
         use crate::dialect::{IdentityMapper, MssqlToPostgresMapper, PostgresToMssqlMapper};
         use crate::drivers::{MssqlDialect, PostgresDialect};
@@ -80,6 +87,28 @@ impl DriverCatalog {
             "postgres",
             Arc::new(IdentityMapper::new("postgres")),
         );
+
+        // Register MySQL support if the feature is enabled
+        #[cfg(feature = "mysql")]
+        {
+            use crate::dialect::{
+                MssqlToMysqlMapper, MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMysqlMapper,
+            };
+            use crate::drivers::MysqlDialect;
+
+            catalog.register_dialect("mysql", MysqlDialect::new());
+
+            // MySQL ↔ PostgreSQL
+            catalog.register_mapper("mysql", "postgres", Arc::new(MysqlToPostgresMapper::new()));
+            catalog.register_mapper("postgres", "mysql", Arc::new(PostgresToMysqlMapper::new()));
+
+            // MySQL ↔ MSSQL
+            catalog.register_mapper("mysql", "mssql", Arc::new(MysqlToMssqlMapper::new()));
+            catalog.register_mapper("mssql", "mysql", Arc::new(MssqlToMysqlMapper::new()));
+
+            // MySQL identity mapper
+            catalog.register_mapper("mysql", "mysql", Arc::new(IdentityMapper::new("mysql")));
+        }
 
         catalog
     }
@@ -166,6 +195,145 @@ impl DriverCatalog {
             .keys()
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect()
+    }
+
+    // =========================================================================
+    // Factory methods for creating readers and writers
+    // =========================================================================
+
+    /// Create a source reader from configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Source database configuration
+    /// * `max_conns` - Maximum connection pool size
+    ///
+    /// # Returns
+    ///
+    /// A `SourceReaderImpl` enum variant appropriate for the database type.
+    pub async fn create_reader(
+        &self,
+        config: &SourceConfig,
+        max_conns: usize,
+    ) -> Result<SourceReaderImpl> {
+        let db_type = config.r#type.to_lowercase();
+
+        match db_type.as_str() {
+            "postgres" | "postgresql" | "pg" => {
+                let reader = PostgresReader::new(config, max_conns).await?;
+                Ok(SourceReaderImpl::Postgres(Arc::new(reader)))
+            }
+            "mssql" | "sqlserver" | "sql_server" => {
+                let reader = MssqlReader::with_pool_size(config.clone(), max_conns as u32).await?;
+                Ok(SourceReaderImpl::Mssql(Arc::new(reader)))
+            }
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => {
+                let reader = MysqlReader::new(config, max_conns).await?;
+                Ok(SourceReaderImpl::Mysql(Arc::new(reader)))
+            }
+            other => {
+                #[cfg(feature = "mysql")]
+                let supported = "mssql, postgres, mysql";
+                #[cfg(not(feature = "mysql"))]
+                let supported = "mssql, postgres (enable 'mysql' feature for MySQL support)";
+                Err(MigrateError::Config(format!(
+                    "Unknown source database type: '{}'. Supported types: {}",
+                    other, supported
+                )))
+            }
+        }
+    }
+
+    /// Create a target writer from configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Target database configuration
+    /// * `max_conns` - Maximum connection pool size
+    /// * `source_db_type` - The source database type (for type mapping)
+    ///
+    /// # Returns
+    ///
+    /// A `TargetWriterImpl` enum variant appropriate for the database type,
+    /// with the correct type mapper configured.
+    pub async fn create_writer(
+        &self,
+        config: &TargetConfig,
+        max_conns: usize,
+        source_db_type: &str,
+    ) -> Result<TargetWriterImpl> {
+        let db_type = config.r#type.to_lowercase();
+        let target_type = match db_type.as_str() {
+            "postgres" | "postgresql" | "pg" => "postgres",
+            "mssql" | "sqlserver" | "sql_server" => "mssql",
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => "mysql",
+            other => {
+                #[cfg(feature = "mysql")]
+                let supported = "mssql, postgres, mysql";
+                #[cfg(not(feature = "mysql"))]
+                let supported = "mssql, postgres (enable 'mysql' feature for MySQL support)";
+                return Err(MigrateError::Config(format!(
+                    "Unknown target database type: '{}'. Supported types: {}",
+                    other, supported
+                )));
+            }
+        };
+
+        // Get the type mapper for this source→target combination
+        let type_mapper = self.get_mapper(source_db_type, target_type);
+
+        match db_type.as_str() {
+            "postgres" | "postgresql" | "pg" => {
+                let mut writer = PostgresWriter::new(config, max_conns).await?;
+                if let Some(mapper) = type_mapper {
+                    writer = writer.with_type_mapper(mapper);
+                }
+                Ok(TargetWriterImpl::Postgres(Arc::new(writer)))
+            }
+            "mssql" | "sqlserver" | "sql_server" => {
+                let mut writer = MssqlWriter::with_pool_size(config.clone(), max_conns as u32).await?;
+                if let Some(mapper) = type_mapper {
+                    writer = writer.with_type_mapper(mapper);
+                }
+                Ok(TargetWriterImpl::Mssql(Arc::new(writer)))
+            }
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => {
+                let mut writer = MysqlWriter::new(config, max_conns).await?;
+                if let Some(mapper) = type_mapper {
+                    writer = writer.with_type_mapper(mapper);
+                }
+                Ok(TargetWriterImpl::Mysql(Arc::new(writer)))
+            }
+            _ => unreachable!(), // Already handled above
+        }
+    }
+
+    /// Get the canonical database type string.
+    ///
+    /// Normalizes various aliases to the canonical form:
+    /// - "mssql", "sqlserver", "sql_server" → "mssql"
+    /// - "postgres", "postgresql", "pg" → "postgres"
+    /// - "mysql", "mariadb" → "mysql" (requires `mysql` feature)
+    pub fn normalize_db_type(db_type: &str) -> Result<&'static str> {
+        match db_type.to_lowercase().as_str() {
+            "mssql" | "sqlserver" | "sql_server" => Ok("mssql"),
+            "postgres" | "postgresql" | "pg" => Ok("postgres"),
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => Ok("mysql"),
+            other => {
+                #[cfg(feature = "mysql")]
+                let supported = "mssql, postgres, mysql";
+                #[cfg(not(feature = "mysql"))]
+                let supported = "mssql, postgres (enable 'mysql' feature for MySQL support)";
+                Err(MigrateError::Config(format!(
+                    "Unknown database type: '{}'. Supported types: {}",
+                    other, supported
+                )))
+            }
+        }
     }
 }
 

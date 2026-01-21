@@ -1,11 +1,15 @@
 //! Pool wrapper enums for bidirectional migration support.
 //!
 //! These enums provide static dispatch for source and target pool implementations,
-//! avoiding trait objects while supporting all 4 migration directions:
+//! avoiding trait objects while supporting all migration directions:
 //! - MSSQL → PostgreSQL
 //! - PostgreSQL → MSSQL
 //! - MSSQL → MSSQL
 //! - PostgreSQL → PostgreSQL
+//! - MySQL → PostgreSQL (requires `mysql` feature)
+//! - MySQL → MSSQL (requires `mysql` feature)
+//! - MSSQL → MySQL (requires `mysql` feature)
+//! - PostgreSQL → MySQL (requires `mysql` feature)
 
 use crate::config::AuthMethod;
 use crate::config::Config;
@@ -15,18 +19,145 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
-use crate::state::{DbStateBackend, MssqlStateBackend, StateBackendEnum};
+#[cfg(not(feature = "mysql"))]
+use crate::state::{DbStateBackend, MssqlStateBackend, NoOpStateBackend, StateBackendEnum};
+#[cfg(feature = "mysql")]
+use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "mysql")]
+use crate::drivers::{MysqlReader, MysqlWriter};
+#[cfg(feature = "mysql")]
+use crate::core::traits::{SourceReader as NewSourceReader, TargetWriter as NewTargetWriter};
+#[cfg(feature = "mysql")]
+use crate::core::value::{Batch, SqlValue as NewSqlValue, SqlNullType as NewSqlNullType};
+#[cfg(feature = "mysql")]
+use std::borrow::Cow;
+
 #[cfg(feature = "kerberos")]
 use tracing::info;
+#[cfg(feature = "mysql")]
+use tracing::info as mysql_info;
+
+/// Convert old SqlValue to new SqlValue<'static> for MySQL compatibility.
+#[cfg(feature = "mysql")]
+fn convert_sql_value(old: SqlValue) -> NewSqlValue<'static> {
+    use crate::target::SqlNullType as OldSqlNullType;
+
+    match old {
+        SqlValue::Null(nt) => {
+            let new_nt = match nt {
+                OldSqlNullType::Bool => NewSqlNullType::Bool,
+                OldSqlNullType::I16 => NewSqlNullType::I16,
+                OldSqlNullType::I32 => NewSqlNullType::I32,
+                OldSqlNullType::I64 => NewSqlNullType::I64,
+                OldSqlNullType::F32 => NewSqlNullType::F32,
+                OldSqlNullType::F64 => NewSqlNullType::F64,
+                OldSqlNullType::String => NewSqlNullType::String,
+                OldSqlNullType::Bytes => NewSqlNullType::Bytes,
+                OldSqlNullType::Uuid => NewSqlNullType::Uuid,
+                OldSqlNullType::Decimal => NewSqlNullType::Decimal,
+                OldSqlNullType::DateTime => NewSqlNullType::DateTime,
+                OldSqlNullType::DateTimeOffset => NewSqlNullType::DateTimeOffset,
+                OldSqlNullType::Date => NewSqlNullType::Date,
+                OldSqlNullType::Time => NewSqlNullType::Time,
+            };
+            NewSqlValue::Null(new_nt)
+        }
+        SqlValue::Bool(v) => NewSqlValue::Bool(v),
+        SqlValue::I16(v) => NewSqlValue::I16(v),
+        SqlValue::I32(v) => NewSqlValue::I32(v),
+        SqlValue::I64(v) => NewSqlValue::I64(v),
+        SqlValue::F32(v) => NewSqlValue::F32(v),
+        SqlValue::F64(v) => NewSqlValue::F64(v),
+        SqlValue::String(v) => NewSqlValue::Text(Cow::Owned(v)),
+        SqlValue::Bytes(v) => NewSqlValue::Bytes(Cow::Owned(v)),
+        SqlValue::Uuid(v) => NewSqlValue::Uuid(v),
+        SqlValue::Decimal(v) => NewSqlValue::Decimal(v),
+        SqlValue::DateTime(v) => NewSqlValue::DateTime(v),
+        SqlValue::DateTimeOffset(v) => NewSqlValue::DateTimeOffset(v),
+        SqlValue::Date(v) => NewSqlValue::Date(v),
+        SqlValue::Time(v) => NewSqlValue::Time(v),
+    }
+}
+
+/// MySQL UpsertWriter wrapper that implements the UpsertWriter trait using the new TargetWriter API.
+#[cfg(feature = "mysql")]
+pub struct MysqlUpsertWriter {
+    writer: Arc<MysqlWriter>,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+}
+
+#[cfg(feature = "mysql")]
+impl MysqlUpsertWriter {
+    /// Create a new MySQL upsert writer.
+    pub fn new(
+        writer: Arc<MysqlWriter>,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Self {
+        Self {
+            writer,
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[async_trait::async_trait]
+impl UpsertWriter for MysqlUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        // Convert old SqlValue to new SqlValue
+        let new_rows: Vec<Vec<NewSqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_sql_value).collect())
+            .collect();
+
+        let batch = Batch {
+            rows: new_rows,
+            last_key: None,
+            is_last: false,
+        };
+
+        NewTargetWriter::upsert_batch(
+            self.writer.as_ref(),
+            &self.schema,
+            &self.table,
+            cols,
+            pk_cols,
+            batch,
+            self.writer_id,
+            self.partition_id,
+        )
+        .await
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        false
+    }
+}
 
 /// Enum wrapper for source pool implementations.
 pub enum SourcePoolImpl {
     Mssql(Arc<MssqlPool>),
     Postgres(Arc<PgSourcePool>),
+    #[cfg(feature = "mysql")]
+    Mysql(Arc<MysqlReader>),
 }
 
 impl SourcePoolImpl {
@@ -35,11 +166,27 @@ impl SourcePoolImpl {
         let pool_size = config.migration.get_max_mssql_connections() as u32;
         let source_type = config.source.r#type.to_lowercase();
 
-        if source_type == "postgres" || source_type == "postgresql" {
+        if source_type == "postgres" || source_type == "postgresql" || source_type == "pg" {
             // PostgreSQL source - native tokio-postgres only
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
             let pool = PgSourcePool::new(&config.source, pool_size as usize).await?;
             Ok(Self::Postgres(Arc::new(pool)))
+        } else if source_type == "mysql" || source_type == "mariadb" {
+            // MySQL/MariaDB source - uses SQLx
+            #[cfg(feature = "mysql")]
+            {
+                mysql_info!("Creating MySQL source connection pool");
+                let reader = MysqlReader::new(&config.source, pool_size as usize).await?;
+                Ok(Self::Mysql(Arc::new(reader)))
+            }
+            #[cfg(not(feature = "mysql"))]
+            {
+                Err(MigrateError::Config(
+                    "MySQL source requires the 'mysql' feature.\n\n\
+                     Rebuild with: cargo build --features mysql"
+                        .into(),
+                ))
+            }
         } else {
             // MSSQL source - uses native Tiberius driver
             if config.source.auth == AuthMethod::Kerberos {
@@ -75,6 +222,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.db_type(),
             Self::Postgres(p) => p.db_type(),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => p.db_type(),
         }
     }
 
@@ -83,6 +232,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.extract_schema(schema).await,
             Self::Postgres(p) => p.extract_schema(schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::extract_schema(p.as_ref(), schema).await,
         }
     }
 
@@ -95,6 +246,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.get_partition_boundaries(table, num_partitions).await,
             Self::Postgres(p) => p.get_partition_boundaries(table, num_partitions).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await,
         }
     }
 
@@ -103,6 +256,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.load_indexes(table).await,
             Self::Postgres(p) => p.load_indexes(table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::load_indexes(p.as_ref(), table).await,
         }
     }
 
@@ -111,6 +266,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.load_foreign_keys(table).await,
             Self::Postgres(p) => p.load_foreign_keys(table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::load_foreign_keys(p.as_ref(), table).await,
         }
     }
 
@@ -119,6 +276,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.load_check_constraints(table).await,
             Self::Postgres(p) => p.load_check_constraints(table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::load_check_constraints(p.as_ref(), table).await,
         }
     }
 
@@ -127,6 +286,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.get_row_count(schema, table).await,
             Self::Postgres(p) => p.get_row_count(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::get_row_count(p.as_ref(), schema, table).await,
         }
     }
 
@@ -135,6 +296,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.test_connection().await,
             Self::Postgres(p) => p.test_connection().await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => p.test_connection().await,
         }
     }
 
@@ -143,6 +306,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.close().await,
             Self::Postgres(p) => p.close().await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::close(p.as_ref()).await,
         }
     }
 
@@ -158,6 +323,14 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.query_rows_fast(sql, columns, col_types).await,
             Self::Postgres(p) => p.query_rows_fast(sql, columns, col_types).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => {
+                // MySQL uses the new trait-based API which doesn't have query_rows_fast
+                // This path shouldn't be called for MySQL sources using the new transfer engine
+                Err(crate::error::MigrateError::Config(
+                    "MySQL source does not support query_rows_fast. Use the new SourceReader API.".to_string(),
+                ))
+            }
         }
     }
 
@@ -166,7 +339,7 @@ impl SourcePoolImpl {
     /// This is the high-performance path for MSSQL->PG upsert that bypasses
     /// SqlValue entirely. Returns (encoded_bytes, first_pk, last_pk, row_count).
     ///
-    /// Only supported for MSSQL sources - returns None for PostgreSQL.
+    /// Only supported for MSSQL sources - returns None for other sources.
     pub async fn query_rows_direct_copy(
         &self,
         sql: &str,
@@ -180,6 +353,8 @@ impl SourcePoolImpl {
             }
             // Direct copy is only optimized for MSSQL sources
             Self::Postgres(_) => Ok(None),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => Ok(None),
         }
     }
 
@@ -228,6 +403,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => p.get_max_pk(schema, table, pk_col).await,
             Self::Postgres(p) => p.get_max_pk(schema, table, pk_col).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewSourceReader::get_max_pk(p.as_ref(), schema, table, pk_col).await,
         }
     }
 
@@ -236,6 +413,8 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(p) => Some(p.clone()),
             Self::Postgres(_) => None,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => None,
         }
     }
 
@@ -244,7 +423,25 @@ impl SourcePoolImpl {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => None,
         }
+    }
+
+    /// Get the underlying MySQL reader.
+    #[cfg(feature = "mysql")]
+    pub fn as_mysql(&self) -> Option<Arc<MysqlReader>> {
+        match self {
+            Self::Mssql(_) => None,
+            Self::Postgres(_) => None,
+            Self::Mysql(p) => Some(p.clone()),
+        }
+    }
+
+    /// Check if this is a MySQL source.
+    #[cfg(feature = "mysql")]
+    pub fn is_mysql(&self) -> bool {
+        matches!(self, Self::Mysql(_))
     }
 
     /// Check if this is an ODBC-based source.
@@ -258,6 +455,8 @@ impl SourcePoolImpl {
 pub enum TargetPoolImpl {
     Mssql(Arc<MssqlTargetPool>),
     Postgres(Arc<PgPool>),
+    #[cfg(feature = "mysql")]
+    Mysql(Arc<MysqlWriter>),
 }
 
 impl TargetPoolImpl {
@@ -266,7 +465,7 @@ impl TargetPoolImpl {
         let max_conns = config.migration.get_max_pg_connections();
         let target_type = config.target.r#type.to_lowercase();
 
-        if target_type == "mssql" {
+        if target_type == "mssql" || target_type == "sqlserver" || target_type == "sql_server" {
             // MSSQL target - uses native Tiberius driver
             if config.target.auth == AuthMethod::Kerberos {
                 #[cfg(feature = "kerberos")]
@@ -292,6 +491,22 @@ impl TargetPoolImpl {
             }
             let pool = MssqlTargetPool::new(&config.target, max_conns as u32).await?;
             Ok(Self::Mssql(Arc::new(pool)))
+        } else if target_type == "mysql" || target_type == "mariadb" {
+            // MySQL/MariaDB target - uses SQLx
+            #[cfg(feature = "mysql")]
+            {
+                mysql_info!("Creating MySQL target connection pool");
+                let writer = MysqlWriter::new(&config.target, max_conns).await?;
+                Ok(Self::Mysql(Arc::new(writer)))
+            }
+            #[cfg(not(feature = "mysql"))]
+            {
+                Err(MigrateError::Config(
+                    "MySQL target requires the 'mysql' feature.\n\n\
+                     Rebuild with: cargo build --features mysql"
+                        .into(),
+                ))
+            }
         } else {
             // PostgreSQL target - native tokio-postgres only
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
@@ -311,7 +526,15 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.db_type(),
             Self::Postgres(p) => p.db_type(),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => p.db_type(),
         }
+    }
+
+    /// Returns true if this target supports direct copy encoding (PostgreSQL binary format).
+    /// Only PostgreSQL targets support this - MSSQL and MySQL use parameterized inserts.
+    pub fn supports_direct_copy(&self) -> bool {
+        matches!(self, Self::Postgres(_))
     }
 
     /// Create a state backend appropriate for this target database type.
@@ -323,6 +546,8 @@ impl TargetPoolImpl {
             Self::Mssql(p) => Ok(StateBackendEnum::Mssql(MssqlStateBackend::new(Arc::clone(
                 p,
             )))),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => Ok(StateBackendEnum::Mysql(MysqlStateBackend::new(p.pool())))
         }
     }
 
@@ -331,6 +556,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_schema(schema).await,
             Self::Postgres(p) => p.create_schema(schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_schema(p.as_ref(), schema).await,
         }
     }
 
@@ -339,6 +566,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_table(table, target_schema).await,
             Self::Postgres(p) => p.create_table(table, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_table(p.as_ref(), table, target_schema).await,
         }
     }
 
@@ -347,6 +576,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_table_unlogged(table, target_schema).await,
             Self::Postgres(p) => p.create_table_unlogged(table, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_table_unlogged(p.as_ref(), table, target_schema).await,
         }
     }
 
@@ -355,6 +586,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.drop_table(schema, table).await,
             Self::Postgres(p) => p.drop_table(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::drop_table(p.as_ref(), schema, table).await,
         }
     }
 
@@ -363,6 +596,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.truncate_table(schema, table).await,
             Self::Postgres(p) => p.truncate_table(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::truncate_table(p.as_ref(), schema, table).await,
         }
     }
 
@@ -371,6 +606,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.table_exists(schema, table).await,
             Self::Postgres(p) => p.table_exists(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::table_exists(p.as_ref(), schema, table).await,
         }
     }
 
@@ -379,6 +616,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_primary_key(table, target_schema).await,
             Self::Postgres(p) => p.create_primary_key(table, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_primary_key(p.as_ref(), table, target_schema).await,
         }
     }
 
@@ -392,6 +631,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_index(table, idx, target_schema).await,
             Self::Postgres(p) => p.create_index(table, idx, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_index(p.as_ref(), table, idx, target_schema).await,
         }
     }
 
@@ -400,6 +641,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.drop_non_pk_indexes(schema, table).await,
             Self::Postgres(p) => p.drop_non_pk_indexes(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::drop_non_pk_indexes(p.as_ref(), schema, table).await,
         }
     }
 
@@ -413,6 +656,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_foreign_key(table, fk, target_schema).await,
             Self::Postgres(p) => p.create_foreign_key(table, fk, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_foreign_key(p.as_ref(), table, fk, target_schema).await,
         }
     }
 
@@ -426,6 +671,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.create_check_constraint(table, chk, target_schema).await,
             Self::Postgres(p) => p.create_check_constraint(table, chk, target_schema).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::create_check_constraint(p.as_ref(), table, chk, target_schema).await,
         }
     }
 
@@ -434,6 +681,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.has_primary_key(schema, table).await,
             Self::Postgres(p) => p.has_primary_key(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::has_primary_key(p.as_ref(), schema, table).await,
         }
     }
 
@@ -442,6 +691,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.get_row_count(schema, table).await,
             Self::Postgres(p) => p.get_row_count(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::get_row_count(p.as_ref(), schema, table).await,
         }
     }
 
@@ -450,6 +701,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.reset_sequence(schema, table).await,
             Self::Postgres(p) => p.reset_sequence(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::reset_sequence(p.as_ref(), schema, table).await,
         }
     }
 
@@ -458,6 +711,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.set_table_logged(schema, table).await,
             Self::Postgres(p) => p.set_table_logged(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::set_table_logged(p.as_ref(), schema, table).await,
         }
     }
 
@@ -466,6 +721,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.set_table_unlogged(schema, table).await,
             Self::Postgres(p) => p.set_table_unlogged(schema, table).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::set_table_unlogged(p.as_ref(), schema, table).await,
         }
     }
 
@@ -480,6 +737,20 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.write_chunk(schema, table, cols, rows).await,
             Self::Postgres(p) => p.write_chunk(schema, table, cols, rows).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => {
+                // Convert old SqlValue to new SqlValue<'static> for MySQL
+                let new_rows: Vec<Vec<NewSqlValue<'static>>> = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(convert_sql_value).collect())
+                    .collect();
+                let batch = Batch {
+                    rows: new_rows,
+                    last_key: None,
+                    is_last: true,
+                };
+                NewTargetWriter::write_batch(p.as_ref(), schema, table, cols, batch).await
+            }
         }
     }
 
@@ -504,6 +775,20 @@ impl TargetPoolImpl {
                 p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
                     .await
             }
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => {
+                // Convert old SqlValue to new SqlValue<'static> for MySQL
+                let new_rows: Vec<Vec<NewSqlValue<'static>>> = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(convert_sql_value).collect())
+                    .collect();
+                let batch = Batch {
+                    rows: new_rows,
+                    last_key: None,
+                    is_last: true,
+                };
+                NewTargetWriter::upsert_batch(p.as_ref(), schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+            }
         }
     }
 
@@ -524,6 +809,17 @@ impl TargetPoolImpl {
                 p.get_upsert_writer(schema, table, writer_id, partition_id)
                     .await
             }
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => {
+                // MySQL uses the MysqlUpsertWriter wrapper
+                Ok(Box::new(MysqlUpsertWriter::new(
+                    Arc::clone(p),
+                    schema,
+                    table,
+                    writer_id,
+                    partition_id,
+                )))
+            }
         }
     }
 
@@ -532,6 +828,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(_) => Ok(()),
             Self::Postgres(p) => p.test_connection().await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => p.test_connection().await,
         }
     }
 
@@ -540,6 +838,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.close().await,
             Self::Postgres(p) => p.close().await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => NewTargetWriter::close(p.as_ref()).await,
         }
     }
 
@@ -548,6 +848,8 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => None,
         }
     }
 
@@ -556,7 +858,25 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => Some(p.clone()),
             Self::Postgres(_) => None,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => None,
         }
+    }
+
+    /// Get the underlying MySQL writer.
+    #[cfg(feature = "mysql")]
+    pub fn as_mysql(&self) -> Option<Arc<MysqlWriter>> {
+        match self {
+            Self::Mssql(_) => None,
+            Self::Postgres(_) => None,
+            Self::Mysql(p) => Some(p.clone()),
+        }
+    }
+
+    /// Check if this is a MySQL target.
+    #[cfg(feature = "mysql")]
+    pub fn is_mysql(&self) -> bool {
+        matches!(self, Self::Mysql(_))
     }
 
     /// Check if this is an ODBC-based target.
@@ -571,6 +891,8 @@ impl Clone for SourcePoolImpl {
         match self {
             Self::Mssql(p) => Self::Mssql(p.clone()),
             Self::Postgres(p) => Self::Postgres(p.clone()),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => Self::Mysql(p.clone()),
         }
     }
 }
@@ -580,6 +902,8 @@ impl Clone for TargetPoolImpl {
         match self {
             Self::Mssql(p) => Self::Mssql(p.clone()),
             Self::Postgres(p) => Self::Postgres(p.clone()),
+            #[cfg(feature = "mysql")]
+            Self::Mysql(p) => Self::Mysql(p.clone()),
         }
     }
 }

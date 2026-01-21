@@ -5,6 +5,8 @@ mod pools;
 pub use pools::{SourcePoolImpl, TargetPoolImpl};
 
 use crate::config::{Config, TableStats, TargetMode};
+use crate::core::catalog::DriverCatalog;
+use crate::drivers::{SourceReaderImpl, TargetWriterImpl};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
 use crate::state::{MigrationState, RunStatus, StateBackendEnum, TableState, TaskStatus};
@@ -28,6 +30,8 @@ pub struct Orchestrator {
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
+    /// Driver catalog for creating readers/writers with the new plugin architecture.
+    catalog: DriverCatalog,
     progress_enabled: bool,
     progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
 }
@@ -276,6 +280,9 @@ impl ProgressTracker {
 impl Orchestrator {
     /// Create a new orchestrator.
     pub async fn new(config: Config) -> Result<Self> {
+        // Initialize driver catalog with built-in drivers
+        let catalog = DriverCatalog::with_builtins();
+
         // Create source pool based on configured type
         let source = SourcePoolImpl::from_config(&config).await?;
         info!("Connected to {} source database", source.db_type());
@@ -295,6 +302,7 @@ impl Orchestrator {
             state: None,
             source,
             target,
+            catalog,
             progress_enabled: false,
             progress_tx: None,
         })
@@ -400,6 +408,31 @@ impl Orchestrator {
     /// Get a reference to the target connection pool.
     pub fn target_pool(&self) -> TargetPoolImpl {
         self.target.clone()
+    }
+
+    /// Get a reference to the driver catalog.
+    pub fn catalog(&self) -> &DriverCatalog {
+        &self.catalog
+    }
+
+    /// Create a source reader using the new driver architecture.
+    ///
+    /// This creates a new reader instance using `DriverCatalog`. Use this for
+    /// data transfer operations that benefit from the new streaming interface.
+    pub async fn create_source_reader(&self, max_conns: usize) -> Result<SourceReaderImpl> {
+        self.catalog.create_reader(&self.config.source, max_conns).await
+    }
+
+    /// Create a target writer using the new driver architecture.
+    ///
+    /// This creates a new writer instance using `DriverCatalog`. The writer
+    /// will have the appropriate type mapper configured for the source→target
+    /// database combination.
+    pub async fn create_target_writer(&self, max_conns: usize) -> Result<TargetWriterImpl> {
+        let source_db_type = DriverCatalog::normalize_db_type(&self.config.source.r#type)?;
+        self.catalog
+            .create_writer(&self.config.target, max_conns, source_db_type)
+            .await
     }
 
     /// Extract schema from the source database.

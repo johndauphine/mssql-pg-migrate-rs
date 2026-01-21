@@ -13,6 +13,8 @@ pub enum DatabaseType {
     Mssql,
     /// PostgreSQL
     Postgres,
+    /// MySQL/MariaDB (requires `mysql` feature)
+    Mysql,
 }
 
 /// Authentication/connection method for database connections.
@@ -66,6 +68,7 @@ impl DatabaseType {
         match s.to_lowercase().as_str() {
             "mssql" | "sqlserver" | "sql_server" => Some(Self::Mssql),
             "postgres" | "postgresql" | "pg" => Some(Self::Postgres),
+            "mysql" | "mariadb" => Some(Self::Mysql),
             _ => None,
         }
     }
@@ -75,14 +78,27 @@ impl DatabaseType {
         match self {
             Self::Mssql => 1433,
             Self::Postgres => 5432,
+            Self::Mysql => 3306,
         }
     }
 
     /// Get the default schema for this database type.
+    /// Note: MySQL uses "database" instead of "schema", but we treat
+    /// the database name as the schema for consistency.
     pub fn default_schema(&self) -> &'static str {
         match self {
             Self::Mssql => "dbo",
             Self::Postgres => "public",
+            Self::Mysql => "", // MySQL uses database name directly
+        }
+    }
+
+    /// Get the string representation for this database type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mssql => "mssql",
+            Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
         }
     }
 }

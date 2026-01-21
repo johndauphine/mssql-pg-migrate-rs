@@ -8,6 +8,10 @@
 //!
 //! - [`MssqlToPostgresMapper`]: MSSQL → PostgreSQL (all lossless)
 //! - [`PostgresToMssqlMapper`]: PostgreSQL → MSSQL (some lossy)
+//! - [`MysqlToPostgresMapper`]: MySQL → PostgreSQL (mostly lossless)
+//! - [`PostgresToMysqlMapper`]: PostgreSQL → MySQL (some lossy)
+//! - [`MysqlToMssqlMapper`]: MySQL → MSSQL
+//! - [`MssqlToMysqlMapper`]: MSSQL → MySQL
 //! - [`IdentityMapper`]: Same dialect transfers (passthrough)
 //!
 //! # Usage
@@ -23,4 +27,7 @@
 
 mod typemap;
 
-pub use typemap::{IdentityMapper, MssqlToPostgresMapper, PostgresToMssqlMapper};
+pub use typemap::{
+    mssql_to_mysql_basic, IdentityMapper, MssqlToMysqlMapper, MssqlToPostgresMapper,
+    MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMssqlMapper, PostgresToMysqlMapper,
+};

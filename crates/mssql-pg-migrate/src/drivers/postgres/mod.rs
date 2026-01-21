@@ -3,12 +3,13 @@
 //! This module provides PostgreSQL-specific implementations:
 //!
 //! - [`PostgresDialect`]: SQL syntax strategy for PostgreSQL
-//!
-//! # Note
-//!
-//! The full `PostgresReader` and `PostgresWriter` implementations will be extracted
-//! from `source/postgres.rs` and `target/mod.rs` in subsequent commits.
+//! - [`PostgresReader`]: Source reader for PostgreSQL databases
+//! - [`PostgresWriter`]: Target writer for PostgreSQL databases
 
 mod dialect;
+mod reader;
+mod writer;
 
 pub use dialect::PostgresDialect;
+pub use reader::PostgresReader;
+pub use writer::PostgresWriter;

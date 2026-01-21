@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-High-performance, headless MSSQL ↔ PostgreSQL migration tool written in Rust. Designed for scripted environments, Kubernetes, and Airflow DAGs.
+High-performance, headless database migration tool written in Rust. Supports MSSQL ↔ PostgreSQL bidirectional migrations, with optional MySQL/MariaDB support. Designed for scripted environments, Kubernetes, and Airflow DAGs.
 
 ## Build & Development Commands
 
@@ -15,6 +15,7 @@ cargo build --release
 # Build with optional features
 cargo build --release --features tui        # Terminal UI
 cargo build --release --features kerberos   # Kerberos auth
+cargo build --release --features mysql      # MySQL/MariaDB support
 
 # Run tests
 cargo test
@@ -43,19 +44,20 @@ crates/
 │       │   ├── catalog.rs   # DriverCatalog for dependency injection
 │       │   ├── schema.rs    # Table, Column, Index, ForeignKey
 │       │   └── value.rs     # SqlValue with Cow<'a, str> for zero-copy
-│       ├── drivers/         # Database driver implementations
-│       │   ├── mssql/       # MSSQL dialect
-│       │   ├── postgres/    # PostgreSQL dialect
+│       ├── drivers/         # Database driver implementations (NEW)
+│       │   ├── mssql/       # MSSQL dialect, reader, writer
+│       │   ├── postgres/    # PostgreSQL dialect, reader, writer
+│       │   ├── mysql/       # MySQL/MariaDB dialect (feature: mysql)
 │       │   └── common/      # Shared utilities (TLS)
-│       ├── dialect/         # Type mapping registry
-│       │   └── typemap.rs   # MssqlToPostgres, PostgresToMssql mappers
+│       ├── dialect/         # Type mapping registry (NEW)
+│       │   └── typemap.rs   # All type mappers (MSSQL↔PG, MySQL↔PG, etc.)
 │       ├── pipeline/        # Transfer pipeline (Template Method)
 │       │   ├── template.rs  # TransferPipeline trait, PipelineConfig
 │       │   └── job.rs       # TransferJob (Command pattern)
 │       ├── orchestrator/    # Main coordinator, connection pools
 │       ├── transfer/        # Parallel read/write engine
-│       ├── source/          # SourcePool trait: MssqlPool, PgSourcePool
-│       ├── target/          # TargetPool trait: PgPool, MssqlTargetPool
+│       ├── source/          # SourcePool trait (DEPRECATED → use drivers/)
+│       ├── target/          # TargetPool trait (DEPRECATED → use drivers/)
 │       ├── state/           # Database-backed migration state
 │       │   ├── backend.rs   # StateBackend trait (Strategy pattern)
 │       │   ├── db.rs        # PostgreSQL state backend
@@ -77,7 +79,7 @@ crates/
 1. **Config** → Load YAML/JSON, auto-tune based on RAM/CPU
 2. **Orchestrator** → Connect pools, initialize state backend
 3. **Schema Extraction** → List tables, columns, indexes, FKs from source
-4. **Type Mapping** → Convert types bidirectionally (MSSQL ↔ PostgreSQL)
+4. **Type Mapping** → Convert types bidirectionally (MSSQL ↔ PostgreSQL ↔ MySQL)
 5. **Target Schema** → Create/truncate tables, drop non-PK indexes
 6. **Transfer Engine** → Parallel readers (keyset pagination) + parallel writers (binary COPY)
 7. **Finalization** → Create indexes, FKs, constraints sequentially
@@ -85,8 +87,19 @@ crates/
 
 ### Key Abstractions
 
-- **`SourcePool` trait** (`source/mod.rs`): Database-agnostic source operations. Implementations: `MssqlPool`, `PgSourcePool`
-- **`TargetPool` trait** (`target/mod.rs`): Database-agnostic target operations. Implementations: `PgPool`, `MssqlTargetPool`
+**New Plugin Architecture (recommended):**
+- **`SourceReader` trait** (`core/traits.rs`): Database-agnostic source operations
+- **`TargetWriter` trait** (`core/traits.rs`): Database-agnostic target operations
+- **`Dialect` trait** (`core/traits.rs`): SQL syntax strategy for different databases
+- **`TypeMapper` trait** (`core/traits.rs`): Type conversion between databases
+- **`DriverCatalog`** (`core/catalog.rs`): Factory for creating readers, writers, and mappers
+- **`SourceReaderImpl` / `TargetWriterImpl`** (`drivers/mod.rs`): Enum-based static dispatch
+
+**Legacy (deprecated, still functional):**
+- **`SourcePool` trait** (`source/mod.rs`): Use `SourceReader` instead
+- **`TargetPool` trait** (`target/mod.rs`): Use `TargetWriter` instead
+
+**State Management:**
 - **`StateBackend` trait** (`state/backend.rs`): Migration state storage strategy. Implementations: `DbStateBackend`, `MssqlStateBackend`
 - **`TransferEngine`** (`transfer/mod.rs`): Manages parallel read-ahead pipeline with configurable workers
 
@@ -124,6 +137,27 @@ The codebase uses Gang of Four design patterns for extensibility:
 | `drop_recreate` | Drop & recreate tables, bulk insert | Full refresh (fastest) |
 | `truncate` | Truncate existing, create if missing | Preserve schema |
 | `upsert` | Staging table → `INSERT...ON CONFLICT DO UPDATE` | Incremental sync |
+
+### MySQL/MariaDB Support
+
+MySQL/MariaDB support is available via the `mysql` feature flag:
+
+```bash
+cargo build --release --features mysql
+```
+
+**Supported Migration Paths:**
+- MySQL → PostgreSQL (all types lossless)
+- PostgreSQL → MySQL (some lossy: uuid→char(36), interval→varchar)
+- MySQL → MSSQL
+- MSSQL → MySQL
+
+**MySQL-specific Features:**
+- Uses SQLx connection pooling
+- Multi-row INSERT batching for bulk writes
+- `INSERT...ON DUPLICATE KEY UPDATE` for upserts
+- Enforces utf8mb4 charset for full Unicode support
+- Explicit transactions for batch safety
 
 ### Incremental Sync
 

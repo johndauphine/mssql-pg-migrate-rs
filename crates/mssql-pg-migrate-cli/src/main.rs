@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -343,8 +344,27 @@ fn setup_logging(verbosity: &str, format: &str) -> Result<(), String> {
         _ => Level::INFO,
     };
 
+    // Build filter that suppresses sqlx query logging (which prints huge SQL strings with ? placeholders)
+    // sqlx logs queries at DEBUG/TRACE level, which floods terminals and makes debugging impossible
+    let level_str = match level {
+        Level::DEBUG => "debug",
+        Level::INFO => "info",
+        Level::WARN => "warn",
+        Level::ERROR => "error",
+        Level::TRACE => "trace",
+    };
+    // Set default level, but suppress all sqlx logging to error-only to avoid SQL query spam
+    // This filter takes precedence over RUST_LOG for sqlx targets
+    let filter_str = format!(
+        "{},sqlx=error,sqlx::query=off,sqlx_core=error,sqlx_mysql=error",
+        level_str
+    );
+    let filter = EnvFilter::builder()
+        .with_default_directive(level.into())
+        .parse_lossy(&filter_str);
+
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
+        .with_env_filter(filter)
         .with_span_events(FmtSpan::CLOSE)
         .with_target(false);
 

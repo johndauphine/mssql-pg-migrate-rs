@@ -83,6 +83,13 @@ impl From<deadpool_postgres::PoolError> for MigrateError {
     }
 }
 
+#[cfg(feature = "mysql")]
+impl From<sqlx::Error> for MigrateError {
+    fn from(err: sqlx::Error) -> Self {
+        MigrateError::pool(err, "MySQL database")
+    }
+}
+
 impl MigrateError {
     /// Create a Pool error with context about where it occurred, preserving the source error
     pub fn pool<E>(error: E, context: impl Into<String>) -> Self

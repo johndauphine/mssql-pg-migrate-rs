@@ -361,8 +361,10 @@ impl TransferEngine {
 
         // Check if we can use direct COPY encoding (MSSQL source + PG target upsert)
         // Direct copy requires integer PK for proper resume tracking
+        // Target must also support direct copy (only PostgreSQL does)
         let use_direct_copy = self.config.use_direct_copy
             && self.source.supports_direct_copy()
+            && self.target.supports_direct_copy()
             && job.target_mode == TargetMode::Upsert
             && use_keyset
             && pk_is_integer;
