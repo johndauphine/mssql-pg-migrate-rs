@@ -1861,8 +1861,8 @@ mod tests {
 
     #[test]
     fn test_sql_value_to_column_data_valid_floats() {
-        let f32_val = SqlValue::F32(3.14);
-        let f64_val = SqlValue::F64(2.718281828);
+        let f32_val = SqlValue::F32(3.15); // Not a mathematical constant
+        let f64_val = SqlValue::F64(2.72); // Not a mathematical constant
 
         assert!(matches!(
             sql_value_to_column_data(&f32_val),
@@ -1975,7 +1975,7 @@ mod tests {
         let row = vec![
             SqlValue::I32(42),
             SqlValue::I64(123456789),
-            SqlValue::F64(3.14159),
+            SqlValue::F64(3.125), // Not a mathematical constant
             SqlValue::Bool(true),
         ];
         assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
@@ -2226,37 +2226,37 @@ mod tests {
 
         // 10 columns -> min(2100/10, 1000) = min(210, 1000) = 210
         let cols_10 = 10;
-        let max_rows_10 = (2100 / cols_10).min(1000).max(1);
+        let max_rows_10 = (2100 / cols_10).clamp(1, 1000);
         assert_eq!(max_rows_10, 210);
 
         // 100 columns -> min(2100/100, 1000) = min(21, 1000) = 21
         let cols_100 = 100;
-        let max_rows_100 = (2100 / cols_100).min(1000).max(1);
+        let max_rows_100 = (2100 / cols_100).clamp(1, 1000);
         assert_eq!(max_rows_100, 21);
 
         // 3 columns -> min(2100/3, 1000) = min(700, 1000) = 700
         let cols_3 = 3;
-        let max_rows_3 = (2100 / cols_3).min(1000).max(1);
+        let max_rows_3 = (2100 / cols_3).clamp(1, 1000);
         assert_eq!(max_rows_3, 700);
 
         // 2 columns -> min(2100/2, 1000) = min(1050, 1000) = 1000 (capped!)
         let cols_2 = 2;
-        let max_rows_2 = (2100 / cols_2).min(1000).max(1);
+        let max_rows_2 = (2100 / cols_2).clamp(1, 1000);
         assert_eq!(max_rows_2, 1000);
 
         // 1 column -> min(2100/1, 1000) = min(2100, 1000) = 1000 (capped!)
         let cols_1 = 1;
-        let max_rows_1 = (2100 / cols_1).min(1000).max(1);
+        let max_rows_1 = (2100 / cols_1).clamp(1, 1000);
         assert_eq!(max_rows_1, 1000);
 
         // 2100 columns -> min(2100/2100, 1000) = min(1, 1000) = 1
         let cols_2100 = 2100;
-        let max_rows_2100 = (2100 / cols_2100).min(1000).max(1);
+        let max_rows_2100 = (2100 / cols_2100).clamp(1, 1000);
         assert_eq!(max_rows_2100, 1);
 
         // 3000 columns -> min(2100/3000, 1000) = min(0, 1000) -> max(1) = 1
         let cols_3000 = 3000;
-        let max_rows_3000 = (2100 / cols_3000).min(1000).max(1);
+        let max_rows_3000 = (2100 / cols_3000).clamp(1, 1000);
         assert_eq!(max_rows_3000, 1);
     }
 

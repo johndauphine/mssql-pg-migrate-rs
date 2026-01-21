@@ -75,7 +75,11 @@ impl DriverCatalog {
 
         // Identity mappers for same-dialect transfers
         catalog.register_mapper("mssql", "mssql", Arc::new(IdentityMapper::new("mssql")));
-        catalog.register_mapper("postgres", "postgres", Arc::new(IdentityMapper::new("postgres")));
+        catalog.register_mapper(
+            "postgres",
+            "postgres",
+            Arc::new(IdentityMapper::new("postgres")),
+        );
 
         catalog
     }
@@ -102,9 +106,8 @@ impl DriverCatalog {
 
     /// Get a dialect by name, returning an error if not found.
     pub fn require_dialect(&self, name: &str) -> Result<Arc<dyn Dialect>> {
-        self.get_dialect(name).ok_or_else(|| {
-            MigrateError::Config(format!("Unknown database dialect: {}", name))
-        })
+        self.get_dialect(name)
+            .ok_or_else(|| MigrateError::Config(format!("Unknown database dialect: {}", name)))
     }
 
     /// Register a type mapper for a source→target dialect pair.
@@ -170,7 +173,10 @@ impl std::fmt::Debug for DriverCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DriverCatalog")
             .field("dialects", &self.dialects.keys().collect::<Vec<_>>())
-            .field("type_mappers", &self.type_mappers.keys().collect::<Vec<_>>())
+            .field(
+                "type_mappers",
+                &self.type_mappers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -217,13 +223,7 @@ mod tests {
             format!("{} > {}", pk_col, last_pk)
         }
 
-        fn build_row_number_query(
-            &self,
-            inner: &str,
-            _pk: &str,
-            start: i64,
-            end: i64,
-        ) -> String {
+        fn build_row_number_query(&self, inner: &str, _pk: &str, start: i64, end: i64) -> String {
             format!("{} ROWS {} TO {}", inner, start, end)
         }
     }

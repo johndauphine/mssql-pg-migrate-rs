@@ -112,10 +112,7 @@ impl Dialect for PostgresDialect {
             .join(", ");
 
         // Non-PK columns for UPDATE
-        let non_pk_cols: Vec<_> = columns
-            .iter()
-            .filter(|c| !pk_columns.contains(c))
-            .collect();
+        let non_pk_cols: Vec<_> = columns.iter().filter(|c| !pk_columns.contains(c)).collect();
 
         let mut sql = format!(
             "INSERT INTO {} ({}) SELECT {} FROM {}",
@@ -208,10 +205,7 @@ mod tests {
         };
 
         let sql = dialect.build_select_query(&opts);
-        assert_eq!(
-            sql,
-            "SELECT \"id\", \"name\" FROM \"public\".\"users\""
-        );
+        assert_eq!(sql, "SELECT \"id\", \"name\" FROM \"public\".\"users\"");
     }
 
     #[test]
@@ -293,21 +287,14 @@ mod tests {
     #[test]
     fn test_build_keyset_where() {
         let dialect = PostgresDialect::new();
-        assert_eq!(
-            dialect.build_keyset_where("id", 100),
-            "\"id\" > 100"
-        );
+        assert_eq!(dialect.build_keyset_where("id", 100), "\"id\" > 100");
     }
 
     #[test]
     fn test_build_row_number_query() {
         let dialect = PostgresDialect::new();
-        let sql = dialect.build_row_number_query(
-            "SELECT * FROM \"public\".\"users\"",
-            "id",
-            1,
-            1000,
-        );
+        let sql =
+            dialect.build_row_number_query("SELECT * FROM \"public\".\"users\"", "id", 1, 1000);
 
         assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY \"id\")"));
         assert!(sql.contains("__rn >= 1"));

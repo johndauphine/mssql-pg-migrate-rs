@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tiberius::Row;
 
 use crate::error::{MigrateError, Result};
-use crate::state::backend::{run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend};
+use crate::state::backend::{
+    run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend,
+};
 use crate::state::{MigrationState, RunStatus, TableState};
 use crate::target::MssqlTargetPool;
 
@@ -203,12 +205,16 @@ impl MssqlStateBackend {
 
         // Extract run-level fields from first row (all rows have same values)
         let first_row = &rows[0];
-        let run_id: String = first_row.get::<&str, _>(0).ok_or_else(|| {
-            MigrateError::State("Failed to get run_id from database".to_string())
-        })?.to_string();
-        let config_hash: String = first_row.get::<&str, _>(1).ok_or_else(|| {
-            MigrateError::State("Failed to get config_hash from database".to_string())
-        })?.to_string();
+        let run_id: String = first_row
+            .get::<&str, _>(0)
+            .ok_or_else(|| MigrateError::State("Failed to get run_id from database".to_string()))?
+            .to_string();
+        let config_hash: String = first_row
+            .get::<&str, _>(1)
+            .ok_or_else(|| {
+                MigrateError::State("Failed to get config_hash from database".to_string())
+            })?
+            .to_string();
         let started_at: DateTime<Utc> = first_row.get(2).ok_or_else(|| {
             MigrateError::State("Failed to get run_started_at from database".to_string())
         })?;
@@ -265,10 +271,7 @@ impl MssqlStateBackend {
     }
 
     /// Get the last sync timestamp for a specific table (for incremental sync).
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         let mut conn = self.pool.get_conn().await?;
 
         let sql = format!(
@@ -313,10 +316,7 @@ impl StateBackend for MssqlStateBackend {
         MssqlStateBackend::load_latest(self, config_hash).await
     }
 
-    async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         MssqlStateBackend::get_last_sync_timestamp(self, table_name).await
     }
 

@@ -220,6 +220,7 @@ pub trait TargetWriter: Send + Sync {
     /// Upsert a batch of rows (insert or update on conflict).
     ///
     /// Uses staging table pattern for efficiency.
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_batch(
         &self,
         schema: &str,
@@ -428,7 +429,10 @@ mod tests {
         let mapping = TypeMapping::lossy("text", "Array types stored as JSON");
         assert_eq!(mapping.target_type, "text");
         assert!(mapping.is_lossy);
-        assert_eq!(mapping.warning.as_deref(), Some("Array types stored as JSON"));
+        assert_eq!(
+            mapping.warning.as_deref(),
+            Some("Array types stored as JSON")
+        );
     }
 
     #[test]

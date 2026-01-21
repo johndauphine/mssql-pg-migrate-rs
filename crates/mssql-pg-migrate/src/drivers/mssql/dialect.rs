@@ -115,10 +115,7 @@ impl Dialect for MssqlDialect {
             .join(" AND ");
 
         // Non-PK columns for UPDATE
-        let non_pk_cols: Vec<_> = columns
-            .iter()
-            .filter(|c| !pk_columns.contains(c))
-            .collect();
+        let non_pk_cols: Vec<_> = columns.iter().filter(|c| !pk_columns.contains(c)).collect();
 
         let update_set = non_pk_cols
             .iter()
@@ -319,21 +316,13 @@ mod tests {
     #[test]
     fn test_build_keyset_where() {
         let dialect = MssqlDialect::new();
-        assert_eq!(
-            dialect.build_keyset_where("Id", 100),
-            "[Id] > 100"
-        );
+        assert_eq!(dialect.build_keyset_where("Id", 100), "[Id] > 100");
     }
 
     #[test]
     fn test_build_row_number_query() {
         let dialect = MssqlDialect::new();
-        let sql = dialect.build_row_number_query(
-            "SELECT * FROM [dbo].[Users]",
-            "Id",
-            1,
-            1000,
-        );
+        let sql = dialect.build_row_number_query("SELECT * FROM [dbo].[Users]", "Id", 1, 1000);
 
         assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY [Id])"));
         assert!(sql.contains("__rn >= 1"));

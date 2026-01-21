@@ -23,8 +23,8 @@
 //! This allows different pipeline implementations (parallel, serial, streaming)
 //! to be used interchangeably.
 
-mod template;
 mod job;
+mod template;
 
-pub use template::{TransferPipeline, PipelineConfig, PipelineStats};
-pub use job::{TransferJob, JobResult};
+pub use job::{JobResult, TransferJob};
+pub use template::{PipelineConfig, PipelineStats, TransferPipeline};

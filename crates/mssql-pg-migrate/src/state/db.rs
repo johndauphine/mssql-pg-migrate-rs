@@ -13,7 +13,9 @@ use deadpool_postgres::Pool;
 use std::collections::HashMap;
 
 use crate::error::Result;
-use crate::state::backend::{run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend};
+use crate::state::backend::{
+    run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend,
+};
 use crate::state::{MigrationState, TableState};
 
 /// Database state backend for migration runs.
@@ -36,11 +38,8 @@ impl DbStateBackend {
         let conn = self.pool.get().await?;
 
         // Create schema
-        conn.execute(
-            &format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema),
-            &[],
-        )
-        .await?;
+        conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema), &[])
+            .await?;
 
         // Create denormalized table_state table (includes run-level fields)
         conn.execute(
@@ -229,10 +228,7 @@ impl DbStateBackend {
 
     /// Get the last sync timestamp for a specific table (for incremental sync).
     /// Returns the most recent completed run's timestamp for this table.
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         let conn = self.pool.get().await?;
 
         let row = conn
@@ -275,10 +271,7 @@ impl StateBackend for DbStateBackend {
         DbStateBackend::load_latest(self, config_hash).await
     }
 
-    async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         DbStateBackend::get_last_sync_timestamp(self, table_name).await
     }
 

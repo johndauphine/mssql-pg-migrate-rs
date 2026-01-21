@@ -969,9 +969,11 @@ impl Orchestrator {
                 if let Some((col_name, col_type)) =
                     table.find_date_column(&self.config.migration.date_updated_columns)
                 {
-
                     // Get last sync timestamp from database (queries historical completed runs)
-                    let last_sync = self.state_backend.get_last_sync_timestamp(&table_name).await?;
+                    let last_sync = self
+                        .state_backend
+                        .get_last_sync_timestamp(&table_name)
+                        .await?;
 
                     if let Some(last_sync_ts) = last_sync {
                         // Incremental sync: only rows modified after last sync

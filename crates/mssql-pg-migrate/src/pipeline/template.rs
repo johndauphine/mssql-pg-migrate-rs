@@ -116,21 +116,19 @@ impl PipelineConfig {
     /// This adjusts parallelism based on available CPU cores and memory.
     pub fn auto_tune(mut self, available_memory_mb: usize, cpu_cores: usize) -> Self {
         // Scale readers based on CPU (IO-bound, can exceed cores)
-        self.parallel_readers = (cpu_cores * 2).min(16).max(4);
+        self.parallel_readers = (cpu_cores * 2).clamp(4, 16);
 
         // Scale writers based on CPU (more CPU-bound due to encoding)
-        self.parallel_writers = cpu_cores.min(12).max(2);
+        self.parallel_writers = cpu_cores.clamp(2, 12);
 
         // Scale chunk size based on memory
         // Estimate ~1KB per row average, target 10% of memory for buffering
         let target_buffer_mb = available_memory_mb / 10;
         let rows_per_mb = 1000; // ~1KB per row estimate
-        self.chunk_size = (target_buffer_mb * rows_per_mb)
-            .min(200_000)
-            .max(10_000);
+        self.chunk_size = (target_buffer_mb * rows_per_mb).clamp(10_000, 200_000);
 
         // Channel buffer scales with readers
-        self.channel_buffer = (self.parallel_readers / 2).max(2).min(8);
+        self.channel_buffer = (self.parallel_readers / 2).clamp(2, 8);
 
         self
     }
@@ -377,7 +375,9 @@ pub trait TransferPipeline: Send + Sync {
             if cancel.is_cancelled() {
                 break;
             }
-            let result = self.execute_job(job, tracker.clone(), cancel.clone()).await?;
+            let result = self
+                .execute_job(job, tracker.clone(), cancel.clone())
+                .await?;
             results.push(result);
         }
         Ok(results)
@@ -412,7 +412,9 @@ pub trait TransferPipeline: Send + Sync {
         self.setup().await?;
 
         // Phase 2: Execute jobs
-        let results = self.execute_jobs(jobs, tracker.clone(), cancel.clone()).await?;
+        let results = self
+            .execute_jobs(jobs, tracker.clone(), cancel.clone())
+            .await?;
 
         // Phase 3: Finalize (only if not cancelled)
         if !cancel.is_cancelled() {

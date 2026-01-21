@@ -156,7 +156,11 @@ impl Table {
     /// logs a warning since mismatched timezones can cause data loss.
     pub fn find_date_column(&self, candidate_names: &[String]) -> Option<(String, String)> {
         for name in candidate_names {
-            if let Some(col) = self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+            if let Some(col) = self
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+            {
                 let data_type = col.data_type.to_lowercase();
                 // Check if it's a date/time type
                 if is_date_type(&data_type) {
@@ -502,10 +506,7 @@ mod tests {
         };
 
         // LastActivityDate comes first in candidates, should be returned even though CreationDate exists
-        let candidates = vec![
-            "LastActivityDate".to_string(),
-            "CreationDate".to_string(),
-        ];
+        let candidates = vec!["LastActivityDate".to_string(), "CreationDate".to_string()];
 
         let result = table.find_date_column(&candidates);
         assert!(result.is_some());

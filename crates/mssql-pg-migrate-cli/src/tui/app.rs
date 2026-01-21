@@ -1101,7 +1101,7 @@ impl App {
                 self.phase = MigrationPhase::Cancelled;
                 self.add_transcript(TranscriptEntry::info("Migration cancelled"));
             }
-            "failed" | _ => {
+            _ => {
                 self.phase = MigrationPhase::Failed;
                 let error_msg = result
                     .error
@@ -1158,14 +1158,16 @@ impl App {
             p.to_string()
         } else {
             // Auto-reload current config file
-            self.config_path.to_str().unwrap_or("config.yaml").to_string()
+            self.config_path
+                .to_str()
+                .unwrap_or("config.yaml")
+                .to_string()
         };
 
         match Config::load(&path) {
             Ok(new_config) => {
                 self.config_path = PathBuf::from(&path);
-                self.config_summary =
-                    ConfigSummary::from_config(&new_config, &self.config_path);
+                self.config_summary = ConfigSummary::from_config(&new_config, &self.config_path);
                 self.config = new_config;
                 self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
                 true

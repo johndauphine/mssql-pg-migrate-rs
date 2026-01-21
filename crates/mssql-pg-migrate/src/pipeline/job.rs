@@ -130,7 +130,12 @@ impl TransferJob {
     }
 
     /// Set the partition for this job.
-    pub fn with_partition(mut self, partition_id: i32, min_pk: Option<i64>, max_pk: Option<i64>) -> Self {
+    pub fn with_partition(
+        mut self,
+        partition_id: i32,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+    ) -> Self {
         self.partition_id = Some(partition_id);
         self.min_pk = min_pk;
         self.max_pk = max_pk;
@@ -161,7 +166,11 @@ impl TransferJob {
 
     /// Get the column types for this job (pre-computed for O(1) lookup).
     pub fn column_types(&self) -> Vec<String> {
-        self.table.columns.iter().map(|c| c.data_type.clone()).collect()
+        self.table
+            .columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect()
     }
 
     /// Get the primary key column names.

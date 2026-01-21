@@ -30,7 +30,7 @@ pub enum SslMode {
 
 impl SslMode {
     /// Parse an SSL mode from a string.
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "disable" | "" => Ok(SslMode::Disable),
             "require" => Ok(SslMode::Require),
@@ -64,8 +64,8 @@ impl TlsBuilder {
     }
 
     /// Create a TLS builder from an ssl_mode string.
-    pub fn from_str(ssl_mode: &str) -> Result<Self> {
-        Ok(Self::new(SslMode::from_str(ssl_mode)?))
+    pub fn parse(ssl_mode: &str) -> Result<Self> {
+        Ok(Self::new(SslMode::parse(ssl_mode)?))
     }
 
     /// Build a MakeRustlsConnect instance for use with deadpool-postgres.
@@ -188,12 +188,12 @@ mod tests {
 
     #[test]
     fn test_ssl_mode_parsing() {
-        assert_eq!(SslMode::from_str("disable").unwrap(), SslMode::Disable);
-        assert_eq!(SslMode::from_str("require").unwrap(), SslMode::Require);
-        assert_eq!(SslMode::from_str("verify-ca").unwrap(), SslMode::VerifyCa);
-        assert_eq!(SslMode::from_str("verify-full").unwrap(), SslMode::VerifyFull);
-        assert_eq!(SslMode::from_str("").unwrap(), SslMode::Disable);
-        assert!(SslMode::from_str("invalid").is_err());
+        assert_eq!(SslMode::parse("disable").unwrap(), SslMode::Disable);
+        assert_eq!(SslMode::parse("require").unwrap(), SslMode::Require);
+        assert_eq!(SslMode::parse("verify-ca").unwrap(), SslMode::VerifyCa);
+        assert_eq!(SslMode::parse("verify-full").unwrap(), SslMode::VerifyFull);
+        assert_eq!(SslMode::parse("").unwrap(), SslMode::Disable);
+        assert!(SslMode::parse("invalid").is_err());
     }
 
     #[test]

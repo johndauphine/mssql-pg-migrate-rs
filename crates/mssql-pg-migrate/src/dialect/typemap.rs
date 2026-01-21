@@ -220,12 +220,7 @@ fn mssql_to_postgres(mssql_type: &str, max_length: i32, precision: i32, scale: i
 /// Map a PostgreSQL data type to MSSQL.
 ///
 /// Some mappings are lossy - the warning field indicates lost functionality.
-fn postgres_to_mssql(
-    pg_type: &str,
-    max_length: i32,
-    precision: i32,
-    scale: i32,
-) -> TypeMapping {
+fn postgres_to_mssql(pg_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
     let pg_lower = pg_type.to_lowercase();
 
     // Handle array types (lossy - stored as JSON)
@@ -383,7 +378,13 @@ fn postgres_to_mssql(
 mod tests {
     use super::*;
 
-    fn test_column(name: &str, data_type: &str, max_length: i32, precision: i32, scale: i32) -> Column {
+    fn test_column(
+        name: &str,
+        data_type: &str,
+        max_length: i32,
+        precision: i32,
+        scale: i32,
+    ) -> Column {
         Column {
             name: name.to_string(),
             data_type: data_type.to_string(),

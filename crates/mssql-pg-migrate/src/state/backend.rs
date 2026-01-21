@@ -15,8 +15,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
 use super::{MigrationState, RunStatus, TaskStatus};
+use crate::error::Result;
 
 /// Trait for migration state persistence backends.
 ///
@@ -76,10 +76,7 @@ pub trait StateBackend: Send + Sync {
     /// # Arguments
     ///
     /// * `table_name` - Full table name (schema.table)
-    async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>>;
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>>;
 
     /// Get the backend type name for logging/debugging.
     fn backend_type(&self) -> &'static str;

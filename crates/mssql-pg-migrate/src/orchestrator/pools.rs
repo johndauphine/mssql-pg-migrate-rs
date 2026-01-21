@@ -317,8 +317,12 @@ impl TargetPoolImpl {
     /// Create a state backend appropriate for this target database type.
     pub fn create_state_backend(&self) -> Result<StateBackendEnum> {
         match self {
-            Self::Postgres(p) => Ok(StateBackendEnum::Postgres(DbStateBackend::new(p.pool().clone()))),
-            Self::Mssql(p) => Ok(StateBackendEnum::Mssql(MssqlStateBackend::new(Arc::clone(p)))),
+            Self::Postgres(p) => Ok(StateBackendEnum::Postgres(DbStateBackend::new(
+                p.pool().clone(),
+            ))),
+            Self::Mssql(p) => Ok(StateBackendEnum::Mssql(MssqlStateBackend::new(Arc::clone(
+                p,
+            )))),
         }
     }
 
@@ -480,6 +484,7 @@ impl TargetPoolImpl {
     }
 
     /// Upsert a chunk of rows.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_chunk(
         &self,
         schema: &str,

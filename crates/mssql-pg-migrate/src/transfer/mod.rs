@@ -793,8 +793,17 @@ async fn read_table_chunks_parallel(
 
         let handle = tokio::spawn(async move {
             read_chunk_range(
-                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx, date_filter,
+                source,
+                table,
+                columns,
+                col_types,
+                start_pk,
+                range_max,
+                chunk_size,
+                reader_id,
+                is_resume,
+                tx,
+                date_filter,
             )
             .await
         });
@@ -895,8 +904,17 @@ async fn read_table_chunks_direct(
 
         let handle = tokio::spawn(async move {
             read_chunk_range_direct(
-                source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx, date_filter,
+                source,
+                table,
+                columns,
+                col_types,
+                start_pk,
+                range_max,
+                chunk_size,
+                reader_id,
+                is_resume,
+                tx,
+                date_filter,
             )
             .await
         });
@@ -927,6 +945,7 @@ async fn read_table_chunks_direct(
 }
 
 /// Read chunks for a specific PK range using direct COPY encoding.
+#[allow(clippy::too_many_arguments)]
 async fn read_chunk_range_direct(
     source: SourcePoolImpl,
     table: Table,
@@ -1040,6 +1059,7 @@ async fn read_chunk_range_direct(
 /// `is_resume` indicates whether `start_pk` came from a resume checkpoint (true) or
 /// is a fresh range boundary (false). When resuming, the first query uses `>` to skip
 /// the already-processed row. For fresh starts, the first query uses `>=` to include it.
+#[allow(clippy::too_many_arguments)]
 async fn read_chunk_range(
     source: SourcePoolImpl,
     table: Table,
@@ -1249,6 +1269,7 @@ async fn read_table_chunks(
 /// This is needed because for the first chunk of a range, `last_pk` represents the starting
 /// boundary that should be included, not a previously-read row to skip.
 /// For subsequent chunks, `last_pk` is the last PK we read, so we use `>` (exclusive).
+#[allow(clippy::too_many_arguments)]
 async fn read_chunk_keyset_fast(
     source: &SourcePoolImpl,
     table: &Table,
@@ -1360,6 +1381,7 @@ async fn read_chunk_keyset_fast(
 /// Read a chunk using direct COPY encoding (bypasses SqlValue for MSSQL->PG).
 ///
 /// Returns (encoded_bytes, first_pk, last_pk, row_count) or None if not supported.
+#[allow(clippy::too_many_arguments)]
 async fn read_chunk_keyset_direct(
     source: &SourcePoolImpl,
     table: &Table,

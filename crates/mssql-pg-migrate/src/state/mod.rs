@@ -78,10 +78,7 @@ impl StateBackendEnum {
     }
 
     /// Get the last sync timestamp for a specific table.
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         match self {
             Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
@@ -112,10 +109,7 @@ impl StateBackend for StateBackendEnum {
         StateBackendEnum::load_latest(self, config_hash).await
     }
 
-    async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         StateBackendEnum::get_last_sync_timestamp(self, table_name).await
     }
 
@@ -245,8 +239,9 @@ impl MigrationState {
         let mut state_for_signing = self.clone();
         state_for_signing.hmac = None;
 
-        let content = serde_json::to_string(&state_for_signing)
-            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+        let content = serde_json::to_string(&state_for_signing).map_err(|e| {
+            MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e))
+        })?;
 
         let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
             .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
@@ -271,8 +266,9 @@ impl MigrationState {
         let mut state_for_signing = self.clone();
         state_for_signing.hmac = None;
 
-        let content = serde_json::to_string(&state_for_signing)
-            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+        let content = serde_json::to_string(&state_for_signing).map_err(|e| {
+            MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e))
+        })?;
 
         let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
             .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
@@ -280,10 +276,11 @@ impl MigrationState {
         mac.update(content.as_bytes());
 
         // Constant-time comparison to prevent timing attacks
-        mac.verify_slice(&stored_bytes)
-            .map_err(|_| MigrateError::Config(
-                "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
-            ))
+        mac.verify_slice(&stored_bytes).map_err(|_| {
+            MigrateError::Config(
+                "State file integrity check failed: HMAC mismatch (possible tampering)".to_string(),
+            )
+        })
     }
 
     /// Load state from a file with integrity validation.
@@ -304,7 +301,9 @@ impl MigrationState {
         }
         // If no HMAC present, accept for backward compatibility but log warning
         else {
-            tracing::warn!("State file has no HMAC signature (older format), integrity cannot be verified");
+            tracing::warn!(
+                "State file has no HMAC signature (older format), integrity cannot be verified"
+            );
         }
 
         Ok(state)
@@ -615,10 +614,7 @@ mod tests {
         state.update_sync_timestamp("dbo.NonExistent", timestamp);
 
         // Should still return None
-        assert_eq!(
-            state.get_last_sync_timestamp("dbo.NonExistent"),
-            None
-        );
+        assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
     }
 
     #[test]

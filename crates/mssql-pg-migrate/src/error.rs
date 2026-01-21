@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_is_recoverable_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let io_err = std::io::Error::other("test");
         assert!(MigrateError::Io(io_err).is_recoverable());
     }
 
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_pool_helper() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test error");
+        let io_err = std::io::Error::other("test error");
         let err = MigrateError::pool(io_err, "context");
         match &err {
             MigrateError::Pool {

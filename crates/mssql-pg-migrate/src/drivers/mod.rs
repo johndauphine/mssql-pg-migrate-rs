@@ -87,8 +87,12 @@ impl Dialect for DialectImpl {
         pk_columns: &[String],
     ) -> String {
         match self {
-            DialectImpl::Mssql(d) => d.build_upsert_query(target_table, staging_table, columns, pk_columns),
-            DialectImpl::Postgres(d) => d.build_upsert_query(target_table, staging_table, columns, pk_columns),
+            DialectImpl::Mssql(d) => {
+                d.build_upsert_query(target_table, staging_table, columns, pk_columns)
+            }
+            DialectImpl::Postgres(d) => {
+                d.build_upsert_query(target_table, staging_table, columns, pk_columns)
+            }
         }
     }
 
@@ -114,8 +118,12 @@ impl Dialect for DialectImpl {
         end_row: i64,
     ) -> String {
         match self {
-            DialectImpl::Mssql(d) => d.build_row_number_query(inner_query, pk_col, start_row, end_row),
-            DialectImpl::Postgres(d) => d.build_row_number_query(inner_query, pk_col, start_row, end_row),
+            DialectImpl::Mssql(d) => {
+                d.build_row_number_query(inner_query, pk_col, start_row, end_row)
+            }
+            DialectImpl::Postgres(d) => {
+                d.build_row_number_query(inner_query, pk_col, start_row, end_row)
+            }
         }
     }
 }
