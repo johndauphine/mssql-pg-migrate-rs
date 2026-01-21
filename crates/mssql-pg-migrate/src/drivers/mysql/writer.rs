@@ -20,6 +20,10 @@ use crate::error::{MigrateError, Result};
 /// Connection pool timeout.
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// MySQL maximum placeholders per prepared statement.
+/// MySQL has a hard limit of 65,535 placeholders.
+const MYSQL_MAX_PLACEHOLDERS: usize = 65535;
+
 /// MySQL target writer implementation.
 pub struct MysqlWriter {
     pool: MySqlPool,
@@ -87,6 +91,15 @@ impl MysqlWriter {
         self
     }
 
+    /// Test the database connection.
+    pub async fn test_connection(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
+        Ok(())
+    }
+
     /// Quote a MySQL identifier.
     fn quote_ident(name: &str) -> String {
         format!("`{}`", name.replace('`', "``"))
@@ -106,8 +119,17 @@ impl MysqlWriter {
             }
             mapping.target_type
         } else {
-            // No mapper - assume source is MySQL
-            format_mysql_type(&col.data_type, col.max_length, col.precision, col.scale)
+            // No mapper provided - use default MSSQL to MySQL mapping
+            // This is a fallback for the common case of migrating from MSSQL
+            use crate::dialect::mssql_to_mysql_basic;
+            let target_type = mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale);
+            if target_type.is_empty() {
+                // Unknown type - pass through with warning
+                warn!("Unknown MSSQL type '{}' for column '{}', passing through", col.data_type, col.name);
+                col.data_type.to_uppercase()
+            } else {
+                target_type
+            }
         }
     }
 
@@ -447,38 +469,49 @@ impl TargetWriter for MysqlWriter {
 
         let row_count = rows.len() as u64;
         let qualified_table = Self::qualify_table(schema, table);
-
-        // Build multi-row INSERT
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list_str = col_list.join(", ");
 
-        // Build value placeholders for each row
-        let placeholders_per_row = format!("({})", vec!["?"; cols.len()].join(", "));
-        let all_placeholders: Vec<String> =
-            std::iter::repeat_n(placeholders_per_row, rows.len()).collect();
-
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES {}",
-            qualified_table,
-            col_list.join(", "),
-            all_placeholders.join(", ")
-        );
-
-        // Build query with bound values
-        let mut query = sqlx::query(&sql);
-
-        for row in &rows {
-            for value in row {
-                query = bind_value(query, value);
-            }
-        }
+        // Calculate max rows per batch to stay under MySQL's placeholder limit
+        let num_cols = cols.len();
+        let max_rows_per_batch = if num_cols > 0 {
+            MYSQL_MAX_PLACEHOLDERS / num_cols
+        } else {
+            return Ok(0);
+        };
 
         // Use explicit transaction for batch safety
         let mut tx = self.pool.begin().await?;
-        query.execute(&mut *tx).await.map_err(|e| {
-            MigrateError::transfer(&qualified_table, format!("INSERT batch: {}", e))
-        })?;
+
+        // Process rows in sub-batches to respect MySQL placeholder limit
+        for chunk in rows.chunks(max_rows_per_batch) {
+            let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
+            let all_placeholders: Vec<String> =
+                std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
+
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                qualified_table,
+                col_list_str,
+                all_placeholders.join(", ")
+            );
+
+            let mut query = sqlx::query(&sql);
+
+            for row in chunk {
+                for value in row {
+                    query = bind_value(query, value);
+                }
+            }
+
+            query.execute(&mut *tx).await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("INSERT batch: {}", e))
+            })?;
+        }
+
         tx.commit().await?;
 
+        debug!("MySQL: wrote {} rows to {}", row_count, qualified_table);
         Ok(row_count)
     }
 
@@ -503,6 +536,16 @@ impl TargetWriter for MysqlWriter {
 
         let row_count = rows.len() as u64;
         let qualified_target = Self::qualify_table(schema, table);
+        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list_str = col_list.join(", ");
+
+        // Calculate max rows per batch to stay under MySQL's placeholder limit
+        let num_cols = cols.len();
+        let max_rows_per_batch = if num_cols > 0 {
+            MYSQL_MAX_PLACEHOLDERS / num_cols
+        } else {
+            return Ok(0);
+        };
 
         // Create staging table
         let staging_name = match partition_id {
@@ -523,26 +566,28 @@ impl TargetWriter for MysqlWriter {
         );
         sqlx::query(&create_sql).execute(&mut *tx).await?;
 
-        // Insert into staging table
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
-        let placeholders_per_row = format!("({})", vec!["?"; cols.len()].join(", "));
-        let all_placeholders: Vec<String> =
-            std::iter::repeat_n(placeholders_per_row, rows.len()).collect();
+        // Insert into staging table in sub-batches to respect MySQL placeholder limit
+        for chunk in rows.chunks(max_rows_per_batch) {
+            let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
+            let all_placeholders: Vec<String> =
+                std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
 
-        let insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES {}",
-            staging_qualified,
-            col_list.join(", "),
-            all_placeholders.join(", ")
-        );
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                staging_qualified,
+                col_list_str,
+                all_placeholders.join(", ")
+            );
 
-        let mut insert_query = sqlx::query(&insert_sql);
-        for row in &rows {
-            for value in row {
-                insert_query = bind_value(insert_query, value);
+            let mut insert_query = sqlx::query(&insert_sql);
+            for row in chunk {
+                for value in row {
+                    insert_query = bind_value(insert_query, value);
+                }
             }
+
+            insert_query.execute(&mut *tx).await?;
         }
-        insert_query.execute(&mut *tx).await?;
 
         // Build INSERT ... ON DUPLICATE KEY UPDATE from staging
         let select_cols = cols
@@ -558,7 +603,7 @@ impl TargetWriter for MysqlWriter {
             format!(
                 "INSERT IGNORE INTO {} ({}) SELECT {} FROM {} AS s",
                 qualified_target,
-                col_list.join(", "),
+                col_list_str,
                 select_cols,
                 staging_qualified
             )
@@ -579,7 +624,7 @@ impl TargetWriter for MysqlWriter {
             format!(
                 "INSERT INTO {} ({}) SELECT {} FROM {} AS s ON DUPLICATE KEY UPDATE {}",
                 qualified_target,
-                col_list.join(", "),
+                col_list_str,
                 select_cols,
                 staging_qualified,
                 update_set
@@ -594,6 +639,7 @@ impl TargetWriter for MysqlWriter {
 
         tx.commit().await?;
 
+        debug!("MySQL: upserted {} rows to {}", row_count, qualified_target);
         Ok(row_count)
     }
 

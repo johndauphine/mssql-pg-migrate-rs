@@ -4,9 +4,10 @@
 //! Uses SQLx for connection pooling and async query execution.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
 use sqlx::{Row, ValueRef};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -16,6 +17,9 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition,
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
+
+/// Connection pool timeout.
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MySQL/MariaDB source reader implementation.
 pub struct MysqlReader {
@@ -27,14 +31,21 @@ pub struct MysqlReader {
 impl MysqlReader {
     /// Create a new MySQL reader from configuration.
     pub async fn new(config: &SourceConfig, max_conns: usize) -> Result<Self> {
-        let connection_string = format!(
-            "mysql://{}:{}@{}:{}/{}",
-            config.user, config.password, config.host, config.port, config.database
-        );
+        // Default to Preferred SSL mode for source connections
+        let ssl_mode = MySqlSslMode::Preferred;
+
+        let options = MySqlConnectOptions::new()
+            .host(&config.host)
+            .port(config.port)
+            .database(&config.database)
+            .username(&config.user)
+            .password(&config.password)
+            .ssl_mode(ssl_mode);
 
         let pool = MySqlPoolOptions::new()
             .max_connections(max_conns as u32)
-            .connect(&connection_string)
+            .acquire_timeout(POOL_CONNECTION_TIMEOUT)
+            .connect_with(options)
             .await
             .map_err(|e| MigrateError::pool(e, "creating MySQL source pool"))?;
 
@@ -595,6 +606,14 @@ impl SourceReader for MysqlReader {
     }
 }
 
+/// Represents a primary key value for keyset pagination.
+/// Supports both numeric and text-based primary keys.
+#[derive(Clone, Debug)]
+enum LastPkValue {
+    Int(i64),
+    Text(String),
+}
+
 impl MysqlReader {
     async fn read_table_impl(
         pool: MySqlPool,
@@ -615,7 +634,13 @@ impl MysqlReader {
             Self::quote_ident(&opts.table)
         );
 
-        let mut last_pk: Option<i64> = opts.min_pk;
+        // Track last PK value for keyset pagination (supports both int and text PKs)
+        let mut last_pk: Option<LastPkValue> = opts.min_pk.map(LastPkValue::Int);
+        // Track offset for fallback pagination when keyset isn't possible
+        let mut offset: usize = 0;
+        // Whether to use offset-based pagination (set after first batch if PK isn't usable)
+        let mut use_offset_pagination = false;
+
         // Get PK column name from pk_idx
         let pk_col: Option<&str> = opts.pk_idx.and_then(|idx| columns.get(idx).map(|s| s.as_str()));
 
@@ -623,11 +648,24 @@ impl MysqlReader {
             let mut query = format!("SELECT {} FROM {}", col_list, table_ref);
 
             let mut conditions = Vec::new();
-            if let (Some(pk), Some(lpk)) = (pk_col, last_pk) {
-                conditions.push(format!("{} > {}", Self::quote_ident(pk), lpk));
-            }
-            if let (Some(pk), Some(mpk)) = (pk_col, opts.max_pk) {
-                conditions.push(format!("{} <= {}", Self::quote_ident(pk), mpk));
+
+            // Build keyset pagination condition if we have a last PK value
+            if !use_offset_pagination {
+                if let (Some(pk), Some(ref lpk)) = (pk_col, &last_pk) {
+                    match lpk {
+                        LastPkValue::Int(v) => {
+                            conditions.push(format!("{} > {}", Self::quote_ident(pk), v));
+                        }
+                        LastPkValue::Text(v) => {
+                            // Properly escape the string value for SQL
+                            let escaped = v.replace('\'', "''");
+                            conditions.push(format!("{} > '{}'", Self::quote_ident(pk), escaped));
+                        }
+                    }
+                }
+                if let (Some(pk), Some(mpk)) = (pk_col, opts.max_pk) {
+                    conditions.push(format!("{} <= {}", Self::quote_ident(pk), mpk));
+                }
             }
 
             // Add additional where clause if provided
@@ -645,6 +683,11 @@ impl MysqlReader {
             }
 
             query.push_str(&format!(" LIMIT {}", batch_size));
+
+            // Add OFFSET for fallback pagination
+            if use_offset_pagination && offset > 0 {
+                query.push_str(&format!(" OFFSET {}", offset));
+            }
 
             let rows: Vec<MySqlRow> = sqlx::query(&query)
                 .fetch_all(&pool)
@@ -676,25 +719,42 @@ impl MysqlReader {
                 .map(|row| Self::row_to_values(row, &col_meta))
                 .collect();
 
-            // Track last PK for keyset pagination
+            // Track last PK for keyset pagination (supports multiple types)
             let last_key = opts.pk_idx.and_then(|idx| {
                 batch_rows.last().and_then(|row| match &row[idx] {
                     SqlValue::I64(v) => Some(SqlValue::I64(*v)),
                     SqlValue::I32(v) => Some(SqlValue::I64(*v as i64)),
                     SqlValue::I16(v) => Some(SqlValue::I64(*v as i64)),
+                    SqlValue::Text(s) => Some(SqlValue::Text(s.clone())),
                     _ => None,
                 })
             });
 
-            // Update last_pk for next iteration
-            last_pk = opts.pk_idx.and_then(|idx| {
+            // Update last_pk for next iteration - now supports text PKs
+            let new_last_pk: Option<LastPkValue> = opts.pk_idx.and_then(|idx| {
                 batch_rows.last().and_then(|row| match &row[idx] {
-                    SqlValue::I64(v) => Some(*v),
-                    SqlValue::I32(v) => Some(*v as i64),
-                    SqlValue::I16(v) => Some(*v as i64),
+                    SqlValue::I64(v) => Some(LastPkValue::Int(*v)),
+                    SqlValue::I32(v) => Some(LastPkValue::Int(*v as i64)),
+                    SqlValue::I16(v) => Some(LastPkValue::Int(*v as i64)),
+                    SqlValue::Text(s) => Some(LastPkValue::Text(s.to_string())),
                     _ => None,
                 })
             });
+
+            // If we couldn't extract a PK value for keyset pagination, fall back to OFFSET
+            if new_last_pk.is_none() && pk_col.is_some() && !use_offset_pagination {
+                debug!(
+                    "Table {}.{}: PK type not suitable for keyset pagination, falling back to OFFSET",
+                    opts.schema, opts.table
+                );
+                use_offset_pagination = true;
+            }
+
+            if use_offset_pagination {
+                offset += batch_rows.len();
+            } else {
+                last_pk = new_last_pk;
+            }
 
             let is_last = batch_rows.len() < batch_size;
             let batch = Batch {

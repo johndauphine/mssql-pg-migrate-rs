@@ -931,7 +931,10 @@ fn mysql_to_mssql(mysql_type: &str, max_length: i32, precision: i32, scale: i32)
 }
 
 /// Map an MSSQL data type to MySQL.
-fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
+/// Map MSSQL type to MySQL type.
+///
+/// This is a public helper function for type mapping.
+pub fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
     let mssql_lower = mssql_type.to_lowercase();
 
     match mssql_lower.as_str() {
@@ -1027,6 +1030,13 @@ fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: i32)
             format!("Unknown MSSQL type '{}' stored as text.", mssql_type),
         ),
     }
+}
+
+/// Map MSSQL type to MySQL type (returns just the target type string).
+///
+/// Convenience function that returns just the target type without the full TypeMapping.
+pub fn mssql_to_mysql_basic(mssql_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+    mssql_to_mysql(mssql_type, max_length, precision, scale).target_type
 }
 
 #[cfg(test)]

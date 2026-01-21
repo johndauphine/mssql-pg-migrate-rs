@@ -19,9 +19,12 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
     let source_type = config.source.r#type.to_lowercase();
-    if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
+    if !matches!(
+        source_type.as_str(),
+        "mssql" | "sqlserver" | "sql_server" | "postgres" | "postgresql" | "pg" | "mysql" | "mariadb"
+    ) {
         return Err(MigrateError::Config(format!(
-            "source.type must be 'mssql' or 'postgres', got '{}'",
+            "source.type must be 'mssql', 'postgres', or 'mysql', got '{}'",
             config.source.r#type
         )));
     }
@@ -40,9 +43,12 @@ pub fn validate(config: &Config) -> Result<()> {
         ));
     }
     let target_type = config.target.r#type.to_lowercase();
-    if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
+    if !matches!(
+        target_type.as_str(),
+        "mssql" | "sqlserver" | "sql_server" | "postgres" | "postgresql" | "pg" | "mysql" | "mariadb"
+    ) {
         return Err(MigrateError::Config(format!(
-            "target.type must be 'mssql' or 'postgres', got '{}'",
+            "target.type must be 'mssql', 'postgres', or 'mysql', got '{}'",
             config.target.r#type
         )));
     }
@@ -211,8 +217,32 @@ mod tests {
     #[test]
     fn test_wrong_target_type() {
         let mut config = valid_config();
-        config.target.r#type = "mysql".to_string();
+        config.target.r#type = "oracle".to_string();
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_mysql_as_source_accepted() {
+        let mut config = valid_config();
+        config.source.r#type = "mysql".to_string();
+        config.source.port = 3306;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_mysql_as_target_accepted() {
+        let mut config = valid_config();
+        config.target.r#type = "mysql".to_string();
+        config.target.port = 3306;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_mariadb_as_target_accepted() {
+        let mut config = valid_config();
+        config.target.r#type = "mariadb".to_string();
+        config.target.port = 3306;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

@@ -28,6 +28,6 @@
 mod typemap;
 
 pub use typemap::{
-    IdentityMapper, MssqlToMysqlMapper, MssqlToPostgresMapper, MysqlToMssqlMapper,
-    MysqlToPostgresMapper, PostgresToMssqlMapper, PostgresToMysqlMapper,
+    mssql_to_mysql_basic, IdentityMapper, MssqlToMysqlMapper, MssqlToPostgresMapper,
+    MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMssqlMapper, PostgresToMysqlMapper,
 };

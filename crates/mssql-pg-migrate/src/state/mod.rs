@@ -17,6 +17,7 @@
 pub mod backend;
 pub mod db;
 pub mod mssql_db;
+pub mod noop;
 
 use crate::error::{MigrateError, Result};
 use chrono::{DateTime, Utc};
@@ -31,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub use backend::StateBackend;
 pub use db::DbStateBackend;
 pub use mssql_db::MssqlStateBackend;
+pub use noop::NoOpStateBackend;
 
 /// Enum wrapper for database state backend implementations.
 ///
@@ -50,6 +52,7 @@ pub use mssql_db::MssqlStateBackend;
 pub enum StateBackendEnum {
     Postgres(DbStateBackend),
     Mssql(MssqlStateBackend),
+    NoOp(NoOpStateBackend),
 }
 
 impl StateBackendEnum {
@@ -58,6 +61,7 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.init_schema().await,
             Self::Mssql(backend) => backend.init_schema().await,
+            Self::NoOp(backend) => backend.init_schema().await,
         }
     }
 
@@ -66,6 +70,7 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.save(state).await,
             Self::Mssql(backend) => backend.save(state).await,
+            Self::NoOp(backend) => backend.save(state).await,
         }
     }
 
@@ -74,6 +79,7 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.load_latest(config_hash).await,
             Self::Mssql(backend) => backend.load_latest(config_hash).await,
+            Self::NoOp(backend) => backend.load_latest(config_hash).await,
         }
     }
 
@@ -82,6 +88,7 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
+            Self::NoOp(backend) => backend.get_last_sync_timestamp(table_name).await,
         }
     }
 
@@ -90,6 +97,7 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(_) => "postgres",
             Self::Mssql(_) => "mssql",
+            Self::NoOp(_) => "noop",
         }
     }
 }
