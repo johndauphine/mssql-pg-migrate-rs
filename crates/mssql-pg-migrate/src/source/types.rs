@@ -145,6 +145,38 @@ impl Table {
         let pk_type = self.pk_columns[0].data_type.to_lowercase();
         matches!(pk_type.as_str(), "int" | "bigint" | "smallint" | "tinyint")
     }
+
+    /// Find the first date/timestamp column matching the candidate names.
+    /// Used for date-based incremental sync (watermark).
+    /// Returns (column_name, column_type) if found.
+    pub fn find_date_column(&self, candidate_names: &[String]) -> Option<(String, String)> {
+        for name in candidate_names {
+            if let Some(col) = self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                let data_type = col.data_type.to_lowercase();
+                // Check if it's a date/time type
+                if is_date_type(&data_type) {
+                    return Some((col.name.clone(), col.data_type.clone()));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Check if a data type is a date/time type suitable for watermark filtering.
+fn is_date_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "datetime"
+            | "datetime2"
+            | "smalldatetime"
+            | "date"
+            | "datetimeoffset"
+            | "timestamp"
+            | "timestamptz"
+            | "timestamp with time zone"
+            | "timestamp without time zone"
+    )
 }
 
 /// Column metadata.
@@ -252,4 +284,224 @@ pub struct CheckConstraint {
 
     /// Constraint definition (SQL expression).
     pub definition: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_date_column_found() {
+        let table = Table {
+            schema: "dbo".to_string(),
+            name: "Users".to_string(),
+            columns: vec![
+                Column {
+                    name: "Id".to_string(),
+                    data_type: "int".to_string(),
+                    max_length: 0,
+                    precision: 10,
+                    scale: 0,
+                    is_nullable: false,
+                    is_identity: true,
+                    ordinal_pos: 1,
+                },
+                Column {
+                    name: "LastActivityDate".to_string(),
+                    data_type: "datetime2".to_string(),
+                    max_length: 0,
+                    precision: 7,
+                    scale: 0,
+                    is_nullable: true,
+                    is_identity: false,
+                    ordinal_pos: 2,
+                },
+                Column {
+                    name: "CreationDate".to_string(),
+                    data_type: "datetime".to_string(),
+                    max_length: 0,
+                    precision: 0,
+                    scale: 0,
+                    is_nullable: false,
+                    is_identity: false,
+                    ordinal_pos: 3,
+                },
+            ],
+            primary_key: vec!["Id".to_string()],
+            pk_columns: vec![],
+            row_count: 1000,
+            estimated_row_size: 100,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        };
+
+        let candidates = vec![
+            "LastActivityDate".to_string(),
+            "ModifiedDate".to_string(),
+            "CreationDate".to_string(),
+        ];
+
+        let result = table.find_date_column(&candidates);
+        assert!(result.is_some());
+        let (col_name, col_type) = result.unwrap();
+        assert_eq!(col_name, "LastActivityDate");
+        assert_eq!(col_type, "datetime2");
+    }
+
+    #[test]
+    fn test_find_date_column_case_insensitive() {
+        let table = Table {
+            schema: "dbo".to_string(),
+            name: "Orders".to_string(),
+            columns: vec![Column {
+                name: "UpdatedAt".to_string(),
+                data_type: "timestamp".to_string(),
+                max_length: 0,
+                precision: 0,
+                scale: 0,
+                is_nullable: true,
+                is_identity: false,
+                ordinal_pos: 1,
+            }],
+            primary_key: vec![],
+            pk_columns: vec![],
+            row_count: 100,
+            estimated_row_size: 50,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        };
+
+        // Search with different case
+        let candidates = vec!["updatedat".to_string()];
+        let result = table.find_date_column(&candidates);
+        assert!(result.is_some());
+        let (col_name, _) = result.unwrap();
+        assert_eq!(col_name, "UpdatedAt"); // Returns actual column name, not search name
+    }
+
+    #[test]
+    fn test_find_date_column_not_found() {
+        let table = Table {
+            schema: "dbo".to_string(),
+            name: "Users".to_string(),
+            columns: vec![Column {
+                name: "Id".to_string(),
+                data_type: "int".to_string(),
+                max_length: 0,
+                precision: 10,
+                scale: 0,
+                is_nullable: false,
+                is_identity: true,
+                ordinal_pos: 1,
+            }],
+            primary_key: vec!["Id".to_string()],
+            pk_columns: vec![],
+            row_count: 1000,
+            estimated_row_size: 100,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        };
+
+        let candidates = vec!["LastActivityDate".to_string(), "ModifiedDate".to_string()];
+        let result = table.find_date_column(&candidates);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_date_column_wrong_type() {
+        let table = Table {
+            schema: "dbo".to_string(),
+            name: "Users".to_string(),
+            columns: vec![Column {
+                name: "LastActivityDate".to_string(),
+                data_type: "varchar".to_string(), // Not a date type
+                max_length: 50,
+                precision: 0,
+                scale: 0,
+                is_nullable: true,
+                is_identity: false,
+                ordinal_pos: 1,
+            }],
+            primary_key: vec![],
+            pk_columns: vec![],
+            row_count: 1000,
+            estimated_row_size: 100,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        };
+
+        let candidates = vec!["LastActivityDate".to_string()];
+        let result = table.find_date_column(&candidates);
+        assert!(result.is_none()); // Should not match because it's varchar, not a date type
+    }
+
+    #[test]
+    fn test_find_date_column_priority_order() {
+        let table = Table {
+            schema: "dbo".to_string(),
+            name: "Posts".to_string(),
+            columns: vec![
+                Column {
+                    name: "CreationDate".to_string(),
+                    data_type: "datetime".to_string(),
+                    max_length: 0,
+                    precision: 0,
+                    scale: 0,
+                    is_nullable: false,
+                    is_identity: false,
+                    ordinal_pos: 1,
+                },
+                Column {
+                    name: "LastActivityDate".to_string(),
+                    data_type: "datetime2".to_string(),
+                    max_length: 0,
+                    precision: 7,
+                    scale: 0,
+                    is_nullable: true,
+                    is_identity: false,
+                    ordinal_pos: 2,
+                },
+            ],
+            primary_key: vec![],
+            pk_columns: vec![],
+            row_count: 1000,
+            estimated_row_size: 100,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        };
+
+        // LastActivityDate comes first in candidates, should be returned even though CreationDate exists
+        let candidates = vec![
+            "LastActivityDate".to_string(),
+            "CreationDate".to_string(),
+        ];
+
+        let result = table.find_date_column(&candidates);
+        assert!(result.is_some());
+        let (col_name, _) = result.unwrap();
+        assert_eq!(col_name, "LastActivityDate"); // First matching candidate
+    }
+
+    #[test]
+    fn test_is_date_type() {
+        assert!(is_date_type("datetime"));
+        assert!(is_date_type("datetime2"));
+        assert!(is_date_type("smalldatetime"));
+        assert!(is_date_type("date"));
+        assert!(is_date_type("datetimeoffset"));
+        assert!(is_date_type("timestamp"));
+        assert!(is_date_type("timestamptz"));
+        assert!(is_date_type("timestamp with time zone"));
+        assert!(is_date_type("timestamp without time zone"));
+
+        assert!(!is_date_type("varchar"));
+        assert!(!is_date_type("int"));
+        assert!(!is_date_type("bigint"));
+        assert!(!is_date_type("text"));
+    }
 }

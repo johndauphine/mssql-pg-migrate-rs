@@ -354,4 +354,82 @@ mod tests {
         assert_eq!(loaded_table.status, TaskStatus::Failed);
         assert_eq!(loaded_table.error, Some("Connection timeout".to_string()));
     }
+
+    #[test]
+    fn test_sync_timestamp_tracking() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Users", 1000);
+
+        // Initially no sync timestamp
+        assert_eq!(state.get_last_sync_timestamp("dbo.Users"), None);
+
+        // Update sync timestamp
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Users", timestamp);
+
+        // Should retrieve the timestamp
+        assert_eq!(state.get_last_sync_timestamp("dbo.Users"), Some(timestamp));
+    }
+
+    #[test]
+    fn test_sync_timestamp_persistence() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Posts", 5000);
+
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Posts", timestamp);
+
+        let file = NamedTempFile::new().unwrap();
+        state.save(file.path()).unwrap();
+
+        // Load from file and verify timestamp persisted
+        let loaded = MigrationState::load(file.path()).unwrap();
+        assert_eq!(loaded.get_last_sync_timestamp("dbo.Posts"), Some(timestamp));
+    }
+
+    #[test]
+    fn test_sync_timestamp_nonexistent_table() {
+        let state = MigrationState::new("test-run".into(), "hash".into());
+
+        // Should return None for non-existent table
+        assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
+    }
+
+    #[test]
+    fn test_sync_timestamp_update_nonexistent_table() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+
+        // Update should not panic for non-existent table (silently ignored)
+        let timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.NonExistent", timestamp);
+
+        // Should still return None
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.NonExistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sync_timestamp_overwrite() {
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        state.get_or_create_table("dbo.Orders", 2000);
+
+        let first_timestamp = Utc::now();
+        state.update_sync_timestamp("dbo.Orders", first_timestamp);
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.Orders"),
+            Some(first_timestamp)
+        );
+
+        // Update with new timestamp
+        let second_timestamp = first_timestamp + chrono::Duration::hours(1);
+        state.update_sync_timestamp("dbo.Orders", second_timestamp);
+
+        // Should return the new timestamp
+        assert_eq!(
+            state.get_last_sync_timestamp("dbo.Orders"),
+            Some(second_timestamp)
+        );
+    }
 }
