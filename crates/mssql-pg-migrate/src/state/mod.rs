@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut state = MigrationState::new("test-run".into(), "abc123".into());
+        let state = MigrationState::new("test-run".into(), "abc123".into());
         assert!(state.validate_config("abc123").is_ok());
         assert!(state.validate_config("different").is_err());
     }
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_sync_timestamp_nonexistent_table() {
-        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        let state = MigrationState::new("test-run".into(), "hash".into());
 
         // Should return None for non-existent table
         assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
