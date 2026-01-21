@@ -784,6 +784,10 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Reload config before running
+                if !self.try_load_config(None) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting migration..."));
                 self.spawn_migration(false, false).await;
             }
@@ -792,12 +796,20 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Reload config before running
+                if !self.try_load_config(None) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting dry run..."));
                 self.spawn_migration(true, false).await;
             }
             Action::Resume => {
                 if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                // Reload config before running
+                if !self.try_load_config(None) {
                     return Ok(());
                 }
                 self.add_transcript(TranscriptEntry::info("Resuming migration..."));
