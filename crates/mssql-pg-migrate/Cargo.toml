@@ -20,6 +20,9 @@ kerberos = ["tiberius/integrated-auth-gssapi"]
 # Async runtime
 tokio = { workspace = true }
 
+# Zero-cost polymorphism for driver dispatch
+enum_dispatch = "0.3"
+
 # MSSQL driver
 tiberius = { workspace = true }
 tokio-util = { workspace = true }
