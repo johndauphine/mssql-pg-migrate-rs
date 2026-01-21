@@ -720,6 +720,7 @@ async fn read_table_chunks_parallel(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let date_filter = job.date_filter.clone();
 
         // For partitioned jobs or resume, use the job's min_pk as starting point
         // Track whether we're resuming (first reader with resume_from_pk) vs fresh start
@@ -738,7 +739,7 @@ async fn read_table_chunks_parallel(
         let handle = tokio::spawn(async move {
             read_chunk_range(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, date_filter,
             )
             .await
         });
@@ -825,6 +826,7 @@ async fn read_table_chunks_direct(
         let columns = columns.clone();
         let col_types = col_types.clone();
         let tx = tx.clone();
+        let date_filter = job.date_filter.clone();
 
         let (start_pk, is_resume) = if reader_id == 0 {
             if job.resume_from_pk.is_some() {
@@ -839,7 +841,7 @@ async fn read_table_chunks_direct(
         let handle = tokio::spawn(async move {
             read_chunk_range_direct(
                 source, table, columns, col_types, start_pk, range_max, chunk_size, reader_id,
-                is_resume, tx,
+                is_resume, tx, date_filter,
             )
             .await
         });
@@ -881,6 +883,7 @@ async fn read_chunk_range_direct(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    date_filter: Option<DateFilter>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -902,6 +905,7 @@ async fn read_chunk_range_direct(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            date_filter.as_ref(),
         )
         .await?;
 
@@ -992,6 +996,7 @@ async fn read_chunk_range(
     reader_id: usize,
     is_resume: bool,
     tx: mpsc::Sender<RowChunk>,
+    date_filter: Option<DateFilter>,
 ) -> Result<i64> {
     let table_name = table.full_name();
 
@@ -1013,6 +1018,7 @@ async fn read_chunk_range(
             Some(end_pk),
             chunk_size,
             is_first_chunk,
+            date_filter.as_ref(),
         )
         .await?;
 
@@ -1110,6 +1116,7 @@ async fn read_table_chunks(
                 max_pk,
                 chunk_size,
                 is_first_chunk,
+                job.date_filter.as_ref(),
             )
             .await?
         } else {
@@ -1196,6 +1203,7 @@ async fn read_chunk_keyset_fast(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    date_filter: Option<&DateFilter>,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
     let is_postgres = source.db_type() == "postgres";
@@ -1245,6 +1253,21 @@ async fn read_chunk_keyset_fast(
         conditions.push(format!("{} <= {}", pk_quoted, pk));
     }
 
+    // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
+    if let Some(filter) = date_filter {
+        let date_quoted = if is_postgres {
+            quote_pg_ident(&filter.column)
+        } else {
+            quote_mssql_ident(&filter.column)
+        };
+        let timestamp_str = filter.timestamp.to_rfc3339();
+        // Include NULL values to catch rows without timestamps
+        conditions.push(format!(
+            "({} > '{}' OR {} IS NULL)",
+            date_quoted, timestamp_str, date_quoted
+        ));
+    }
+
     if !conditions.is_empty() {
         query.push_str(" WHERE ");
         query.push_str(&conditions.join(" AND "));
@@ -1289,6 +1312,7 @@ async fn read_chunk_keyset_direct(
     max_pk: Option<i64>,
     chunk_size: usize,
     first_chunk: bool,
+    date_filter: Option<&DateFilter>,
 ) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
     // Only MSSQL supports direct copy
     if !source.supports_direct_copy() {
@@ -1320,6 +1344,17 @@ async fn read_chunk_keyset_direct(
     }
     if let Some(pk) = max_pk {
         conditions.push(format!("{} <= {}", pk_quoted, pk));
+    }
+
+    // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
+    if let Some(filter) = date_filter {
+        let date_quoted = quote_mssql_ident(&filter.column);
+        let timestamp_str = filter.timestamp.to_rfc3339();
+        // Include NULL values to catch rows without timestamps
+        conditions.push(format!(
+            "({} > '{}' OR {} IS NULL)",
+            date_quoted, timestamp_str, date_quoted
+        ));
     }
 
     if !conditions.is_empty() {
