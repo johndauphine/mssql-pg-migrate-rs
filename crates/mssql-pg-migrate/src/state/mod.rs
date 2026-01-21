@@ -3,7 +3,18 @@
 //! Supports both database and file-based storage:
 //! - **Database** (recommended): Stores state in target database `_mssql_pg_migrate` schema
 //! - **File**: Legacy file-based state for backwards compatibility
+//!
+//! # Design Pattern
+//!
+//! The state module uses the Strategy pattern via [`StateBackend`] trait.
+//! Different backends can be swapped at runtime:
+//!
+//! - `DbStateBackend`: PostgreSQL storage
+//! - `MssqlStateBackend`: MSSQL storage
+//!
+//! The orchestrator works with `Arc<dyn StateBackend>` for flexibility.
 
+pub mod backend;
 pub mod db;
 pub mod mssql_db;
 
@@ -17,16 +28,31 @@ use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub use backend::StateBackend;
 pub use db::DbStateBackend;
 pub use mssql_db::MssqlStateBackend;
 
 /// Enum wrapper for database state backend implementations.
-pub enum StateBackend {
+///
+/// This enum provides a convenient way to hold different backend implementations
+/// and implements the [`StateBackend`] trait for polymorphic usage.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Using the enum directly
+/// let backend = StateBackendEnum::Postgres(DbStateBackend::new(pool));
+/// backend.init_schema().await?;
+///
+/// // Or as a trait object
+/// let backend: Arc<dyn StateBackend> = Arc::new(DbStateBackend::new(pool));
+/// ```
+pub enum StateBackendEnum {
     Postgres(DbStateBackend),
     Mssql(MssqlStateBackend),
 }
 
-impl StateBackend {
+impl StateBackendEnum {
     /// Initialize the state schema.
     pub async fn init_schema(&self) -> Result<()> {
         match self {
@@ -60,6 +86,41 @@ impl StateBackend {
             Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
         }
+    }
+
+    /// Get the backend type name.
+    pub fn backend_type(&self) -> &'static str {
+        match self {
+            Self::Postgres(_) => "postgres",
+            Self::Mssql(_) => "mssql",
+        }
+    }
+}
+
+// Implement the StateBackend trait for the enum wrapper
+#[async_trait::async_trait]
+impl StateBackend for StateBackendEnum {
+    async fn init_schema(&self) -> Result<()> {
+        StateBackendEnum::init_schema(self).await
+    }
+
+    async fn save(&self, state: &MigrationState) -> Result<()> {
+        StateBackendEnum::save(self, state).await
+    }
+
+    async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        StateBackendEnum::load_latest(self, config_hash).await
+    }
+
+    async fn get_last_sync_timestamp(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        StateBackendEnum::get_last_sync_timestamp(self, table_name).await
+    }
+
+    fn backend_type(&self) -> &'static str {
+        StateBackendEnum::backend_type(self)
     }
 }
 

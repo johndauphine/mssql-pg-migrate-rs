@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
-use crate::state::{DbStateBackend, MssqlStateBackend, StateBackend};
+use crate::state::{DbStateBackend, MssqlStateBackend, StateBackendEnum};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -315,10 +315,10 @@ impl TargetPoolImpl {
     }
 
     /// Create a state backend appropriate for this target database type.
-    pub fn create_state_backend(&self) -> Result<StateBackend> {
+    pub fn create_state_backend(&self) -> Result<StateBackendEnum> {
         match self {
-            Self::Postgres(p) => Ok(StateBackend::Postgres(DbStateBackend::new(p.pool().clone()))),
-            Self::Mssql(p) => Ok(StateBackend::Mssql(MssqlStateBackend::new(Arc::clone(p)))),
+            Self::Postgres(p) => Ok(StateBackendEnum::Postgres(DbStateBackend::new(p.pool().clone()))),
+            Self::Mssql(p) => Ok(StateBackendEnum::Mssql(MssqlStateBackend::new(Arc::clone(p)))),
         }
     }
 

@@ -7,7 +7,7 @@ pub use pools::{SourcePoolImpl, TargetPoolImpl};
 use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
-use crate::state::{MigrationState, RunStatus, StateBackend, TableState, TaskStatus};
+use crate::state::{MigrationState, RunStatus, StateBackendEnum, TableState, TaskStatus};
 use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Migration orchestrator.
 pub struct Orchestrator {
     config: Config,
-    state_backend: StateBackend,
+    state_backend: StateBackendEnum,
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
