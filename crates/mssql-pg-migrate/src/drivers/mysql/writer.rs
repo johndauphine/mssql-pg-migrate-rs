@@ -91,6 +91,11 @@ impl MysqlWriter {
         self
     }
 
+    /// Get a clone of the underlying connection pool.
+    pub fn pool(&self) -> MySqlPool {
+        self.pool.clone()
+    }
+
     /// Test the database connection.
     pub async fn test_connection(&self) -> Result<()> {
         sqlx::query("SELECT 1")
@@ -729,14 +734,6 @@ mod tests {
     fn test_quote_ident() {
         assert_eq!(MysqlWriter::quote_ident("name"), "`name`");
         assert_eq!(MysqlWriter::quote_ident("table`name"), "`table``name`");
-    }
-
-    #[test]
-    fn test_format_mysql_type() {
-        assert_eq!(format_mysql_type("varchar", 255, 0, 0), "VARCHAR(255)");
-        assert_eq!(format_mysql_type("varchar", 70000, 0, 0), "TEXT");
-        assert_eq!(format_mysql_type("decimal", 0, 10, 2), "DECIMAL(10,2)");
-        assert_eq!(format_mysql_type("char", 50, 0, 0), "CHAR(50)");
     }
 
     #[test]

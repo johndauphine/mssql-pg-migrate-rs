@@ -17,6 +17,8 @@
 pub mod backend;
 pub mod db;
 pub mod mssql_db;
+#[cfg(feature = "mysql")]
+pub mod mysql_db;
 pub mod noop;
 
 use crate::error::{MigrateError, Result};
@@ -32,6 +34,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub use backend::StateBackend;
 pub use db::DbStateBackend;
 pub use mssql_db::MssqlStateBackend;
+#[cfg(feature = "mysql")]
+pub use mysql_db::MysqlStateBackend;
 pub use noop::NoOpStateBackend;
 
 /// Enum wrapper for database state backend implementations.
@@ -52,6 +56,8 @@ pub use noop::NoOpStateBackend;
 pub enum StateBackendEnum {
     Postgres(DbStateBackend),
     Mssql(MssqlStateBackend),
+    #[cfg(feature = "mysql")]
+    Mysql(MysqlStateBackend),
     NoOp(NoOpStateBackend),
 }
 
@@ -61,6 +67,8 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.init_schema().await,
             Self::Mssql(backend) => backend.init_schema().await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(backend) => backend.init_schema().await,
             Self::NoOp(backend) => backend.init_schema().await,
         }
     }
@@ -70,6 +78,8 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.save(state).await,
             Self::Mssql(backend) => backend.save(state).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(backend) => backend.save(state).await,
             Self::NoOp(backend) => backend.save(state).await,
         }
     }
@@ -79,6 +89,8 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.load_latest(config_hash).await,
             Self::Mssql(backend) => backend.load_latest(config_hash).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(backend) => backend.load_latest(config_hash).await,
             Self::NoOp(backend) => backend.load_latest(config_hash).await,
         }
     }
@@ -88,6 +100,8 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
+            #[cfg(feature = "mysql")]
+            Self::Mysql(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::NoOp(backend) => backend.get_last_sync_timestamp(table_name).await,
         }
     }
@@ -97,6 +111,8 @@ impl StateBackendEnum {
         match self {
             Self::Postgres(_) => "postgres",
             Self::Mssql(_) => "mssql",
+            #[cfg(feature = "mysql")]
+            Self::Mysql(_) => "mysql",
             Self::NoOp(_) => "noop",
         }
     }

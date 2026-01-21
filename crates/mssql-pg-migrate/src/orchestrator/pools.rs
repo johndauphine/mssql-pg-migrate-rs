@@ -19,7 +19,10 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
+#[cfg(not(feature = "mysql"))]
 use crate::state::{DbStateBackend, MssqlStateBackend, NoOpStateBackend, StateBackendEnum};
+#[cfg(feature = "mysql")]
+use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -544,11 +547,7 @@ impl TargetPoolImpl {
                 p,
             )))),
             #[cfg(feature = "mysql")]
-            Self::Mysql(_) => {
-                // MySQL state backend not yet implemented - use no-op backend
-                // Resume capability not available for MySQL targets
-                Ok(StateBackendEnum::NoOp(NoOpStateBackend::new()))
-            }
+            Self::Mysql(p) => Ok(StateBackendEnum::Mysql(MysqlStateBackend::new(p.pool())))
         }
     }
 
