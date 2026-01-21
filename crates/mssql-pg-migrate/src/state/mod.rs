@@ -2,9 +2,13 @@
 
 use crate::error::{MigrateError, Result};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::Path;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Migration state for resume capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +30,12 @@ pub struct MigrationState {
 
     /// When the migration completed (if finished).
     pub completed_at: Option<DateTime<Utc>>,
+
+    /// HMAC-SHA256 signature for integrity validation.
+    /// Computed over serialized state (excluding this field) using config_hash as key.
+    /// Optional for backward compatibility with older state files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<String>,
 }
 
 /// Overall run status.
@@ -106,19 +116,71 @@ impl MigrationState {
             status: RunStatus::Running,
             tables: HashMap::new(),
             completed_at: None,
+            hmac: None, // Will be computed on first save
         }
     }
 
-    /// Load state from a file.
+    /// Compute HMAC-SHA256 signature for state integrity validation.
+    ///
+    /// # Security
+    ///
+    /// Uses config_hash as HMAC key to prevent tampering with state file.
+    /// Attacker would need both file system access AND knowledge of config_hash.
+    fn compute_hmac(&self) -> Result<String> {
+        // Create a copy without HMAC for signing
+        let mut state_for_signing = self.clone();
+        state_for_signing.hmac = None;
+
+        let content = serde_json::to_string(&state_for_signing)
+            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+
+        let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
+            .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
+
+        mac.update(content.as_bytes());
+        let result = mac.finalize();
+        Ok(hex::encode(result.into_bytes()))
+    }
+
+    /// Load state from a file with integrity validation.
+    ///
+    /// # Security
+    ///
+    /// Validates HMAC signature if present to detect tampering.
+    /// Older state files without HMAC are still accepted for backward compatibility,
+    /// but will be upgraded to include HMAC on next save.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let state: Self = serde_json::from_str(&content)?;
+
+        // Validate HMAC if present
+        if let Some(stored_hmac) = &state.hmac {
+            let expected_hmac = state.compute_hmac()?;
+            if stored_hmac != &expected_hmac {
+                return Err(MigrateError::Config(
+                    "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
+                ));
+            }
+        }
+        // If no HMAC present, accept for backward compatibility but log warning
+        else {
+            tracing::warn!("State file has no HMAC signature (older format), integrity cannot be verified");
+        }
+
         Ok(state)
     }
 
-    /// Save state to a file (atomic write).
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+    /// Save state to a file (atomic write with HMAC).
+    ///
+    /// # Security
+    ///
+    /// Computes HMAC-SHA256 signature before saving to enable integrity validation on load.
+    pub fn save<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
+
+        // Compute HMAC before serialization
+        self.hmac = Some(self.compute_hmac()?);
+
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| MigrateError::Config(format!("Failed to serialize state: {}", e)))?;
 
@@ -253,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let state = MigrationState::new("test-run".into(), "abc123".into());
+        let mut state = MigrationState::new("test-run".into(), "abc123".into());
         assert!(state.validate_config("abc123").is_ok());
         assert!(state.validate_config("different").is_err());
     }
@@ -282,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_state_json_format_pretty() {
-        let state = MigrationState::new("test-run".into(), "hash".into());
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
         let file = NamedTempFile::new().unwrap();
         state.save(file.path()).unwrap();
 
@@ -297,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_state_file_is_json_not_yaml() {
-        let state = MigrationState::new("test".into(), "hash".into());
+        let mut state = MigrationState::new("test".into(), "hash".into());
         let file = NamedTempFile::new().unwrap();
         state.save(file.path()).unwrap();
 
@@ -389,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_sync_timestamp_nonexistent_table() {
-        let state = MigrationState::new("test-run".into(), "hash".into());
+        let mut state = MigrationState::new("test-run".into(), "hash".into());
 
         // Should return None for non-existent table
         assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);

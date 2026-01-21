@@ -149,12 +149,25 @@ impl Table {
     /// Find the first date/timestamp column matching the candidate names.
     /// Used for date-based incremental sync (watermark).
     /// Returns (column_name, column_type) if found.
+    ///
+    /// # Timezone Warning
+    ///
+    /// For timezone-naive types (datetime, datetime2, timestamp without time zone),
+    /// logs a warning since mismatched timezones can cause data loss.
     pub fn find_date_column(&self, candidate_names: &[String]) -> Option<(String, String)> {
         for name in candidate_names {
             if let Some(col) = self.columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
                 let data_type = col.data_type.to_lowercase();
                 // Check if it's a date/time type
                 if is_date_type(&data_type) {
+                    // SECURITY: Warn about timezone-naive types
+                    if is_timezone_naive(&data_type) {
+                        tracing::warn!(
+                            "Table {}.{}: Using timezone-naive column '{}' ({}) for incremental sync. \
+                             Ensure database timezone matches UTC or use datetimeoffset/timestamptz to avoid data loss.",
+                            self.schema, self.name, col.name, col.data_type
+                        );
+                    }
                     return Some((col.name.clone(), col.data_type.clone()));
                 }
             }
@@ -176,6 +189,19 @@ fn is_date_type(data_type: &str) -> bool {
             | "timestamptz"
             | "timestamp with time zone"
             | "timestamp without time zone"
+    )
+}
+
+/// Check if a timestamp type is timezone-naive (lacks timezone info).
+///
+/// # Security
+///
+/// Timezone-naive types can cause data loss if database timezone differs from UTC.
+/// Returns true for types that should generate warnings.
+fn is_timezone_naive(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "datetime" | "datetime2" | "smalldatetime" | "timestamp" | "timestamp without time zone"
     )
 }
 

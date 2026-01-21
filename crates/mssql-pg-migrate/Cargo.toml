@@ -67,6 +67,7 @@ bytes = { workspace = true }
 
 # Hashing for config validation and row change detection
 sha2 = { workspace = true }
+hmac = { workspace = true }
 md-5 = "0.10"
 
 # Hex encoding

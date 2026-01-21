@@ -29,6 +29,54 @@ pub struct DateFilter {
     pub timestamp: DateTime<Utc>,
 }
 
+impl DateFilter {
+    /// Create a new DateFilter with validation.
+    ///
+    /// # Security
+    ///
+    /// Validates timestamp bounds to prevent injection and invalid date ranges:
+    /// - Rejects future timestamps (clock skew or tampering)
+    /// - Rejects very old timestamps (likely corruption or tampering)
+    /// - Column name validated separately during query building
+    pub fn new(column: String, timestamp: DateTime<Utc>) -> Result<Self> {
+        let now = Utc::now();
+
+        // Reject timestamps more than 1 hour in the future (allows for clock skew)
+        if timestamp > now + chrono::Duration::hours(1) {
+            return Err(MigrateError::Config(format!(
+                "Invalid sync timestamp for column '{}': timestamp {} is in the future (now: {})",
+                column,
+                timestamp.to_rfc3339(),
+                now.to_rfc3339()
+            )));
+        }
+
+        // Reject timestamps older than 100 years (likely corruption)
+        let min_timestamp = now - chrono::Duration::days(36500); // ~100 years
+        if timestamp < min_timestamp {
+            return Err(MigrateError::Config(format!(
+                "Invalid sync timestamp for column '{}': timestamp {} is too old (more than 100 years)",
+                column,
+                timestamp.to_rfc3339()
+            )));
+        }
+
+        Ok(Self { column, timestamp })
+    }
+
+    /// Get the timestamp as a validated RFC3339 string suitable for SQL.
+    ///
+    /// # Security
+    ///
+    /// Returns a validated RFC3339 timestamp that has been bounds-checked.
+    /// The RFC3339 format is guaranteed to not contain SQL metacharacters.
+    pub fn timestamp_sql_safe(&self) -> String {
+        // RFC3339 format is guaranteed safe: YYYY-MM-DDTHH:MM:SS.sssZ
+        // No single quotes, no semicolons, no SQL injection risk
+        self.timestamp.to_rfc3339()
+    }
+}
+
 /// Transfer job for a single table or partition.
 #[derive(Debug, Clone)]
 pub struct TransferJob {
@@ -1260,7 +1308,9 @@ async fn read_chunk_keyset_fast(
         } else {
             quote_mssql_ident(&filter.column)
         };
-        let timestamp_str = filter.timestamp.to_rfc3339();
+        // SECURITY: timestamp_sql_safe() returns bounds-validated RFC3339 string
+        // RFC3339 format (YYYY-MM-DDTHH:MM:SS.sssZ) contains no SQL metacharacters
+        let timestamp_str = filter.timestamp_sql_safe();
         // Include NULL values to catch rows without timestamps
         conditions.push(format!(
             "({} > '{}' OR {} IS NULL)",
@@ -1349,7 +1399,9 @@ async fn read_chunk_keyset_direct(
     // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
     if let Some(filter) = date_filter {
         let date_quoted = quote_mssql_ident(&filter.column);
-        let timestamp_str = filter.timestamp.to_rfc3339();
+        // SECURITY: timestamp_sql_safe() returns bounds-validated RFC3339 string
+        // RFC3339 format (YYYY-MM-DDTHH:MM:SS.sssZ) contains no SQL metacharacters
+        let timestamp_str = filter.timestamp_sql_safe();
         // Include NULL values to catch rows without timestamps
         conditions.push(format!(
             "({} > '{}' OR {} IS NULL)",
@@ -1589,18 +1641,29 @@ async fn read_table_chunks_copy_binary(
 ///
 /// Escapes double quotes by doubling them and wraps in double quotes.
 /// Includes defensive validation for suspicious patterns.
+///
+/// # Security
+///
+/// Runtime validation prevents SQL injection via identifier manipulation.
+/// Panics on invalid identifiers (null bytes, excessive length) as these
+/// indicate corruption or attack attempts.
 fn quote_pg_ident(name: &str) -> String {
-    // Defensive validation: reject suspicious patterns
-    debug_assert!(
-        !name.contains('\0'),
-        "Identifier contains null byte: {:?}",
-        name
-    );
-    debug_assert!(
-        name.len() <= 128,
-        "Identifier exceeds maximum length (128): {}",
-        name.len()
-    );
+    // SECURITY: Runtime validation (not debug-only)
+    // Null bytes should never appear in legitimate identifiers
+    if name.contains('\0') {
+        panic!(
+            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
+            name
+        );
+    }
+
+    // PostgreSQL identifier length limit is 63 bytes, but we're more conservative
+    if name.len() > 128 {
+        panic!(
+            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
+            name.len()
+        );
+    }
 
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -1665,18 +1728,22 @@ fn is_integer_type(col_type: &str) -> bool {
 /// However, we add defensive validation to reject suspicious patterns that
 /// could indicate tampering or corruption.
 fn quote_mssql_ident(name: &str) -> String {
-    // Defensive validation: reject suspicious patterns
-    // These should never appear in legitimate identifier names
-    debug_assert!(
-        !name.contains('\0'),
-        "Identifier contains null byte: {:?}",
-        name
-    );
-    debug_assert!(
-        name.len() <= 128,
-        "Identifier exceeds maximum length (128): {}",
-        name.len()
-    );
+    // SECURITY: Runtime validation (not debug-only)
+    // Null bytes should never appear in legitimate identifiers
+    if name.contains('\0') {
+        panic!(
+            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
+            name
+        );
+    }
+
+    // SQL Server identifier length limit is 128 characters
+    if name.len() > 128 {
+        panic!(
+            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
+            name.len()
+        );
+    }
 
     format!("[{}]", name.replace(']', "]]"))
 }

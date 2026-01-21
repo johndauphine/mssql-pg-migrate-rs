@@ -1256,6 +1256,7 @@ dependencies = [
  "futures",
  "glob",
  "hex",
+ "hmac",
  "md-5",
  "parking_lot",
  "postgres-types",

@@ -529,7 +529,7 @@ impl Orchestrator {
             self.prepare_target(&tables, &mut state).await?;
 
             // Save state after preparation
-            self.save_state(&state)?;
+            self.save_state(&mut state)?;
         } else {
             info!(
                 "Phase 2: [DRY RUN] Would prepare target database (mode: {:?})",
@@ -632,7 +632,7 @@ impl Orchestrator {
 
         // Save final state (skip in dry-run)
         if !dry_run {
-            self.save_state(&state)?;
+            self.save_state(&mut state)?;
         }
 
         let result = MigrationResult {
@@ -958,17 +958,25 @@ impl Orchestrator {
 
                     if let Some(last_sync_ts) = last_sync {
                         // Incremental sync: only rows modified after last sync
-                        info!(
-                            "{}: incremental sync from {} using {} ({})",
-                            table_name,
-                            last_sync_ts.to_rfc3339(),
-                            col_name,
-                            col_type
-                        );
-                        Some(DateFilter {
-                            column: col_name,
-                            timestamp: last_sync_ts,
-                        })
+                        match DateFilter::new(col_name.clone(), last_sync_ts) {
+                            Ok(filter) => {
+                                info!(
+                                    "{}: incremental sync from {} using {} ({})",
+                                    table_name,
+                                    last_sync_ts.to_rfc3339(),
+                                    col_name,
+                                    col_type
+                                );
+                                Some(filter)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "{}: invalid sync timestamp, falling back to full sync: {}",
+                                    table_name, e
+                                );
+                                None
+                            }
+                        }
                     } else {
                         // First sync: full load, but record timestamp for next run
                         info!(
@@ -1388,7 +1396,7 @@ impl Orchestrator {
     }
 
     /// Save state to file.
-    fn save_state(&self, state: &MigrationState) -> Result<()> {
+    fn save_state(&self, state: &mut MigrationState) -> Result<()> {
         if let Some(ref path) = self.state_file {
             state.save(path)?;
         }
