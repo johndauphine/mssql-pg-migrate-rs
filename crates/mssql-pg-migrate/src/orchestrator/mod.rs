@@ -420,7 +420,9 @@ impl Orchestrator {
     /// This creates a new reader instance using `DriverCatalog`. Use this for
     /// data transfer operations that benefit from the new streaming interface.
     pub async fn create_source_reader(&self, max_conns: usize) -> Result<SourceReaderImpl> {
-        self.catalog.create_reader(&self.config.source, max_conns).await
+        self.catalog
+            .create_reader(&self.config.source, max_conns)
+            .await
     }
 
     /// Create a target writer using the new driver architecture.
@@ -456,8 +458,13 @@ impl Orchestrator {
 
     /// Run the migration.
     /// If dry_run is true, only validates and shows what would happen without transferring data.
+    ///
+    /// **Important:** The caller should call `close()` after this method returns,
+    /// regardless of success or failure, to ensure database connections are properly closed.
+    /// Connection cleanup is handled automatically within this method on successful completion,
+    /// but early errors may bypass cleanup.
     pub async fn run(
-        mut self,
+        &mut self,
         cancel: CancellationToken,
         dry_run: bool,
     ) -> Result<MigrationResult> {
@@ -697,6 +704,9 @@ impl Orchestrator {
             result.duration_seconds,
             result.rows_per_second
         );
+
+        // Close database connections before returning (ensures clean shutdown)
+        self.close().await;
 
         transfer_result?;
 
@@ -1462,6 +1472,24 @@ impl Orchestrator {
     /// Save state to database.
     async fn save_state(&self, state: &MigrationState) -> Result<()> {
         self.state_backend.save(state).await
+    }
+
+    /// Explicitly close all database connections.
+    ///
+    /// This method closes both source and target connection pools, ensuring
+    /// clean disconnection from databases. While pools will eventually be
+    /// closed when dropped, calling this method explicitly ensures:
+    /// - Connections are closed promptly rather than lingering
+    /// - Any pending transactions are properly terminated
+    /// - Database server resources are freed immediately
+    ///
+    /// This is called automatically at the end of `run()`, but can be called
+    /// manually for early cleanup in error scenarios.
+    pub async fn close(&self) {
+        info!("Closing database connections");
+        // Close both pools concurrently
+        tokio::join!(self.source.close(), self.target.close());
+        info!("Database connections closed");
     }
 
     /// Validate row counts between source and target.

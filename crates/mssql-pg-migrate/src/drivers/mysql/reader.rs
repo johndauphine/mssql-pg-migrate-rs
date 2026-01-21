@@ -311,7 +311,11 @@ impl SourceReader for MysqlReader {
             tables.push(table);
         }
 
-        info!("Extracted {} tables from MySQL schema '{}'", tables.len(), schema);
+        info!(
+            "Extracted {} tables from MySQL schema '{}'",
+            tables.len(),
+            schema
+        );
         Ok(tables)
     }
 
@@ -446,7 +450,10 @@ impl SourceReader for MysqlReader {
                 let name: String = row.get("CONSTRAINT_NAME");
                 let expression: String = row.get("CHECK_CLAUSE");
 
-                table.check_constraints.push(CheckConstraint { name, definition: expression });
+                table.check_constraints.push(CheckConstraint {
+                    name,
+                    definition: expression,
+                });
             }
 
             debug!(
@@ -642,7 +649,9 @@ impl MysqlReader {
         let mut use_offset_pagination = false;
 
         // Get PK column name from pk_idx
-        let pk_col: Option<&str> = opts.pk_idx.and_then(|idx| columns.get(idx).map(|s| s.as_str()));
+        let pk_col: Option<&str> = opts
+            .pk_idx
+            .and_then(|idx| columns.get(idx).map(|s| s.as_str()));
 
         loop {
             let mut query = format!("SELECT {} FROM {}", col_list, table_ref);

@@ -19,20 +19,20 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
-#[cfg(not(feature = "mysql"))]
-use crate::state::{DbStateBackend, MssqlStateBackend, NoOpStateBackend, StateBackendEnum};
 #[cfg(feature = "mysql")]
 use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
+#[cfg(not(feature = "mysql"))]
+use crate::state::{DbStateBackend, MssqlStateBackend, NoOpStateBackend, StateBackendEnum};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[cfg(feature = "mysql")]
-use crate::drivers::{MysqlReader, MysqlWriter};
-#[cfg(feature = "mysql")]
 use crate::core::traits::{SourceReader as NewSourceReader, TargetWriter as NewTargetWriter};
 #[cfg(feature = "mysql")]
-use crate::core::value::{Batch, SqlValue as NewSqlValue, SqlNullType as NewSqlNullType};
+use crate::core::value::{Batch, SqlNullType as NewSqlNullType, SqlValue as NewSqlValue};
+#[cfg(feature = "mysql")]
+use crate::drivers::{MysqlReader, MysqlWriter};
 #[cfg(feature = "mysql")]
 use std::borrow::Cow;
 
@@ -247,7 +247,9 @@ impl SourcePoolImpl {
             Self::Mssql(p) => p.get_partition_boundaries(table, num_partitions).await,
             Self::Postgres(p) => p.get_partition_boundaries(table, num_partitions).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await,
+            Self::Mysql(p) => {
+                NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await
+            }
         }
     }
 
@@ -328,7 +330,8 @@ impl SourcePoolImpl {
                 // MySQL uses the new trait-based API which doesn't have query_rows_fast
                 // This path shouldn't be called for MySQL sources using the new transfer engine
                 Err(crate::error::MigrateError::Config(
-                    "MySQL source does not support query_rows_fast. Use the new SourceReader API.".to_string(),
+                    "MySQL source does not support query_rows_fast. Use the new SourceReader API."
+                        .to_string(),
                 ))
             }
         }
@@ -547,7 +550,7 @@ impl TargetPoolImpl {
                 p,
             )))),
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => Ok(StateBackendEnum::Mysql(MysqlStateBackend::new(p.pool())))
+            Self::Mysql(p) => Ok(StateBackendEnum::Mysql(MysqlStateBackend::new(p.pool()))),
         }
     }
 
@@ -577,7 +580,9 @@ impl TargetPoolImpl {
             Self::Mssql(p) => p.create_table_unlogged(table, target_schema).await,
             Self::Postgres(p) => p.create_table_unlogged(table, target_schema).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::create_table_unlogged(p.as_ref(), table, target_schema).await,
+            Self::Mysql(p) => {
+                NewTargetWriter::create_table_unlogged(p.as_ref(), table, target_schema).await
+            }
         }
     }
 
@@ -617,7 +622,9 @@ impl TargetPoolImpl {
             Self::Mssql(p) => p.create_primary_key(table, target_schema).await,
             Self::Postgres(p) => p.create_primary_key(table, target_schema).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::create_primary_key(p.as_ref(), table, target_schema).await,
+            Self::Mysql(p) => {
+                NewTargetWriter::create_primary_key(p.as_ref(), table, target_schema).await
+            }
         }
     }
 
@@ -632,7 +639,9 @@ impl TargetPoolImpl {
             Self::Mssql(p) => p.create_index(table, idx, target_schema).await,
             Self::Postgres(p) => p.create_index(table, idx, target_schema).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::create_index(p.as_ref(), table, idx, target_schema).await,
+            Self::Mysql(p) => {
+                NewTargetWriter::create_index(p.as_ref(), table, idx, target_schema).await
+            }
         }
     }
 
@@ -657,7 +666,9 @@ impl TargetPoolImpl {
             Self::Mssql(p) => p.create_foreign_key(table, fk, target_schema).await,
             Self::Postgres(p) => p.create_foreign_key(table, fk, target_schema).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::create_foreign_key(p.as_ref(), table, fk, target_schema).await,
+            Self::Mysql(p) => {
+                NewTargetWriter::create_foreign_key(p.as_ref(), table, fk, target_schema).await
+            }
         }
     }
 
@@ -672,7 +683,10 @@ impl TargetPoolImpl {
             Self::Mssql(p) => p.create_check_constraint(table, chk, target_schema).await,
             Self::Postgres(p) => p.create_check_constraint(table, chk, target_schema).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::create_check_constraint(p.as_ref(), table, chk, target_schema).await,
+            Self::Mysql(p) => {
+                NewTargetWriter::create_check_constraint(p.as_ref(), table, chk, target_schema)
+                    .await
+            }
         }
     }
 
@@ -787,7 +801,17 @@ impl TargetPoolImpl {
                     last_key: None,
                     is_last: true,
                 };
-                NewTargetWriter::upsert_batch(p.as_ref(), schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+                NewTargetWriter::upsert_batch(
+                    p.as_ref(),
+                    schema,
+                    table,
+                    cols,
+                    pk_cols,
+                    batch,
+                    writer_id,
+                    partition_id,
+                )
+                .await
             }
         }
     }

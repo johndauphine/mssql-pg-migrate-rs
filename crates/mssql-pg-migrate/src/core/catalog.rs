@@ -92,7 +92,8 @@ impl DriverCatalog {
         #[cfg(feature = "mysql")]
         {
             use crate::dialect::{
-                MssqlToMysqlMapper, MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMysqlMapper,
+                MssqlToMysqlMapper, MysqlToMssqlMapper, MysqlToPostgresMapper,
+                PostgresToMysqlMapper,
             };
             use crate::drivers::MysqlDialect;
 
@@ -293,7 +294,8 @@ impl DriverCatalog {
                 Ok(TargetWriterImpl::Postgres(Arc::new(writer)))
             }
             "mssql" | "sqlserver" | "sql_server" => {
-                let mut writer = MssqlWriter::with_pool_size(config.clone(), max_conns as u32).await?;
+                let mut writer =
+                    MssqlWriter::with_pool_size(config.clone(), max_conns as u32).await?;
                 if let Some(mapper) = type_mapper {
                     writer = writer.with_type_mapper(mapper);
                 }

@@ -28,10 +28,7 @@ impl NoOpStateBackend {
     }
 
     fn warn_once(&self) {
-        if !self
-            .warned
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if !self.warned.swap(true, std::sync::atomic::Ordering::SeqCst) {
             warn!(
                 "Using no-op state backend: migration state will not be persisted. \
                  Resume capability is not available for this target database type."

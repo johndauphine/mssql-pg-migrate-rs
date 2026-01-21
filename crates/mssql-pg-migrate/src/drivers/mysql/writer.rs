@@ -127,10 +127,14 @@ impl MysqlWriter {
             // No mapper provided - use default MSSQL to MySQL mapping
             // This is a fallback for the common case of migrating from MSSQL
             use crate::dialect::mssql_to_mysql_basic;
-            let target_type = mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale);
+            let target_type =
+                mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale);
             if target_type.is_empty() {
                 // Unknown type - pass through with warning
-                warn!("Unknown MSSQL type '{}' for column '{}', passing through", col.data_type, col.name);
+                warn!(
+                    "Unknown MSSQL type '{}' for column '{}', passing through",
+                    col.data_type, col.name
+                );
                 col.data_type.to_uppercase()
             } else {
                 target_type
@@ -199,7 +203,10 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS {}", Self::qualify_table(schema, table));
+        let sql = format!(
+            "DROP TABLE IF EXISTS {}",
+            Self::qualify_table(schema, table)
+        );
         sqlx::query(&sql).execute(&self.pool).await?;
 
         debug!("Dropped table {}.{}", schema, table);
@@ -248,10 +255,7 @@ impl TargetWriter for MysqlWriter {
         );
 
         sqlx::query(&sql).execute(&self.pool).await?;
-        debug!(
-            "Created primary key on {}.{}",
-            target_schema, table.name
-        );
+        debug!("Created primary key on {}.{}", target_schema, table.name);
         Ok(())
     }
 
@@ -318,7 +322,11 @@ impl TargetWriter for MysqlWriter {
         target_schema: &str,
     ) -> Result<()> {
         let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
-        let ref_cols: Vec<String> = fk.ref_columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let ref_cols: Vec<String> = fk
+            .ref_columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({}) ON DELETE {} ON UPDATE {}",
@@ -607,10 +615,7 @@ impl TargetWriter for MysqlWriter {
             // Only PK columns - use INSERT IGNORE
             format!(
                 "INSERT IGNORE INTO {} ({}) SELECT {} FROM {} AS s",
-                qualified_target,
-                col_list_str,
-                select_cols,
-                staging_qualified
+                qualified_target, col_list_str, select_cols, staging_qualified
             )
         } else {
             // Has non-PK columns - use ON DUPLICATE KEY UPDATE
@@ -628,11 +633,7 @@ impl TargetWriter for MysqlWriter {
 
             format!(
                 "INSERT INTO {} ({}) SELECT {} FROM {} AS s ON DUPLICATE KEY UPDATE {}",
-                qualified_target,
-                col_list_str,
-                select_cols,
-                staging_qualified,
-                update_set
+                qualified_target, col_list_str, select_cols, staging_qualified, update_set
             )
         };
 

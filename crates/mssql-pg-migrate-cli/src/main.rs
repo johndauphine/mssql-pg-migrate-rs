@@ -206,7 +206,13 @@ async fn run() -> Result<(), MigrateError> {
             }
 
             // Run migration (or dry-run)
-            let result = orchestrator.run(cancel_token, dry_run).await?;
+            let result = orchestrator.run(cancel_token, dry_run).await;
+
+            // Always close connections, regardless of success or failure
+            orchestrator.close().await;
+
+            // Now propagate any error
+            let result = result?;
 
             if cli.output_json {
                 println!("{}", result.to_json()?);
@@ -258,7 +264,13 @@ async fn run() -> Result<(), MigrateError> {
             info!("Resuming from database state");
 
             // Run migration (not dry-run for resume)
-            let result = orchestrator.run(cancel_token, false).await?;
+            let result = orchestrator.run(cancel_token, false).await;
+
+            // Always close connections, regardless of success or failure
+            orchestrator.close().await;
+
+            // Now propagate any error
+            let result = result?;
 
             if cli.output_json {
                 println!("{}", result.to_json()?);
@@ -280,13 +292,17 @@ async fn run() -> Result<(), MigrateError> {
 
         Commands::Validate => {
             let orchestrator = Orchestrator::new(config).await?;
-            orchestrator.validate().await?;
+            let result = orchestrator.validate().await;
+            orchestrator.close().await;
+            result?;
             println!("Validation completed successfully");
         }
 
         Commands::HealthCheck => {
             let orchestrator = Orchestrator::new(config).await?;
-            let result = orchestrator.health_check().await?;
+            let health_result = orchestrator.health_check().await;
+            orchestrator.close().await;
+            let result = health_result?;
 
             if cli.output_json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

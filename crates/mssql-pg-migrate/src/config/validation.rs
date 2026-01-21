@@ -21,7 +21,14 @@ pub fn validate(config: &Config) -> Result<()> {
     let source_type = config.source.r#type.to_lowercase();
     if !matches!(
         source_type.as_str(),
-        "mssql" | "sqlserver" | "sql_server" | "postgres" | "postgresql" | "pg" | "mysql" | "mariadb"
+        "mssql"
+            | "sqlserver"
+            | "sql_server"
+            | "postgres"
+            | "postgresql"
+            | "pg"
+            | "mysql"
+            | "mariadb"
     ) {
         return Err(MigrateError::Config(format!(
             "source.type must be 'mssql', 'postgres', or 'mysql', got '{}'",
@@ -45,7 +52,14 @@ pub fn validate(config: &Config) -> Result<()> {
     let target_type = config.target.r#type.to_lowercase();
     if !matches!(
         target_type.as_str(),
-        "mssql" | "sqlserver" | "sql_server" | "postgres" | "postgresql" | "pg" | "mysql" | "mariadb"
+        "mssql"
+            | "sqlserver"
+            | "sql_server"
+            | "postgres"
+            | "postgresql"
+            | "pg"
+            | "mysql"
+            | "mariadb"
     ) {
         return Err(MigrateError::Config(format!(
             "target.type must be 'mssql', 'postgres', or 'mysql', got '{}'",
