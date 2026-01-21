@@ -23,12 +23,13 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
 - **Three target modes** - `drop_recreate`, `truncate`, `upsert`
-- **Incremental sync** - Upsert mode with `INSERT...ON CONFLICT DO UPDATE`
+- **Incremental sync** - Upsert mode with date-based watermarks for fast delta syncs
+- **Database state storage** - Migration state stored in PostgreSQL (no external files)
 - **Interactive TUI** - Terminal UI for guided migration with real-time progress
 - **Configuration wizard** - Interactive `init` command creates config files
 - **Automatic type mapping** - MSSQL to PostgreSQL type conversion
 - **Keyset pagination** - Efficient chunked reads using `WHERE pk > last_pk`
-- **Resume capability** - JSON state file for process restartability
+- **Resume capability** - Automatic crash recovery from database state
 - **Parallel finalization** - Concurrent index and constraint creation
 - **Static binary** - No runtime dependencies, ideal for containers
 - **Airflow integration** - JSON output for XCom, automatic retry support
@@ -83,11 +84,8 @@ mssql-pg-migrate -c config.yaml run
 # Dry run (validate without transferring)
 mssql-pg-migrate -c config.yaml run --dry-run
 
-# With state file for resume
-mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state run
-
-# Resume interrupted migration
-mssql-pg-migrate -c config.yaml --state-file /tmp/migration.state resume
+# Resume interrupted migration (state stored in database)
+mssql-pg-migrate -c config.yaml resume
 
 # JSON output for Airflow
 mssql-pg-migrate -c config.yaml --output-json run
@@ -198,6 +196,44 @@ How it works:
 Example: With 19.3M rows and no changes, full sync takes ~84s. With date watermarks, incremental sync completes in seconds by filtering at the source.
 
 The tool automatically discovers the first matching date/timestamp column for each table. If no match is found, the table falls back to full sync.
+
+### Database State Storage
+
+Migration state is automatically stored in the target PostgreSQL database (`_mssql_pg_migrate` schema), eliminating the need for external state files:
+
+**Benefits:**
+- **Transactional safety** - State updates are atomic with data writes
+- **Multi-instance coordination** - Database locking prevents concurrent migrations
+- **No file system access** - Works in containerized/restricted environments
+- **Built-in audit trail** - Query migration history with SQL
+- **Automatic resume** - Crash recovery and incremental sync "just work"
+
+**Schema:**
+```sql
+_mssql_pg_migrate.migration_runs
+  - run_id, config_hash, started_at, completed_at, status
+
+_mssql_pg_migrate.table_state
+  - run_id, table_name, rows_total, rows_transferred
+  - last_sync_timestamp (for incremental sync)
+  - status, error
+```
+
+**Querying state:**
+```sql
+-- View recent migrations
+SELECT run_id, started_at, status,
+       (SELECT COUNT(*) FROM _mssql_pg_migrate.table_state WHERE run_id = mr.run_id) as tables
+FROM _mssql_pg_migrate.migration_runs mr
+ORDER BY started_at DESC LIMIT 10;
+
+-- Check table sync timestamps
+SELECT table_name, last_sync_timestamp, rows_transferred, status
+FROM _mssql_pg_migrate.table_state
+WHERE run_id = (SELECT run_id FROM _mssql_pg_migrate.migration_runs ORDER BY started_at DESC LIMIT 1);
+```
+
+The state schema is automatically initialized on first run. No configuration or setup required.
 
 ## Type Mapping
 
