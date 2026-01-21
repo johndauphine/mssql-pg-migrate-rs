@@ -55,7 +55,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a new migration
+    /// Start a migration (idempotent: auto-resumes from --state-file if it exists)
+    ///
+    /// When --state-file is provided:
+    /// - First run: Creates new migration, saves state for crash recovery and incremental sync
+    /// - Subsequent runs: Automatically resumes from state (enables incremental sync with date watermarks)
+    ///
+    /// Use 'resume' command for explicit crash recovery that requires existing state.
     Run {
         /// Override source schema
         #[arg(long)]
@@ -74,7 +80,10 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Resume a previously interrupted migration
+    /// Resume from state file (explicit crash recovery - requires existing state)
+    ///
+    /// Unlike 'run', this command errors if state file doesn't exist.
+    /// Use this for crash recovery scenarios where you know migration was interrupted.
     Resume {
         /// Override source schema
         #[arg(long)]
@@ -189,7 +198,12 @@ async fn run() -> Result<(), MigrateError> {
             // Apply global state_file if provided
             if let Some(ref path) = cli.state_file {
                 orchestrator = orchestrator.with_state_file(path.clone());
-                // Auto-resume from state file if it exists (enables incremental sync)
+
+                // Auto-resume from state file if it exists
+                // This makes 'run' idempotent and enables incremental sync workflows:
+                // - First run: Creates new state, saves last_sync_timestamp
+                // - Subsequent runs: Loads state, uses last_sync_timestamp for date filters
+                // Note: 'resume' command requires state to exist (explicit crash recovery)
                 if path.exists() {
                     orchestrator = orchestrator.resume()?;
                 }
