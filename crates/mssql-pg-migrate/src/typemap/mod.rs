@@ -1,4 +1,17 @@
 //! Bidirectional type mapping between MSSQL and PostgreSQL.
+//!
+//! # Deprecation Notice
+//!
+//! The type mapping functions in this module are being replaced by the new
+//! plugin architecture in [`crate::dialect`]:
+//!
+//! - Use [`crate::core::traits::TypeMapper`] trait for type mapping
+//! - Use [`crate::dialect::MssqlToPostgresMapper`] for MSSQL → PostgreSQL
+//! - Use [`crate::dialect::PostgresToMssqlMapper`] for PostgreSQL → MSSQL
+//! - Use [`crate::dialect::MysqlToPostgresMapper`] for MySQL → PostgreSQL
+//! - The new mappers implement the [`TypeMapper`](crate::core::traits::TypeMapper) trait
+//!
+//! The old functions remain for backward compatibility during the transition period.
 
 use crate::config::DatabaseType;
 
@@ -49,13 +62,25 @@ pub fn map_type(
         (DatabaseType::Postgres, DatabaseType::Mssql) => {
             postgres_to_mssql(data_type, max_length, precision, scale)
         }
-        (DatabaseType::Mssql, DatabaseType::Mssql) => {
+        (DatabaseType::Mssql, DatabaseType::Mssql)
+        | (DatabaseType::Postgres, DatabaseType::Postgres)
+        | (DatabaseType::Mysql, DatabaseType::Mysql) => {
             // Same database type - preserve original
             TypeMapping::lossless(data_type.to_string())
         }
-        (DatabaseType::Postgres, DatabaseType::Postgres) => {
-            // Same database type - preserve original
-            TypeMapping::lossless(data_type.to_string())
+        // MySQL mappings - use the dialect/typemap.rs implementations for actual mapping
+        // For now, provide basic identity mapping - full mappers are in dialect/typemap.rs
+        (DatabaseType::Mysql, DatabaseType::Postgres) => {
+            TypeMapping::lossless(mysql_to_postgres_basic(data_type, max_length, precision, scale))
+        }
+        (DatabaseType::Postgres, DatabaseType::Mysql) => {
+            postgres_to_mysql_basic(data_type, max_length, precision, scale)
+        }
+        (DatabaseType::Mysql, DatabaseType::Mssql) => {
+            TypeMapping::lossless(mysql_to_mssql_basic(data_type, max_length, precision, scale))
+        }
+        (DatabaseType::Mssql, DatabaseType::Mysql) => {
+            mssql_to_mysql_basic(data_type, max_length, precision, scale)
         }
     }
 }
@@ -126,6 +151,207 @@ pub fn mssql_to_postgres(mssql_type: &str, max_length: i32, precision: i32, scal
 
         // Default fallback
         _ => "text".to_string(),
+    }
+}
+
+/// Basic MySQL to PostgreSQL type mapping.
+fn mysql_to_postgres_basic(mysql_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+    match mysql_type.to_lowercase().as_str() {
+        "tinyint" => "smallint".to_string(),
+        "smallint" => "smallint".to_string(),
+        "mediumint" | "int" | "integer" => "integer".to_string(),
+        "bigint" => "bigint".to_string(),
+        "float" => "real".to_string(),
+        "double" | "real" => "double precision".to_string(),
+        "decimal" | "numeric" => {
+            if precision > 0 {
+                format!("numeric({},{})", precision, scale)
+            } else {
+                "numeric".to_string()
+            }
+        }
+        "bit" | "bool" | "boolean" => "boolean".to_string(),
+        "char" => {
+            if max_length > 0 {
+                format!("char({})", max_length)
+            } else {
+                "text".to_string()
+            }
+        }
+        "varchar" => {
+            if max_length > 0 {
+                format!("varchar({})", max_length)
+            } else {
+                "text".to_string()
+            }
+        }
+        "text" | "tinytext" | "mediumtext" | "longtext" => "text".to_string(),
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => {
+            "bytea".to_string()
+        }
+        "date" => "date".to_string(),
+        "time" => "time".to_string(),
+        "datetime" | "timestamp" => "timestamp".to_string(),
+        "json" => "jsonb".to_string(),
+        _ => "text".to_string(),
+    }
+}
+
+/// Basic PostgreSQL to MySQL type mapping.
+fn postgres_to_mysql_basic(
+    pg_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> TypeMapping {
+    let pg_lower = pg_type.to_lowercase();
+
+    // Handle array types (lossy)
+    if pg_lower.ends_with("[]") || pg_lower.starts_with("_") {
+        return TypeMapping::lossy(
+            "json".to_string(),
+            format!("Array type '{}' stored as JSON.", pg_type),
+        );
+    }
+
+    match pg_lower.as_str() {
+        "bool" | "boolean" => TypeMapping::lossless("tinyint(1)"),
+        "int2" | "smallint" => TypeMapping::lossless("smallint"),
+        "int4" | "integer" | "int" => TypeMapping::lossless("int"),
+        "int8" | "bigint" => TypeMapping::lossless("bigint"),
+        "float4" | "real" => TypeMapping::lossless("float"),
+        "float8" | "double precision" => TypeMapping::lossless("double"),
+        "numeric" | "decimal" => {
+            if precision > 0 {
+                TypeMapping::lossless(format!("decimal({},{})", precision, scale))
+            } else {
+                TypeMapping::lossless("decimal(65,30)")
+            }
+        }
+        "varchar" | "character varying" => {
+            if max_length > 0 && max_length <= 16383 {
+                TypeMapping::lossless(format!("varchar({})", max_length))
+            } else {
+                TypeMapping::lossless("longtext")
+            }
+        }
+        "text" => TypeMapping::lossless("longtext"),
+        "bytea" => TypeMapping::lossless("longblob"),
+        "date" => TypeMapping::lossless("date"),
+        "time" | "time without time zone" => TypeMapping::lossless("time"),
+        "timestamp" | "timestamp without time zone" => TypeMapping::lossless("datetime"),
+        "timestamptz" | "timestamp with time zone" => TypeMapping::lossless("datetime"),
+        "json" | "jsonb" => TypeMapping::lossless("json"),
+        "uuid" => TypeMapping::lossy("char(36)", "UUID stored as char(36)."),
+        "interval" => TypeMapping::lossy(
+            "varchar(100)",
+            "PostgreSQL interval stored as string.",
+        ),
+        _ => TypeMapping::lossy(
+            "longtext",
+            format!("Unknown PostgreSQL type '{}' stored as text.", pg_type),
+        ),
+    }
+}
+
+/// Basic MySQL to MSSQL type mapping.
+fn mysql_to_mssql_basic(mysql_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+    match mysql_type.to_lowercase().as_str() {
+        "tinyint" => "tinyint".to_string(),
+        "smallint" => "smallint".to_string(),
+        "mediumint" | "int" | "integer" => "int".to_string(),
+        "bigint" => "bigint".to_string(),
+        "float" => "real".to_string(),
+        "double" | "real" => "float".to_string(),
+        "decimal" | "numeric" => {
+            if precision > 0 {
+                format!("decimal({},{})", precision, scale)
+            } else {
+                "decimal(38,10)".to_string()
+            }
+        }
+        "bit" | "bool" | "boolean" => "bit".to_string(),
+        "char" => {
+            if max_length > 0 && max_length <= 4000 {
+                format!("nchar({})", max_length)
+            } else {
+                "nvarchar(max)".to_string()
+            }
+        }
+        "varchar" => {
+            if max_length > 0 && max_length <= 4000 {
+                format!("nvarchar({})", max_length)
+            } else {
+                "nvarchar(max)".to_string()
+            }
+        }
+        "text" | "tinytext" | "mediumtext" | "longtext" => "nvarchar(max)".to_string(),
+        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => {
+            "varbinary(max)".to_string()
+        }
+        "date" => "date".to_string(),
+        "time" => "time".to_string(),
+        "datetime" | "timestamp" => "datetime2".to_string(),
+        "json" => "nvarchar(max)".to_string(),
+        _ => "nvarchar(max)".to_string(),
+    }
+}
+
+/// Basic MSSQL to MySQL type mapping.
+fn mssql_to_mysql_basic(
+    mssql_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> TypeMapping {
+    match mssql_type.to_lowercase().as_str() {
+        "bit" => TypeMapping::lossless("tinyint(1)"),
+        "tinyint" => TypeMapping::lossless("tinyint unsigned"),
+        "smallint" => TypeMapping::lossless("smallint"),
+        "int" => TypeMapping::lossless("int"),
+        "bigint" => TypeMapping::lossless("bigint"),
+        "real" => TypeMapping::lossless("float"),
+        "float" => TypeMapping::lossless("double"),
+        "decimal" | "numeric" => {
+            if precision > 0 && precision <= 65 {
+                TypeMapping::lossless(format!("decimal({},{})", precision, scale))
+            } else {
+                TypeMapping::lossless("decimal(65,30)")
+            }
+        }
+        "money" => TypeMapping::lossless("decimal(19,4)"),
+        "smallmoney" => TypeMapping::lossless("decimal(10,4)"),
+        "char" | "nchar" => {
+            if max_length > 0 && max_length <= 255 {
+                TypeMapping::lossless(format!("char({})", max_length))
+            } else {
+                TypeMapping::lossless("text")
+            }
+        }
+        "varchar" | "nvarchar" => {
+            if max_length == -1 {
+                TypeMapping::lossless("longtext")
+            } else if max_length > 0 && max_length <= 16383 {
+                TypeMapping::lossless(format!("varchar({})", max_length))
+            } else {
+                TypeMapping::lossless("longtext")
+            }
+        }
+        "text" | "ntext" => TypeMapping::lossless("longtext"),
+        "binary" | "varbinary" | "image" => TypeMapping::lossless("longblob"),
+        "date" => TypeMapping::lossless("date"),
+        "time" => TypeMapping::lossless("time"),
+        "datetime" | "datetime2" | "smalldatetime" => TypeMapping::lossless("datetime"),
+        "datetimeoffset" => TypeMapping::lossy(
+            "datetime",
+            "datetimeoffset loses timezone information in MySQL.",
+        ),
+        "uniqueidentifier" => TypeMapping::lossy("char(36)", "UUID stored as char(36)."),
+        "xml" => TypeMapping::lossy("longtext", "XML stored as text in MySQL."),
+        _ => TypeMapping::lossy(
+            "longtext",
+            format!("Unknown MSSQL type '{}' stored as text.", mssql_type),
+        ),
     }
 }
 

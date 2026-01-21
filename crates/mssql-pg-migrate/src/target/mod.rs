@@ -3,6 +3,18 @@
 //! This module provides target database implementations:
 //! - `PgPool` - PostgreSQL target
 //! - `MssqlTargetPool` - MSSQL target (uses Tiberius with SQL Server or Kerberos auth)
+//!
+//! # Deprecation Notice
+//!
+//! The `TargetPool` trait and implementations in this module are being replaced by
+//! the new plugin architecture in [`crate::core`] and [`crate::drivers`]:
+//!
+//! - Use [`crate::core::traits::TargetWriter`] instead of [`TargetPool`]
+//! - Use [`crate::drivers::TargetWriterImpl`] for enum-based dispatch
+//! - Use [`crate::core::value::SqlValue`] instead of the old `SqlValue` type
+//! - Use [`crate::core::value::SqlNullType`] instead of the old `SqlNullType` type
+//!
+//! The old types remain for backward compatibility during the transition period.
 
 mod mssql;
 

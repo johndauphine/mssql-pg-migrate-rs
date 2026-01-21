@@ -57,3 +57,22 @@ pub use typemap::{map_type, mssql_to_postgres, postgres_to_mssql, TypeMapping};
 
 // Pipeline re-exports (new plugin architecture)
 pub use pipeline::{PipelineConfig, PipelineStats, TransferPipeline};
+
+// Core module re-exports (new plugin architecture)
+// These provide the new trait-based abstractions for database operations
+pub use core::{
+    schema::{CheckConstraint, Column, ForeignKey, Index, Partition, PkValue},
+    traits::{Dialect, ReadOptions, SourceReader, TargetWriter, TypeMapper},
+    value::{Batch, SqlNullType as NewSqlNullType, SqlValue as NewSqlValue},
+    DriverCatalog,
+};
+
+// Driver implementations (new plugin architecture)
+pub use drivers::{
+    DialectImpl, MssqlDialect, MssqlReader, MssqlWriter, PostgresDialect, PostgresReader,
+    PostgresWriter, SourceReaderImpl, TargetWriterImpl,
+};
+
+// MySQL support (feature-gated)
+#[cfg(feature = "mysql")]
+pub use drivers::{MysqlDialect, MysqlReader, MysqlWriter};

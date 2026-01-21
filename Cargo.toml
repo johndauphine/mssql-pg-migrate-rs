@@ -30,6 +30,9 @@ tokio-postgres-rustls = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-roots = "0.26"
 
+# MySQL/MariaDB driver (optional, feature-gated)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "chrono", "uuid", "rust_decimal"] }
+
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

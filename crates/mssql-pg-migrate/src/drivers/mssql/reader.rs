@@ -1,105 +1,45 @@
-//! Source database operations.
+//! MSSQL source reader implementation.
 //!
-//! This module provides database-agnostic source operations via the `SourcePool` trait.
-//! Implementations are provided for:
-//! - MSSQL: `MssqlPool` (uses Tiberius with SQL Server or Kerberos auth)
-//! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
-//!
-//! # Deprecation Notice
-//!
-//! The `SourcePool` trait and implementations in this module are being replaced by
-//! the new plugin architecture in [`crate::core`] and [`crate::drivers`]:
-//!
-//! - Use [`crate::core::traits::SourceReader`] instead of [`SourcePool`]
-//! - Use [`crate::drivers::SourceReaderImpl`] for enum-based dispatch
-//! - Use [`crate::core::schema`] for schema types (Table, Column, etc.)
-//! - Use [`crate::core::value::SqlValue`] for the new Cow-based value type
-//!
-//! The old types remain for backward compatibility during the transition period.
+//! Implements the `SourceReader` trait for reading data from MSSQL databases.
+//! Uses Tiberius with bb8 connection pooling for high-performance data extraction.
 
-mod bench_copy;
-mod direct_copy;
-mod pg_binary;
-mod postgres;
+use std::time::Duration;
 
-pub use direct_copy::DirectCopyEncoder;
-pub use pg_binary::{BinaryColumnType, BinaryRowParser};
-pub use postgres::PgSourcePool;
-
-// Re-export schema types from core module (previously in types.rs)
-pub use crate::core::schema::{
-    CheckConstraint, Column, ForeignKey, Index, Partition, PkValue, Table,
-};
-
-#[cfg(feature = "kerberos")]
-use crate::config::AuthMethod as ConfigAuthMethod;
-use crate::config::SourceConfig;
-use crate::error::{MigrateError, Result};
-use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
-use std::time::Duration;
-use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::config::SourceConfig;
+#[cfg(feature = "kerberos")]
+use crate::config::AuthMethod as ConfigAuthMethod;
+use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition, Table};
+use crate::core::traits::{ReadOptions, SourceReader};
+use crate::core::value::{Batch, SqlNullType, SqlValue};
+use crate::error::{MigrateError, Result};
+use crate::source::DirectCopyEncoder;
+
 /// Maximum TDS packet size (32767 bytes, ~32KB).
-/// SQL Server on Linux/Docker negotiates down to 16KB, but we request the maximum.
-/// This improves bulk read performance by ~42% compared to the default 4KB.
 const TDS_MAX_PACKET_SIZE: u32 = 32767;
 
 /// Connection acquisition timeout from pool (30 seconds).
-/// Prevents workers from waiting indefinitely for connections during high contention.
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Idle connection timeout (5 minutes).
-/// Connections idle longer than this are closed to free resources and prevent zombie connections.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum connection lifetime (30 minutes).
-/// Connections older than this are recycled to prevent long-lived zombie connections.
 const POOL_MAX_LIFETIME: Duration = Duration::from_secs(1800);
 
 /// TCP keepalive interval (30 seconds).
-/// Sends keepalive probes to detect dead connections at the TCP level.
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Trait for source database operations.
-#[async_trait]
-pub trait SourcePool: Send + Sync {
-    /// Extract schema information from the source database.
-    async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>>;
-
-    /// Get partition boundaries for parallel reads.
-    async fn get_partition_boundaries(
-        &self,
-        table: &Table,
-        num_partitions: usize,
-    ) -> Result<Vec<Partition>>;
-
-    /// Load index metadata for a table.
-    async fn load_indexes(&self, table: &mut Table) -> Result<()>;
-
-    /// Load foreign key metadata for a table.
-    async fn load_foreign_keys(&self, table: &mut Table) -> Result<()>;
-
-    /// Load check constraint metadata for a table.
-    async fn load_check_constraints(&self, table: &mut Table) -> Result<()>;
-
-    /// Get the row count for a table.
-    async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64>;
-
-    /// Get the database type.
-    fn db_type(&self) -> &str;
-
-    /// Close all connections.
-    async fn close(&self);
-}
-
-/// Connection manager for bb8 pool with tiberius.
+/// Connection manager for bb8 pool with Tiberius.
 #[derive(Clone)]
 struct TiberiusConnectionManager {
     config: SourceConfig,
@@ -120,12 +60,10 @@ impl TiberiusConnectionManager {
         match self.config.auth {
             #[cfg(feature = "kerberos")]
             ConfigAuthMethod::Kerberos => {
-                // Use Tiberius integrated auth (GSSAPI on Unix, SSPI on Windows)
                 info!("Using Kerberos authentication via Tiberius GSSAPI for MSSQL source");
                 config.authentication(TiberiusAuthMethod::Integrated);
             }
             _ => {
-                // Default to SQL Server authentication
                 config.authentication(TiberiusAuthMethod::sql_server(
                     &self.config.user,
                     &self.config.password,
@@ -143,9 +81,7 @@ impl TiberiusConnectionManager {
             config.encryption(EncryptionLevel::NotSupported);
         }
 
-        // Use maximum packet size for better performance
         config.packet_size(TDS_MAX_PACKET_SIZE);
-
         config
     }
 }
@@ -164,15 +100,10 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
             }
         })?;
 
-        // Enable TCP nodelay for lower latency
         tcp.set_nodelay(true).ok();
 
-        // Enable TCP keepalives to detect dead connections at the network level.
-        // This is critical for preventing zombie connections that can cause migration hangs.
-        // Note: Tokio's TcpStream doesn't directly expose keepalive settings, so we use
-        // the lower-level socket API via into_std().
+        // Enable TCP keepalives
         if let Ok(std_tcp) = tcp.into_std() {
-            // Set TCP keepalive using socket2 for cross-platform support
             use std::net::TcpStream as StdTcpStream;
             let socket = socket2::Socket::from(std_tcp);
 
@@ -184,7 +115,6 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
                 warn!("Failed to set TCP keepalive on MSSQL connection: {}", e);
             }
 
-            // Convert back to tokio TcpStream
             let std_tcp: StdTcpStream = socket.into();
             std_tcp.set_nonblocking(true).ok();
             let tcp = TcpStream::from_std(std_tcp).map_err(|e| tiberius::error::Error::Io {
@@ -194,7 +124,6 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
 
             Client::connect(config, tcp.compat_write()).await
         } else {
-            // Fallback if we can't set keepalives (shouldn't happen)
             warn!("Failed to configure TCP keepalives on MSSQL connection");
             let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
                 tiberius::error::Error::Io {
@@ -208,46 +137,40 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
-        // Validate connection with a simple query.
-        // This catches connections that are broken but not detected by TCP keepalives.
         conn.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
-        // bb8 calls this synchronously to check if connection should be discarded.
-        // Tiberius Client doesn't expose a direct "is_broken" flag, but we rely on:
-        // 1. TCP keepalives to detect dead connections at network level
-        // 2. is_valid() check on checkout (test_on_checkout enabled)
-        // 3. Pool-level timeouts to recycle stale connections
         false
     }
 }
 
-/// MSSQL source pool implementation with connection pooling.
-pub struct MssqlPool {
+/// MSSQL source reader implementation.
+///
+/// Provides high-performance data extraction from MSSQL databases using:
+/// - Connection pooling via bb8
+/// - Direct COPY encoding for PostgreSQL targets
+/// - Keyset pagination for parallel reads
+pub struct MssqlReader {
     pool: Pool<TiberiusConnectionManager>,
 }
 
-impl MssqlPool {
-    /// Create a new MSSQL source pool with connection pooling.
+impl MssqlReader {
+    /// Create a new MSSQL reader from configuration.
     pub async fn new(config: SourceConfig) -> Result<Self> {
-        Self::with_max_connections(config, 8).await
+        Self::with_pool_size(config, 8).await
     }
 
-    /// Create a new MSSQL source pool with specified max connections.
-    pub async fn with_max_connections(config: SourceConfig, max_size: u32) -> Result<Self> {
+    /// Create a new MSSQL reader with specified pool size.
+    pub async fn with_pool_size(config: SourceConfig, max_size: u32) -> Result<Self> {
         let manager = TiberiusConnectionManager::new(config.clone());
         let pool = Pool::builder()
             .max_size(max_size)
             .min_idle(Some(1))
-            // Connection acquisition timeout - prevents indefinite blocking
             .connection_timeout(POOL_CONNECTION_TIMEOUT)
-            // Idle connection cleanup - prevents zombie connections from accumulating
             .idle_timeout(Some(POOL_IDLE_TIMEOUT))
-            // Maximum connection lifetime - forces connection recycling
             .max_lifetime(Some(POOL_MAX_LIFETIME))
-            // Validate connections before returning from pool
             .test_on_check_out(true)
             .build(manager)
             .await
@@ -259,7 +182,6 @@ impl MssqlPool {
                 .get()
                 .await
                 .map_err(|e| MigrateError::pool(e, "testing MSSQL connection"))?;
-
             conn.simple_query("SELECT 1").await?.into_row().await?;
         }
 
@@ -375,177 +297,6 @@ impl MssqlPool {
         Ok(())
     }
 
-    /// Query rows from the database and convert to SqlValue.
-    /// Note: This method does O(n) lookup per column per row. Use query_rows_fast for better performance.
-    pub async fn query_rows(
-        &self,
-        sql: &str,
-        columns: &[String],
-        table: &Table,
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        let mut client = self.get_client().await?;
-
-        let stream = client.simple_query(sql).await?;
-        let rows = stream.into_first_result().await?;
-
-        let mut result = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let mut values = Vec::with_capacity(columns.len());
-
-            for (idx, col_name) in columns.iter().enumerate() {
-                // Find column metadata
-                let col_meta = table.columns.iter().find(|c| &c.name == col_name);
-                let data_type = col_meta.map(|c| c.data_type.as_str()).unwrap_or("varchar");
-
-                let value = convert_row_value(&row, idx, data_type);
-                values.push(value);
-            }
-
-            result.push(values);
-        }
-
-        Ok(result)
-    }
-
-    /// Query rows with pre-computed column types for O(1) lookup per value.
-    /// This is the high-performance version used by the parallel transfer engine.
-    pub async fn query_rows_fast(
-        &self,
-        sql: &str,
-        _columns: &[String],
-        col_types: &[String],
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        use std::time::Instant;
-
-        let t0 = Instant::now();
-        let mut client = self.get_client().await?;
-        let t_conn = t0.elapsed();
-
-        let t1 = Instant::now();
-        let stream = client.simple_query(sql).await?;
-        let t_query = t1.elapsed();
-
-        let t2 = Instant::now();
-        let rows = stream.into_first_result().await?;
-        let t_fetch = t2.elapsed();
-
-        let t3 = Instant::now();
-        let mut result = Vec::with_capacity(rows.len());
-
-        for row in rows {
-            let mut values = Vec::with_capacity(col_types.len());
-
-            // O(1) lookup using pre-computed column types array
-            for (idx, data_type) in col_types.iter().enumerate() {
-                let value = convert_row_value(&row, idx, data_type);
-                values.push(value);
-            }
-
-            result.push(values);
-        }
-        let t_convert = t3.elapsed();
-
-        // Log timing breakdown for chunks with significant data
-        if result.len() > 1000 {
-            debug!(
-                "PROFILE read: {} rows - conn={:?}, query={:?}, fetch={:?}, convert={:?}",
-                result.len(),
-                t_conn,
-                t_query,
-                t_fetch,
-                t_convert
-            );
-        }
-
-        Ok(result)
-    }
-
-    /// Query rows and encode directly to PostgreSQL COPY binary format.
-    ///
-    /// This is the high-performance path that bypasses SqlValue entirely.
-    /// Returns (encoded_bytes, first_pk, last_pk, row_count).
-    pub async fn query_rows_direct_copy(
-        &self,
-        sql: &str,
-        col_types: &[String],
-        pk_idx: Option<usize>,
-    ) -> Result<(bytes::Bytes, Option<i64>, Option<i64>, usize)> {
-        use bytes::BytesMut;
-        use std::time::Instant;
-
-        let t0 = Instant::now();
-        let mut client = self.get_client().await?;
-        let t_conn = t0.elapsed();
-
-        let t1 = Instant::now();
-        let stream = client.simple_query(sql).await?;
-        let t_query = t1.elapsed();
-
-        let t2 = Instant::now();
-        let rows = stream.into_first_result().await?;
-        let t_fetch = t2.elapsed();
-
-        let t3 = Instant::now();
-
-        // Create encoder with pre-computed column strategies
-        let encoder = direct_copy::DirectCopyEncoder::new(col_types);
-        // Pre-allocate buffer based on actual row count to minimize reallocations
-        let estimated_size = encoder.buffer_size_for_rows(rows.len());
-        let mut buf = BytesMut::with_capacity(estimated_size);
-
-        encoder.write_header(&mut buf);
-
-        let mut first_pk: Option<i64> = None;
-        let mut last_pk: Option<i64> = None;
-        let row_count = rows.len();
-
-        for (i, row) in rows.iter().enumerate() {
-            // Encode row directly - single type dispatch per value
-            // Pass pk_idx to extract the correct PK column value
-            let pk = encoder.encode_row(row, &mut buf, pk_idx);
-
-            // Track PKs from the specified PK column
-            if pk_idx.is_some() {
-                if i == 0 {
-                    first_pk = pk;
-                }
-                if pk.is_some() {
-                    last_pk = pk;
-                }
-            }
-        }
-
-        encoder.write_trailer(&mut buf);
-
-        let t_encode = t3.elapsed();
-
-        // Log timing breakdown for chunks with significant data
-        if row_count > 1000 {
-            debug!(
-                "PROFILE direct_copy: {} rows - conn={:?}, query={:?}, fetch={:?}, encode={:?}",
-                row_count, t_conn, t_query, t_fetch, t_encode
-            );
-        }
-
-        Ok((buf.freeze(), first_pk, last_pk, row_count))
-    }
-
-    /// Get the maximum primary key value for a table.
-    pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
-        let mut client = self.get_client().await?;
-
-        let query = format!(
-            "SELECT CAST(MAX([{}]) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
-            pk_col, schema, table
-        );
-
-        let stream = client.simple_query(&query).await?;
-        let row = stream.into_row().await?;
-
-        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
-    }
-
     /// Load row count for a table (fast approximate from sys.partitions).
     async fn load_row_count(
         &self,
@@ -574,10 +325,87 @@ impl MssqlPool {
         debug!("Row count for {}: {}", table.full_name(), table.row_count);
         Ok(())
     }
+
+    /// Query rows with pre-computed column types for O(1) lookup.
+    pub async fn query_rows_fast(
+        &self,
+        sql: &str,
+        col_types: &[String],
+    ) -> Result<Vec<Vec<SqlValue<'static>>>> {
+        let mut client = self.get_client().await?;
+        let stream = client.simple_query(sql).await?;
+        let rows = stream.into_first_result().await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = convert_row_value(&row, idx, data_type);
+                values.push(value);
+            }
+
+            result.push(values);
+        }
+
+        Ok(result)
+    }
+
+    /// Query rows and encode directly to PostgreSQL COPY binary format.
+    ///
+    /// This is the high-performance path that bypasses SqlValue entirely.
+    /// Returns (encoded_bytes, first_pk, last_pk, row_count).
+    pub async fn query_rows_direct_copy(
+        &self,
+        sql: &str,
+        col_types: &[String],
+        pk_idx: Option<usize>,
+    ) -> Result<(bytes::Bytes, Option<i64>, Option<i64>, usize)> {
+        use bytes::BytesMut;
+
+        let mut client = self.get_client().await?;
+        let stream = client.simple_query(sql).await?;
+        let rows = stream.into_first_result().await?;
+
+        let encoder = DirectCopyEncoder::new(col_types);
+        let estimated_size = encoder.buffer_size_for_rows(rows.len());
+        let mut buf = BytesMut::with_capacity(estimated_size);
+
+        encoder.write_header(&mut buf);
+
+        let mut first_pk: Option<i64> = None;
+        let mut last_pk: Option<i64> = None;
+        let row_count = rows.len();
+
+        for (i, row) in rows.iter().enumerate() {
+            let pk = encoder.encode_row(row, &mut buf, pk_idx);
+
+            if pk_idx.is_some() {
+                if i == 0 {
+                    first_pk = pk;
+                }
+                if pk.is_some() {
+                    last_pk = pk;
+                }
+            }
+        }
+
+        encoder.write_trailer(&mut buf);
+
+        Ok((buf.freeze(), first_pk, last_pk, row_count))
+    }
+
+    /// Test the connection.
+    pub async fn test_connection(&self) -> Result<()> {
+        let mut client = self.get_client().await?;
+        client.simple_query("SELECT 1").await?.into_row().await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl SourcePool for MssqlPool {
+impl SourceReader for MssqlReader {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
         let mut client = self.get_client().await?;
 
@@ -612,38 +440,15 @@ impl SourcePool for MssqlPool {
                 check_constraints: Vec::new(),
             };
 
-            // Load metadata
             self.load_columns(&mut client, &mut table).await?;
             self.load_primary_key(&mut client, &mut table).await?;
             self.load_row_count(&mut client, &mut table).await?;
 
-            // Estimate row size (simple heuristic: sum of column sizes)
+            // Estimate row size
             table.estimated_row_size = table
                 .columns
                 .iter()
-                .map(|c| {
-                    match c.data_type.as_str() {
-                        "int" => 4,
-                        "bigint" => 8,
-                        "smallint" => 2,
-                        "tinyint" => 1,
-                        "bit" => 1,
-                        "float" => 8,
-                        "real" => 4,
-                        "datetime" | "datetime2" => 8,
-                        "date" => 3,
-                        "time" => 5,
-                        "uniqueidentifier" => 16,
-                        "varchar" | "nvarchar" | "char" | "nchar" => {
-                            if c.max_length == -1 {
-                                100
-                            } else {
-                                c.max_length.min(100) as i64
-                            }
-                        }
-                        _ => 8, // default
-                    }
-                })
+                .map(|c| estimate_column_size(c))
                 .sum();
 
             tables.push(table);
@@ -653,78 +458,9 @@ impl SourcePool for MssqlPool {
         Ok(tables)
     }
 
-    async fn get_partition_boundaries(
-        &self,
-        table: &Table,
-        num_partitions: usize,
-    ) -> Result<Vec<Partition>> {
-        if !table.has_single_pk() {
-            return Err(MigrateError::SchemaExtraction(
-                "Partitioning requires single-column PK".into(),
-            ));
-        }
-
-        let pk_col = &table.primary_key[0];
-        let mut client = self.get_client().await?;
-
-        // Use NTILE to split into partitions - CAST all to BIGINT for consistent types
-        // Use NOLOCK to avoid blocking and improve performance
-        let query = format!(
-            r#"
-            WITH numbered AS (
-                SELECT CAST([{pk}] AS BIGINT) AS pk_val,
-                       NTILE({n}) OVER (ORDER BY [{pk}]) as partition_id
-                FROM [{schema}].[{table}] WITH (NOLOCK)
-            )
-            SELECT CAST(partition_id AS BIGINT) AS partition_id,
-                   MIN(pk_val) as min_pk,
-                   MAX(pk_val) as max_pk,
-                   CAST(COUNT(*) AS BIGINT) as row_count
-            FROM numbered
-            GROUP BY partition_id
-            ORDER BY partition_id
-            "#,
-            pk = pk_col,
-            n = num_partitions,
-            schema = table.schema,
-            table = table.name
-        );
-
-        let stream = client.simple_query(&query).await?;
-        let rows = stream.into_first_result().await?;
-
-        let mut partitions = Vec::new();
-        for row in rows {
-            // All values are now BIGINT
-            let partition_id = row.get::<i64, _>(0).unwrap_or(0) as i32;
-            let min_pk = row.get::<i64, _>(1);
-            let max_pk = row.get::<i64, _>(2);
-            let row_count = row.get::<i64, _>(3).unwrap_or(0);
-
-            let partition = Partition {
-                table_name: table.full_name(),
-                partition_id,
-                min_pk,
-                max_pk,
-                start_row: 0,
-                end_row: 0,
-                row_count,
-            };
-            partitions.push(partition);
-        }
-
-        debug!(
-            "Created {} partitions for {}",
-            partitions.len(),
-            table.full_name()
-        );
-        Ok(partitions)
-    }
-
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
         let mut client = self.get_client().await?;
 
-        // Use subquery approach for ordered string aggregation
         let query = r#"
             SELECT
                 i.name AS index_name,
@@ -754,9 +490,9 @@ impl SourcePool for MssqlPool {
               AND i.is_primary_key = 0
               AND i.type > 0
             ORDER BY i.name
-        "#.to_string();
+        "#;
 
-        let mut q = Query::new(&query);
+        let mut q = Query::new(query);
         q.bind(&table.schema);
         q.bind(&table.name);
 
@@ -797,7 +533,6 @@ impl SourcePool for MssqlPool {
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
         let mut client = self.get_client().await?;
 
-        // Use STUFF/FOR XML PATH for ordered string aggregation
         let query = r#"
             SELECT
                 fk.name AS fk_name,
@@ -828,9 +563,9 @@ impl SourcePool for MssqlPool {
             JOIN sys.schemas rs ON rt.schema_id = rs.schema_id
             WHERE ps.name = @P1 AND pt.name = @P2
             ORDER BY fk.name
-        "#.to_string();
+        "#;
 
-        let mut q = Query::new(&query);
+        let mut q = Query::new(query);
         q.bind(&table.schema);
         q.bind(&table.name);
 
@@ -907,11 +642,88 @@ impl SourcePool for MssqlPool {
         Ok(())
     }
 
+    fn read_table(&self, opts: ReadOptions) -> mpsc::Receiver<Result<Batch>> {
+        let (tx, rx) = mpsc::channel(16);
+        let pool = self.pool.clone();
+        let opts = opts.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = read_table_internal(pool, opts, tx.clone()).await {
+                let _ = tx.send(Err(e)).await;
+            }
+        });
+
+        rx
+    }
+
+    async fn get_partition_boundaries(
+        &self,
+        table: &Table,
+        num_partitions: usize,
+    ) -> Result<Vec<Partition>> {
+        if !table.has_single_pk() {
+            return Err(MigrateError::SchemaExtraction(
+                "Partitioning requires single-column PK".into(),
+            ));
+        }
+
+        let pk_col = &table.primary_key[0];
+        let mut client = self.get_client().await?;
+
+        let query = format!(
+            r#"
+            WITH numbered AS (
+                SELECT CAST([{pk}] AS BIGINT) AS pk_val,
+                       NTILE({n}) OVER (ORDER BY [{pk}]) as partition_id
+                FROM [{schema}].[{table}] WITH (NOLOCK)
+            )
+            SELECT CAST(partition_id AS BIGINT) AS partition_id,
+                   MIN(pk_val) as min_pk,
+                   MAX(pk_val) as max_pk,
+                   CAST(COUNT(*) AS BIGINT) as row_count
+            FROM numbered
+            GROUP BY partition_id
+            ORDER BY partition_id
+            "#,
+            pk = pk_col,
+            n = num_partitions,
+            schema = table.schema,
+            table = table.name
+        );
+
+        let stream = client.simple_query(&query).await?;
+        let rows = stream.into_first_result().await?;
+
+        let mut partitions = Vec::new();
+        for row in rows {
+            let partition_id = row.get::<i64, _>(0).unwrap_or(0) as i32;
+            let min_pk = row.get::<i64, _>(1);
+            let max_pk = row.get::<i64, _>(2);
+            let row_count = row.get::<i64, _>(3).unwrap_or(0);
+
+            let partition = Partition {
+                table_name: table.full_name(),
+                partition_id,
+                min_pk,
+                max_pk,
+                start_row: 0,
+                end_row: 0,
+                row_count,
+            };
+            partitions.push(partition);
+        }
+
+        debug!(
+            "Created {} partitions for {}",
+            partitions.len(),
+            table.full_name()
+        );
+        Ok(partitions)
+    }
+
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         let mut client = self.get_client().await?;
 
-        // CAST to BIGINT for consistent type handling
-        // Use NOLOCK to avoid blocking and improve performance
         let query = format!(
             "SELECT CAST(COUNT(*) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
             schema, table
@@ -920,7 +732,20 @@ impl SourcePool for MssqlPool {
         let stream = client.simple_query(&query).await?;
         let row = stream.into_row().await?;
 
-        // We CAST to BIGINT in the query, so get as i64 directly
+        Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
+    }
+
+    async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        let mut client = self.get_client().await?;
+
+        let query = format!(
+            "SELECT CAST(MAX([{}]) AS BIGINT) FROM [{}].[{}] WITH (NOLOCK)",
+            pk_col, schema, table
+        );
+
+        let stream = client.simple_query(&query).await?;
+        let row = stream.into_row().await?;
+
         Ok(row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0))
     }
 
@@ -929,192 +754,143 @@ impl SourcePool for MssqlPool {
     }
 
     async fn close(&self) {
-        // tiberius doesn't have explicit connection pooling,
-        // each client is a single connection that drops when done
+        // bb8 pool handles cleanup automatically
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        true
     }
 }
 
-impl MssqlPool {
-    /// Test the connection to the MSSQL database.
-    pub async fn test_connection(&self) -> Result<()> {
-        let mut client = self.get_client().await?;
-        client.simple_query("SELECT 1").await?.into_row().await?;
-        Ok(())
+/// Internal function to read table rows and send batches through channel.
+async fn read_table_internal(
+    pool: Pool<TiberiusConnectionManager>,
+    opts: ReadOptions,
+    tx: mpsc::Sender<Result<Batch>>,
+) -> Result<()> {
+    let mut client = pool
+        .get()
+        .await
+        .map_err(|e| MigrateError::pool(e, "getting connection for read_table"))?;
+
+    // Build SELECT query
+    let cols = opts
+        .columns
+        .iter()
+        .map(|c| format!("[{}]", c.replace(']', "]]")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut sql = format!(
+        "SELECT TOP {} {} FROM [{}].[{}] WITH (NOLOCK)",
+        opts.batch_size, cols, opts.schema, opts.table
+    );
+
+    let mut conditions = Vec::new();
+
+    if let (Some(pk_idx), Some(min_pk)) = (opts.pk_idx, opts.min_pk) {
+        let pk_col = &opts.columns[pk_idx];
+        conditions.push(format!("[{}] > {}", pk_col, min_pk));
     }
 
-    /// Execute a count query and return row_count.
-    ///
-    /// Used for Tier 1/2 quick verification.
-    pub async fn execute_count_query(&self, query: &str, min_pk: i64, max_pk: i64) -> Result<i64> {
-        let mut client = self.get_client().await?;
+    if let (Some(pk_idx), Some(max_pk)) = (opts.pk_idx, opts.max_pk) {
+        let pk_col = &opts.columns[pk_idx];
+        conditions.push(format!("[{}] <= {}", pk_col, max_pk));
+    }
 
-        let mut q = Query::new(query);
-        q.bind(min_pk);
-        q.bind(max_pk);
-
-        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
-
-        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
-            let row_count: i32 = row.get::<i32, _>(0).unwrap_or(0);
-            Ok(row_count as i64)
-        } else {
-            Ok(0)
+    if let Some(ref where_clause) = opts.where_clause {
+        if !where_clause.is_empty() {
+            conditions.push(format!("({})", where_clause));
         }
     }
 
-    /// Fetch row hashes for a PK range (Tier 3 verification).
-    ///
-    /// Returns a map of PK -> MD5 hash for comparison with target.
-    pub async fn fetch_row_hashes(
-        &self,
-        query: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<std::collections::HashMap<i64, String>> {
-        let mut client = self.get_client().await?;
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
 
-        let mut q = Query::new(query);
-        q.bind(min_pk);
-        q.bind(max_pk);
+    if let Some(pk_idx) = opts.pk_idx {
+        let pk_col = &opts.columns[pk_idx];
+        sql.push_str(&format!(" ORDER BY [{}]", pk_col));
+    }
 
-        let result = q.query(&mut client).await.map_err(MigrateError::Source)?;
-        let rows = result
-            .into_first_result()
-            .await
-            .map_err(MigrateError::Source)?;
+    // Execute query in batches using keyset pagination
+    let mut last_pk: Option<i64> = opts.min_pk;
 
-        let mut hashes = std::collections::HashMap::new();
-        for row in rows {
-            // Try i32 first (common case), then i64 for BIGINT columns
-            let pk: Option<i64> = row
-                .get::<i32, _>(0)
-                .map(|v| v as i64)
-                .or_else(|| row.get::<i64, _>(0));
-            let hash: Option<&str> = row.get(1);
-
-            if let (Some(pk), Some(hash)) = (pk, hash) {
-                hashes.insert(pk, hash.to_string());
+    loop {
+        let batch_sql = if let Some(lpk) = last_pk {
+            if let Some(pk_idx) = opts.pk_idx {
+                let pk_col = &opts.columns[pk_idx];
+                sql.replace(
+                    &format!("[{}] > {}", pk_col, opts.min_pk.unwrap_or(0)),
+                    &format!("[{}] > {}", pk_col, lpk),
+                )
+            } else {
+                sql.clone()
             }
-        }
-
-        Ok(hashes)
-    }
-
-    /// Get PK boundaries (min, max, count) for a table.
-    pub async fn get_pk_bounds(&self, query: &str) -> Result<(i64, i64, i64)> {
-        let mut client = self.get_client().await?;
-
-        let result = client
-            .simple_query(query)
-            .await
-            .map_err(MigrateError::Source)?;
-
-        if let Some(row) = result.into_row().await.map_err(MigrateError::Source)? {
-            // Try i64 first (query uses CAST AS BIGINT), fallback to i32 for compatibility
-            let min_pk: i64 = row
-                .get::<i64, _>(0)
-                .unwrap_or_else(|| row.get::<i32, _>(0).map(|v| v as i64).unwrap_or(0));
-            let max_pk: i64 = row
-                .get::<i64, _>(1)
-                .unwrap_or_else(|| row.get::<i32, _>(1).map(|v| v as i64).unwrap_or(0));
-            let row_count: i64 = row
-                .get::<i64, _>(2)
-                .unwrap_or_else(|| row.get::<i32, _>(2).map(|v| v as i64).unwrap_or(0));
-            Ok((min_pk, max_pk, row_count))
         } else {
-            Ok((0, 0, 0))
+            sql.clone()
+        };
+
+        let stream = client.simple_query(&batch_sql).await?;
+        let rows = stream.into_first_result().await?;
+
+        if rows.is_empty() {
+            // Send final empty batch to signal completion
+            let _ = tx.send(Ok(Batch::empty_final())).await;
+            break;
+        }
+
+        let mut batch_rows = Vec::with_capacity(rows.len());
+        let mut batch_last_pk: Option<i64> = None;
+
+        for row in rows {
+            let mut values = Vec::with_capacity(opts.col_types.len());
+            for (idx, data_type) in opts.col_types.iter().enumerate() {
+                let value = convert_row_value(&row, idx, data_type);
+
+                // Track last PK
+                if Some(idx) == opts.pk_idx {
+                    if let SqlValue::I32(v) = &value {
+                        batch_last_pk = Some(*v as i64);
+                    } else if let SqlValue::I64(v) = &value {
+                        batch_last_pk = Some(*v);
+                    }
+                }
+
+                values.push(value);
+            }
+            batch_rows.push(values);
+        }
+
+        last_pk = batch_last_pk;
+
+        let is_last = batch_rows.len() < opts.batch_size;
+        let mut batch = Batch::new(batch_rows);
+
+        if let Some(lpk) = batch_last_pk {
+            batch = batch.with_last_key(SqlValue::I64(lpk));
+        }
+        if is_last {
+            batch = batch.mark_final();
+        }
+
+        if tx.send(Ok(batch)).await.is_err() {
+            break; // Channel closed
+        }
+
+        if is_last {
+            break;
         }
     }
 
-    /// Fetch specific rows by primary key values for sync operations.
-    ///
-    /// Returns rows with all columns for the specified PKs.
-    pub async fn fetch_rows_by_pks(
-        &self,
-        table: &Table,
-        pk_column: &str,
-        pks: &[i64],
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        if pks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
-
-        // Build column list with proper quoting
-        let col_list = columns
-            .iter()
-            .map(|c| format!("[{}]", c.replace(']', "]]")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        // Build PK list for IN clause (batch to avoid query size limits)
-        let mut all_rows = Vec::new();
-
-        for chunk in pks.chunks(1000) {
-            let pk_list = chunk
-                .iter()
-                .map(|pk| pk.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let query = format!(
-                "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] IN ({}) ORDER BY [{}]",
-                col_list,
-                table.schema.replace(']', "]]"),
-                table.name.replace(']', "]]"),
-                pk_column.replace(']', "]]"),
-                pk_list,
-                pk_column.replace(']', "]]")
-            );
-
-            let rows = self.query_rows_fast(&query, &columns, &col_types).await?;
-            all_rows.extend(rows);
-        }
-
-        Ok(all_rows)
-    }
-
-    /// Fetch rows for a PK range (for Rust-side hashing).
-    ///
-    /// Returns rows with all columns for the specified PK range, ordered by PK.
-    /// Used by verify module to compute hashes in Rust instead of SQL.
-    pub async fn fetch_rows_for_range(
-        &self,
-        table: &Table,
-        pk_column: &str,
-        min_pk: i64,
-        max_pk: i64,
-    ) -> Result<Vec<Vec<SqlValue>>> {
-        let columns: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-        let col_types: Vec<String> = table.columns.iter().map(|c| c.data_type.clone()).collect();
-
-        // Build column list with proper quoting
-        let col_list = columns
-            .iter()
-            .map(|c| format!("[{}]", c.replace(']', "]]")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let query = format!(
-            "SELECT {} FROM [{}].[{}] WITH (NOLOCK) WHERE [{}] >= {} AND [{}] < {} ORDER BY [{}]",
-            col_list,
-            table.schema.replace(']', "]]"),
-            table.name.replace(']', "]]"),
-            pk_column.replace(']', "]]"),
-            min_pk,
-            pk_column.replace(']', "]]"),
-            max_pk,
-            pk_column.replace(']', "]]")
-        );
-
-        self.query_rows_fast(&query, &columns, &col_types).await
-    }
+    Ok(())
 }
 
 /// Convert a row value to SqlValue based on the column type.
-fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
+fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue<'static> {
+    use std::borrow::Cow;
+
     let dt = data_type.to_lowercase();
 
     match dt.as_str() {
@@ -1154,41 +930,91 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue {
             .get::<NaiveDateTime, _>(idx)
             .map(SqlValue::DateTime)
             .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
-        "date" => {
-            // Tiberius returns date as NaiveDateTime, extract just the date part
-            row.get::<NaiveDateTime, _>(idx)
-                .map(|dt| SqlValue::Date(dt.date()))
-                .unwrap_or(SqlValue::Null(SqlNullType::Date))
-        }
-        "time" => {
-            // Tiberius returns time as NaiveDateTime, extract just the time part
-            row.get::<NaiveDateTime, _>(idx)
-                .map(|dt| SqlValue::Time(dt.time()))
-                .unwrap_or(SqlValue::Null(SqlNullType::Time))
-        }
+        "date" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(|dt| SqlValue::Date(dt.date()))
+            .unwrap_or(SqlValue::Null(SqlNullType::Date)),
+        "time" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(|dt| SqlValue::Time(dt.time()))
+            .unwrap_or(SqlValue::Null(SqlNullType::Time)),
         "binary" | "varbinary" | "image" => row
             .get::<&[u8], _>(idx)
-            .map(|v| SqlValue::Bytes(v.to_vec()))
+            .map(|v| SqlValue::Bytes(Cow::Owned(v.to_vec())))
             .unwrap_or(SqlValue::Null(SqlNullType::Bytes)),
-        "decimal" | "numeric" | "money" | "smallmoney" => {
-            // Use rust_decimal directly with tiberius's rust_decimal feature
-            row.get::<rust_decimal::Decimal, _>(idx)
-                .map(SqlValue::Decimal)
-                .or_else(|| {
-                    // Fallback: try as f64 for money/smallmoney
-                    row.get::<f64, _>(idx).map(|f| {
-                        rust_decimal::Decimal::try_from(f)
-                            .map(SqlValue::Decimal)
-                            .unwrap_or(SqlValue::F64(f))
-                    })
+        "decimal" | "numeric" | "money" | "smallmoney" => row
+            .get::<rust_decimal::Decimal, _>(idx)
+            .map(SqlValue::Decimal)
+            .or_else(|| {
+                row.get::<f64, _>(idx).map(|f| {
+                    rust_decimal::Decimal::try_from(f)
+                        .map(SqlValue::Decimal)
+                        .unwrap_or(SqlValue::F64(f))
                 })
-                .unwrap_or(SqlValue::Null(SqlNullType::Decimal))
-        }
+            })
+            .unwrap_or(SqlValue::Null(SqlNullType::Decimal)),
         _ => {
-            // Default: treat as string (covers varchar, nvarchar, char, nchar, text, ntext, xml, etc.)
+            // Default: treat as string
             row.get::<&str, _>(idx)
-                .map(|s| SqlValue::String(s.to_string()))
+                .map(|s| SqlValue::Text(Cow::Owned(s.to_string())))
                 .unwrap_or(SqlValue::Null(SqlNullType::String))
         }
+    }
+}
+
+/// Estimate column size for row size estimation.
+fn estimate_column_size(col: &Column) -> i64 {
+    match col.data_type.as_str() {
+        "int" => 4,
+        "bigint" => 8,
+        "smallint" => 2,
+        "tinyint" => 1,
+        "bit" => 1,
+        "float" => 8,
+        "real" => 4,
+        "datetime" | "datetime2" => 8,
+        "date" => 3,
+        "time" => 5,
+        "uniqueidentifier" => 16,
+        "varchar" | "nvarchar" | "char" | "nchar" => {
+            if col.max_length == -1 {
+                100
+            } else {
+                col.max_length.min(100) as i64
+            }
+        }
+        _ => 8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimate_column_size() {
+        let col = Column {
+            name: "id".to_string(),
+            data_type: "int".to_string(),
+            max_length: 0,
+            precision: 10,
+            scale: 0,
+            is_nullable: false,
+            is_identity: true,
+            ordinal_pos: 1,
+        };
+        assert_eq!(estimate_column_size(&col), 4);
+
+        let col = Column {
+            name: "name".to_string(),
+            data_type: "varchar".to_string(),
+            max_length: 255,
+            precision: 0,
+            scale: 0,
+            is_nullable: true,
+            is_identity: false,
+            ordinal_pos: 2,
+        };
+        assert_eq!(estimate_column_size(&col), 100);
     }
 }
