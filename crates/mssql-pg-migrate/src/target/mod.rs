@@ -2682,7 +2682,7 @@ fn build_staging_merge_sql(
     } else {
         // High-performance upsert with change detection.
         // Using IS DISTINCT FROM prevents PostgreSQL from creating new dead tuples
-        // when data hasnt actually changed. This significantly reduces table bloat,
+        // when data hasn't actually changed. This significantly reduces table bloat,
         // index maintenance overhead, and WAL traffic.
         let change_detection: Vec<String> = cols
             .iter()

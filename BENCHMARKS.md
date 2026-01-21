@@ -126,9 +126,9 @@ See [PERFORMANCE.md](PERFORMANCE.md) for tuning recommendations.
 
 **Date:** 2026-01-03
 **Configuration:**
-- Workers: 6
-- Parallel Readers: 8
-- Parallel Writers: 8
+- Workers: 12
+- Parallel Readers: 16
+- Parallel Writers: 16
 - Chunk Size: 50,000
 - Change Detection: IS DISTINCT FROM (optimized)
 - Persistent Upsert Writer: Enabled (reusing connection & staging table)

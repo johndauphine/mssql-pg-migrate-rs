@@ -530,7 +530,7 @@ impl MigrationConfig {
         let workers = self.workers.unwrap();
 
         // Parallel readers: conservative scaling based on cores.
-        // Formula: cores/4 clamped to 2-4 for optimal throughput without overwhelming source.
+        // Formula: cores/4 clamped to 2-16 for optimal throughput without overwhelming source.
         if self.parallel_readers.is_none() {
             let readers = (cores / 4).clamp(2, 16);
             self.parallel_readers = Some(readers);

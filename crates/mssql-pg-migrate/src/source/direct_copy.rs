@@ -427,8 +427,6 @@ fn write_binary_numeric(buf: &mut BytesMut, d: &Decimal) {
     // For a decimal with `scale` fractional digits:
     // - Total decimal digits in mantissa = ceil(log10(mantissa))
     // - Integer digits = total digits - scale
-    let total_digits = digits.len() as i32 * 4; // Upper bound in decimal digits
-    let int_digits = total_digits - scale as i32;
     let weight = (digits.len() as i32) - 1 - ((scale as i32 + 3) / 4);
 
     // Trim trailing zeros from digits (PostgreSQL convention)
