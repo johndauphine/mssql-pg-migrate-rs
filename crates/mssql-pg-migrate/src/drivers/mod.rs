@@ -40,9 +40,9 @@ pub use common::{SslMode, TlsBuilder};
 
 // Re-export driver types
 pub use mssql::{MssqlDialect, MssqlReader, MssqlWriter};
-pub use postgres::{PostgresDialect, PostgresReader, PostgresWriter};
 #[cfg(feature = "mysql")]
 pub use mysql::{MysqlDialect, MysqlReader, MysqlWriter};
+pub use postgres::{PostgresDialect, PostgresReader, PostgresWriter};
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -256,7 +256,9 @@ impl SourceReader for SourceReaderImpl {
     ) -> Result<Vec<Partition>> {
         match self {
             SourceReaderImpl::Mssql(r) => r.get_partition_boundaries(table, num_partitions).await,
-            SourceReaderImpl::Postgres(r) => r.get_partition_boundaries(table, num_partitions).await,
+            SourceReaderImpl::Postgres(r) => {
+                r.get_partition_boundaries(table, num_partitions).await
+            }
             #[cfg(feature = "mysql")]
             SourceReaderImpl::Mysql(r) => r.get_partition_boundaries(table, num_partitions).await,
         }
@@ -452,7 +454,9 @@ impl TargetWriter for TargetWriterImpl {
         target_schema: &str,
     ) -> Result<()> {
         match self {
-            TargetWriterImpl::Mssql(w) => w.create_check_constraint(table, chk, target_schema).await,
+            TargetWriterImpl::Mssql(w) => {
+                w.create_check_constraint(table, chk, target_schema).await
+            }
             TargetWriterImpl::Postgres(w) => {
                 w.create_check_constraint(table, chk, target_schema).await
             }

@@ -18,9 +18,9 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
 
-use crate::config::TargetConfig;
 #[cfg(feature = "kerberos")]
 use crate::config::AuthMethod as ConfigAuthMethod;
+use crate::config::TargetConfig;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
@@ -357,7 +357,12 @@ impl TargetWriter for MssqlWriter {
             .map(|c| {
                 let target_type = self.map_type(c);
                 let null_clause = if c.is_nullable { "NULL" } else { "NOT NULL" };
-                format!("{} {} {}", Self::quote_ident(&c.name), target_type, null_clause)
+                format!(
+                    "{} {} {}",
+                    Self::quote_ident(&c.name),
+                    target_type,
+                    null_clause
+                )
             })
             .collect();
 
@@ -445,7 +450,10 @@ impl TargetWriter for MssqlWriter {
             .query(check_query, &[&pk_name, &target_schema, &table.name])
             .await?;
         if !result.into_first_result().await?.is_empty() {
-            debug!("Primary key already exists on {}.{}", target_schema, table.name);
+            debug!(
+                "Primary key already exists on {}.{}",
+                target_schema, table.name
+            );
             return Ok(());
         }
 
@@ -473,7 +481,11 @@ impl TargetWriter for MssqlWriter {
         let idx_cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
 
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
-        let clustered = if idx.is_clustered { "CLUSTERED " } else { "NONCLUSTERED " };
+        let clustered = if idx.is_clustered {
+            "CLUSTERED "
+        } else {
+            "NONCLUSTERED "
+        };
 
         let query = format!(
             "CREATE {}{}INDEX {} ON {}.{} ({})",
@@ -486,7 +498,10 @@ impl TargetWriter for MssqlWriter {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created index {} on {}.{}", idx.name, target_schema, table.name);
+        debug!(
+            "Created index {} on {}.{}",
+            idx.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -516,7 +531,12 @@ impl TargetWriter for MssqlWriter {
             }
         }
 
-        debug!("Dropped {} indexes on {}.{}", dropped_indexes.len(), schema, table);
+        debug!(
+            "Dropped {} indexes on {}.{}",
+            dropped_indexes.len(),
+            schema,
+            table
+        );
         Ok(dropped_indexes)
     }
 
@@ -528,7 +548,11 @@ impl TargetWriter for MssqlWriter {
     ) -> Result<()> {
         let mut conn = self.get_conn().await?;
         let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
-        let ref_cols: Vec<String> = fk.ref_columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let ref_cols: Vec<String> = fk
+            .ref_columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
 
         let query = format!(
             "ALTER TABLE {}.{} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({}) ON DELETE {} ON UPDATE {}",
@@ -544,7 +568,10 @@ impl TargetWriter for MssqlWriter {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created foreign key {} on {}.{}", fk.name, target_schema, table.name);
+        debug!(
+            "Created foreign key {} on {}.{}",
+            fk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -565,7 +592,10 @@ impl TargetWriter for MssqlWriter {
         );
 
         conn.execute(&query, &[]).await?;
-        debug!("Created check constraint {} on {}.{}", chk.name, target_schema, table.name);
+        debug!(
+            "Created check constraint {} on {}.{}",
+            chk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -669,8 +699,12 @@ impl TargetWriter for MssqlWriter {
 
         // Fallback for oversized strings
         if !oversized_rows.is_empty() {
-            debug!("Falling back to INSERT for {} rows with oversized strings", oversized_rows.len());
-            total_inserted += insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows).await?;
+            debug!(
+                "Falling back to INSERT for {} rows with oversized strings",
+                oversized_rows.len()
+            );
+            total_inserted +=
+                insert_rows_fallback(&mut conn, &qualified_table, cols, &oversized_rows).await?;
         }
 
         Ok(total_inserted)
@@ -701,7 +735,8 @@ impl TargetWriter for MssqlWriter {
         let mut conn = self.get_conn().await?;
 
         // Create/reuse staging table
-        let staging_table = ensure_staging_table(&mut conn, schema, table, writer_id, partition_id).await?;
+        let staging_table =
+            ensure_staging_table(&mut conn, schema, table, writer_id, partition_id).await?;
 
         // Bulk insert to staging
         bulk_insert_to_staging(&mut conn, &staging_table, cols, &rows).await?;
@@ -733,12 +768,20 @@ impl TargetWriter for MssqlWriter {
                 Err(e) => {
                     if Self::is_deadlock_error(&e) && retries < DEADLOCK_MAX_RETRIES {
                         retries += 1;
-                        warn!("Deadlock detected during MERGE to {}, retry {}/{}",
-                              qualified_target, retries, DEADLOCK_MAX_RETRIES);
-                        tokio::time::sleep(Duration::from_millis(DEADLOCK_RETRY_DELAY_MS * retries as u64)).await;
+                        warn!(
+                            "Deadlock detected during MERGE to {}, retry {}/{}",
+                            qualified_target, retries, DEADLOCK_MAX_RETRIES
+                        );
+                        tokio::time::sleep(Duration::from_millis(
+                            DEADLOCK_RETRY_DELAY_MS * retries as u64,
+                        ))
+                        .await;
                         continue;
                     }
-                    return Err(MigrateError::transfer(&qualified_target, format!("merge failed: {}", e)));
+                    return Err(MigrateError::transfer(
+                        &qualified_target,
+                        format!("merge failed: {}", e),
+                    ));
                 }
             }
         }
@@ -825,7 +868,11 @@ async fn ensure_staging_table(
         })
         .collect();
 
-    let create_sql = format!("CREATE TABLE {} ({})", qualified_staging, col_defs.join(", "));
+    let create_sql = format!(
+        "CREATE TABLE {} ({})",
+        qualified_staging,
+        col_defs.join(", ")
+    );
     conn.execute(&create_sql, &[]).await?;
 
     Ok(qualified_staging)
@@ -841,9 +888,10 @@ async fn bulk_insert_to_staging(
         return Ok(());
     }
 
-    let mut bulk_load = conn.bulk_insert(staging_table).await.map_err(|e| {
-        MigrateError::transfer(staging_table, format!("bulk insert init: {}", e))
-    })?;
+    let mut bulk_load = conn
+        .bulk_insert(staging_table)
+        .await
+        .map_err(|e| MigrateError::transfer(staging_table, format!("bulk insert init: {}", e)))?;
 
     for row in rows {
         let mut token_row = TokenRow::new();
@@ -895,7 +943,10 @@ async fn insert_rows_fallback(
     let cols_per_row = cols.len();
 
     if cols_per_row == 0 {
-        return Err(MigrateError::transfer(qualified_table, "Cannot insert with zero columns"));
+        return Err(MigrateError::transfer(
+            qualified_table,
+            "Cannot insert with zero columns",
+        ));
     }
 
     let max_rows_per_batch = (2100 / cols_per_row).clamp(1, 1000);
@@ -947,32 +998,62 @@ fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i3
             data_type.to_string()
         }
         "float" => {
-            if precision > 0 { format!("float({})", precision) } else { "float".to_string() }
+            if precision > 0 {
+                format!("float({})", precision)
+            } else {
+                "float".to_string()
+            }
         }
         "decimal" | "numeric" => {
-            if precision > 0 { format!("{}({}, {})", data_type, precision, scale) }
-            else { format!("{}(18, 0)", data_type) }
+            if precision > 0 {
+                format!("{}({}, {})", data_type, precision, scale)
+            } else {
+                format!("{}(18, 0)", data_type)
+            }
         }
         "datetime2" => {
-            if scale > 0 { format!("datetime2({})", scale) } else { "datetime2".to_string() }
+            if scale > 0 {
+                format!("datetime2({})", scale)
+            } else {
+                "datetime2".to_string()
+            }
         }
         "time" => {
-            if scale > 0 { format!("time({})", scale) } else { "time".to_string() }
+            if scale > 0 {
+                format!("time({})", scale)
+            } else {
+                "time".to_string()
+            }
         }
         "datetimeoffset" => {
-            if scale > 0 { format!("datetimeoffset({})", scale) } else { "datetimeoffset".to_string() }
+            if scale > 0 {
+                format!("datetimeoffset({})", scale)
+            } else {
+                "datetimeoffset".to_string()
+            }
         }
         "char" | "varchar" | "nchar" | "nvarchar" => {
-            if max_length == -1 { format!("{}(max)", data_type) }
-            else if max_length > 0 {
-                let len = if lower.starts_with('n') && max_length > 0 { max_length / 2 } else { max_length };
+            if max_length == -1 {
+                format!("{}(max)", data_type)
+            } else if max_length > 0 {
+                let len = if lower.starts_with('n') && max_length > 0 {
+                    max_length / 2
+                } else {
+                    max_length
+                };
                 format!("{}({})", data_type, len)
-            } else { format!("{}(255)", data_type) }
+            } else {
+                format!("{}(255)", data_type)
+            }
         }
         "binary" | "varbinary" => {
-            if max_length == -1 { format!("{}(max)", data_type) }
-            else if max_length > 0 { format!("{}({})", data_type, max_length) }
-            else { format!("{}(255)", data_type) }
+            if max_length == -1 {
+                format!("{}(max)", data_type)
+            } else if max_length > 0 {
+                format!("{}({})", data_type, max_length)
+            } else {
+                format!("{}(255)", data_type)
+            }
         }
         _ => data_type.to_string(),
     }
@@ -1021,12 +1102,18 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
         SqlValue::I32(i) => ColumnData::I32(Some(*i)),
         SqlValue::I64(i) => ColumnData::I64(Some(*i)),
         SqlValue::F32(f) => {
-            if f.is_nan() || f.is_infinite() { ColumnData::F32(None) }
-            else { ColumnData::F32(Some(*f)) }
+            if f.is_nan() || f.is_infinite() {
+                ColumnData::F32(None)
+            } else {
+                ColumnData::F32(Some(*f))
+            }
         }
         SqlValue::F64(f) => {
-            if f.is_nan() || f.is_infinite() { ColumnData::F64(None) }
-            else { ColumnData::F64(Some(*f)) }
+            if f.is_nan() || f.is_infinite() {
+                ColumnData::F64(None)
+            } else {
+                ColumnData::F64(Some(*f))
+            }
         }
         SqlValue::Text(s) => ColumnData::String(Some(Cow::Owned(s.to_string()))),
         SqlValue::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.to_vec()))),
@@ -1034,7 +1121,9 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
         SqlValue::Decimal(d) => {
             let scale = d.scale() as u8;
             let mantissa = d.mantissa();
-            ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(mantissa, scale)))
+            ColumnData::Numeric(Some(tiberius::numeric::Numeric::new_with_scale(
+                mantissa, scale,
+            )))
         }
         SqlValue::DateTime(dt) => {
             let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
@@ -1068,7 +1157,10 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
             let datetime2 = tiberius::time::DateTime2::new(date, time);
             let offset_seconds = dto.offset().local_minus_utc();
             let offset_minutes = (offset_seconds / 60) as i16;
-            ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(datetime2, offset_minutes)))
+            ColumnData::DateTimeOffset(Some(tiberius::time::DateTimeOffset::new(
+                datetime2,
+                offset_minutes,
+            )))
         }
         SqlValue::Date(d) => {
             let epoch = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
@@ -1082,7 +1174,8 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
             ColumnData::DateTime2(Some(tiberius::time::DateTime2::new(date, time)))
         }
         SqlValue::Time(t) => {
-            let nanos = t.num_seconds_from_midnight() as u64 * 1_000_000_000 + t.nanosecond() as u64;
+            let nanos =
+                t.num_seconds_from_midnight() as u64 * 1_000_000_000 + t.nanosecond() as u64;
             let increments = nanos / 100;
             ColumnData::Time(Some(tiberius::time::Time::new(increments, 7)))
         }

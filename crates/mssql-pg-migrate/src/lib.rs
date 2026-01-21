@@ -20,9 +20,11 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let config = Config::load("config.yaml")?;
-//!     let orchestrator = Orchestrator::new(config).await?;
+//!     let mut orchestrator = Orchestrator::new(config).await?;
 //!     let cancel = CancellationToken::new();
 //!     let result = orchestrator.run(cancel, false).await?;
+//!     // Always close connections when done
+//!     orchestrator.close().await;
 //!     println!("Migrated {} rows", result.rows_transferred);
 //!     Ok(())
 //! }

@@ -70,15 +70,15 @@ pub fn map_type(
         }
         // MySQL mappings - use the dialect/typemap.rs implementations for actual mapping
         // For now, provide basic identity mapping - full mappers are in dialect/typemap.rs
-        (DatabaseType::Mysql, DatabaseType::Postgres) => {
-            TypeMapping::lossless(mysql_to_postgres_basic(data_type, max_length, precision, scale))
-        }
+        (DatabaseType::Mysql, DatabaseType::Postgres) => TypeMapping::lossless(
+            mysql_to_postgres_basic(data_type, max_length, precision, scale),
+        ),
         (DatabaseType::Postgres, DatabaseType::Mysql) => {
             postgres_to_mysql_basic(data_type, max_length, precision, scale)
         }
-        (DatabaseType::Mysql, DatabaseType::Mssql) => {
-            TypeMapping::lossless(mysql_to_mssql_basic(data_type, max_length, precision, scale))
-        }
+        (DatabaseType::Mysql, DatabaseType::Mssql) => TypeMapping::lossless(mysql_to_mssql_basic(
+            data_type, max_length, precision, scale,
+        )),
         (DatabaseType::Mssql, DatabaseType::Mysql) => {
             mssql_to_mysql_basic(data_type, max_length, precision, scale)
         }
@@ -155,7 +155,12 @@ pub fn mssql_to_postgres(mssql_type: &str, max_length: i32, precision: i32, scal
 }
 
 /// Basic MySQL to PostgreSQL type mapping.
-fn mysql_to_postgres_basic(mysql_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+fn mysql_to_postgres_basic(
+    mysql_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> String {
     match mysql_type.to_lowercase().as_str() {
         "tinyint" => "smallint".to_string(),
         "smallint" => "smallint".to_string(),
@@ -243,10 +248,7 @@ fn postgres_to_mysql_basic(
         "timestamptz" | "timestamp with time zone" => TypeMapping::lossless("datetime"),
         "json" | "jsonb" => TypeMapping::lossless("json"),
         "uuid" => TypeMapping::lossy("char(36)", "UUID stored as char(36)."),
-        "interval" => TypeMapping::lossy(
-            "varchar(100)",
-            "PostgreSQL interval stored as string.",
-        ),
+        "interval" => TypeMapping::lossy("varchar(100)", "PostgreSQL interval stored as string."),
         _ => TypeMapping::lossy(
             "longtext",
             format!("Unknown PostgreSQL type '{}' stored as text.", pg_type),

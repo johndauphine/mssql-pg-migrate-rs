@@ -8,16 +8,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
+use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::config::SourceConfig;
 #[cfg(feature = "kerberos")]
 use crate::config::AuthMethod as ConfigAuthMethod;
+use crate::config::SourceConfig;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition, Table};
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
@@ -445,11 +445,7 @@ impl SourceReader for MssqlReader {
             self.load_row_count(&mut client, &mut table).await?;
 
             // Estimate row size
-            table.estimated_row_size = table
-                .columns
-                .iter()
-                .map(|c| estimate_column_size(c))
-                .sum();
+            table.estimated_row_size = table.columns.iter().map(|c| estimate_column_size(c)).sum();
 
             tables.push(table);
         }

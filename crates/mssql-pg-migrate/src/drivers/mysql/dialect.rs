@@ -115,13 +115,7 @@ impl Dialect for MysqlDialect {
 
         let update_set = non_pk_cols
             .iter()
-            .map(|c| {
-                format!(
-                    "{} = VALUES({})",
-                    self.quote_ident(c),
-                    self.quote_ident(c)
-                )
-            })
+            .map(|c| format!("{} = VALUES({})", self.quote_ident(c), self.quote_ident(c)))
             .collect::<Vec<_>>()
             .join(", ");
 

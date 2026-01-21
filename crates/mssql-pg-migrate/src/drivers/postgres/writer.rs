@@ -156,7 +156,12 @@ impl PostgresWriter {
             .map(|c| {
                 let target_type = self.map_type(c);
                 let null_clause = if c.is_nullable { "" } else { " NOT NULL" };
-                format!("{} {}{}", Self::quote_ident(&c.name), target_type, null_clause)
+                format!(
+                    "{} {}{}",
+                    Self::quote_ident(&c.name),
+                    target_type,
+                    null_clause
+                )
             })
             .collect();
 
@@ -222,7 +227,10 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", Self::qualify_table(schema, table));
+        let sql = format!(
+            "DROP TABLE IF EXISTS {} CASCADE",
+            Self::qualify_table(schema, table)
+        );
         client.execute(&sql, &[]).await?;
 
         debug!("Dropped table {}.{}", schema, table);
@@ -272,7 +280,11 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let pk_cols: Vec<String> = table.primary_key.iter().map(|c| Self::quote_ident(c)).collect();
+        let pk_cols: Vec<String> = table
+            .primary_key
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
         let pk_name = format!("pk_{}_{}", target_schema, table.name);
 
         let sql = format!(
@@ -306,7 +318,10 @@ impl TargetWriter for PostgresWriter {
         );
 
         client.execute(&sql, &[]).await?;
-        debug!("Created index {} on {}.{}", idx.name, target_schema, table.name);
+        debug!(
+            "Created index {} on {}.{}",
+            idx.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -331,12 +346,21 @@ impl TargetWriter for PostgresWriter {
 
         for row in rows {
             let name: String = row.get(0);
-            let drop_sql = format!("DROP INDEX IF EXISTS {}.{}", Self::quote_ident(schema), Self::quote_ident(&name));
+            let drop_sql = format!(
+                "DROP INDEX IF EXISTS {}.{}",
+                Self::quote_ident(schema),
+                Self::quote_ident(&name)
+            );
             client.execute(&drop_sql, &[]).await?;
             dropped_indexes.push(name);
         }
 
-        debug!("Dropped {} indexes on {}.{}", dropped_indexes.len(), schema, table);
+        debug!(
+            "Dropped {} indexes on {}.{}",
+            dropped_indexes.len(),
+            schema,
+            table
+        );
         Ok(dropped_indexes)
     }
 
@@ -353,7 +377,11 @@ impl TargetWriter for PostgresWriter {
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
-        let ref_cols: Vec<String> = fk.ref_columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let ref_cols: Vec<String> = fk
+            .ref_columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect();
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({}) ON DELETE {} ON UPDATE {}",
@@ -368,7 +396,10 @@ impl TargetWriter for PostgresWriter {
         );
 
         client.execute(&sql, &[]).await?;
-        debug!("Created foreign key {} on {}.{}", fk.name, target_schema, table.name);
+        debug!(
+            "Created foreign key {} on {}.{}",
+            fk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -392,7 +423,10 @@ impl TargetWriter for PostgresWriter {
         );
 
         client.execute(&sql, &[]).await?;
-        debug!("Created check constraint {} on {}.{}", chk.name, target_schema, table.name);
+        debug!(
+            "Created check constraint {} on {}.{}",
+            chk.name, target_schema, table.name
+        );
         Ok(())
     }
 
@@ -423,7 +457,10 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let sql = format!("SELECT COUNT(*)::int8 FROM {}", Self::qualify_table(schema, table));
+        let sql = format!(
+            "SELECT COUNT(*)::int8 FROM {}",
+            Self::qualify_table(schema, table)
+        );
         let row = client.query_one(&sql, &[]).await?;
         Ok(row.get::<_, i64>(0))
     }
@@ -471,7 +508,10 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let sql = format!("ALTER TABLE {} SET LOGGED", Self::qualify_table(schema, table));
+        let sql = format!(
+            "ALTER TABLE {} SET LOGGED",
+            Self::qualify_table(schema, table)
+        );
         client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to LOGGED", schema, table);
@@ -485,7 +525,10 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let sql = format!("ALTER TABLE {} SET UNLOGGED", Self::qualify_table(schema, table));
+        let sql = format!(
+            "ALTER TABLE {} SET UNLOGGED",
+            Self::qualify_table(schema, table)
+        );
         client.execute(&sql, &[]).await?;
 
         debug!("Set table {}.{} to UNLOGGED", schema, table);
@@ -522,9 +565,10 @@ impl TargetWriter for PostgresWriter {
         );
 
         // Get sink for binary COPY
-        let sink = client.copy_in(&copy_sql).await.map_err(|e| {
-            MigrateError::transfer(&qualified_table, format!("COPY init: {}", e))
-        })?;
+        let sink = client
+            .copy_in(&copy_sql)
+            .await
+            .map_err(|e| MigrateError::transfer(&qualified_table, format!("COPY init: {}", e)))?;
 
         // Build binary data
         let mut buf = BytesMut::with_capacity(rows.len() * 256);
@@ -552,13 +596,13 @@ impl TargetWriter for PostgresWriter {
         tokio::pin!(sink);
 
         use futures::SinkExt;
-        sink.send(data).await.map_err(|e| {
-            MigrateError::transfer(&qualified_table, format!("COPY send: {}", e))
-        })?;
+        sink.send(data)
+            .await
+            .map_err(|e| MigrateError::transfer(&qualified_table, format!("COPY send: {}", e)))?;
 
-        sink.finish().await.map_err(|e| {
-            MigrateError::transfer(&qualified_table, format!("COPY finish: {}", e))
-        })?;
+        sink.finish()
+            .await
+            .map_err(|e| MigrateError::transfer(&qualified_table, format!("COPY finish: {}", e)))?;
 
         Ok(row_count)
     }
@@ -641,7 +685,13 @@ impl TargetWriter for PostgresWriter {
         let update_cols: Vec<String> = cols
             .iter()
             .filter(|c| !pk_cols.contains(c))
-            .map(|c| format!("{} = EXCLUDED.{}", Self::quote_ident(c), Self::quote_ident(c)))
+            .map(|c| {
+                format!(
+                    "{} = EXCLUDED.{}",
+                    Self::quote_ident(c),
+                    Self::quote_ident(c)
+                )
+            })
             .collect();
 
         let upsert_sql = if update_cols.is_empty() {
@@ -668,7 +718,12 @@ impl TargetWriter for PostgresWriter {
         client.execute(&upsert_sql, &[]).await?;
 
         // Drop staging
-        client.execute(&format!("DROP TABLE IF EXISTS {}", Self::quote_ident(&staging_name)), &[]).await?;
+        client
+            .execute(
+                &format!("DROP TABLE IF EXISTS {}", Self::quote_ident(&staging_name)),
+                &[],
+            )
+            .await?;
 
         Ok(row_count)
     }
@@ -764,8 +819,8 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue<'_>) {
         }
         SqlValue::Time(t) => {
             // Microseconds since midnight
-            let micros = t.num_seconds_from_midnight() as i64 * 1_000_000
-                + (t.nanosecond() / 1000) as i64;
+            let micros =
+                t.num_seconds_from_midnight() as i64 * 1_000_000 + (t.nanosecond() / 1000) as i64;
             buf.put_i32(8);
             buf.put_i64(micros);
         }
@@ -854,7 +909,8 @@ fn convert_check_definition(def: &str) -> String {
     while let Some(start) = result.find('[') {
         if let Some(end) = result[start..].find(']') {
             let col_name = &result[start + 1..start + end];
-            result = format!("{}\"{}\"{}",
+            result = format!(
+                "{}\"{}\"{}",
                 &result[..start],
                 col_name,
                 &result[start + end + 1..]

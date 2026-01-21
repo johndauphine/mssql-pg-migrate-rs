@@ -730,10 +730,9 @@ fn postgres_to_mysql(pg_type: &str, max_length: i32, precision: i32, scale: i32)
         // Date/time types
         "date" => TypeMapping::lossless("DATE"),
         "time" | "time without time zone" => TypeMapping::lossless("TIME"),
-        "timetz" | "time with time zone" => TypeMapping::lossy(
-            "TIME",
-            "time with time zone loses timezone info in MySQL.",
-        ),
+        "timetz" | "time with time zone" => {
+            TypeMapping::lossy("TIME", "time with time zone loses timezone info in MySQL.")
+        }
         "timestamp" | "timestamp without time zone" => TypeMapping::lossless("DATETIME"),
         "timestamptz" | "timestamp with time zone" => TypeMapping::lossy(
             "DATETIME",
@@ -841,7 +840,10 @@ fn mysql_to_mssql(mysql_type: &str, max_length: i32, precision: i32, scale: i32)
             } else if precision > 38 {
                 TypeMapping::lossy(
                     format!("decimal(38,{})", scale.min(38)),
-                    format!("Precision {} exceeds MSSQL max of 38. Truncated.", precision),
+                    format!(
+                        "Precision {} exceeds MSSQL max of 38. Truncated.",
+                        precision
+                    ),
                 )
             } else {
                 TypeMapping::lossless("decimal(18,0)")
@@ -934,7 +936,12 @@ fn mysql_to_mssql(mysql_type: &str, max_length: i32, precision: i32, scale: i32)
 /// Map MSSQL type to MySQL type.
 ///
 /// This is a public helper function for type mapping.
-pub fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
+pub fn mssql_to_mysql(
+    mssql_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> TypeMapping {
     let mssql_lower = mssql_type.to_lowercase();
 
     match mssql_lower.as_str() {
@@ -954,7 +961,10 @@ pub fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: 
             } else if precision > 65 {
                 TypeMapping::lossy(
                     format!("DECIMAL(65,{})", scale.min(30)),
-                    format!("Precision {} exceeds MySQL max of 65. Truncated.", precision),
+                    format!(
+                        "Precision {} exceeds MySQL max of 65. Truncated.",
+                        precision
+                    ),
                 )
             } else {
                 TypeMapping::lossless("DECIMAL(10,0)")
@@ -1035,7 +1045,12 @@ pub fn mssql_to_mysql(mssql_type: &str, max_length: i32, precision: i32, scale: 
 /// Map MSSQL type to MySQL type (returns just the target type string).
 ///
 /// Convenience function that returns just the target type without the full TypeMapping.
-pub fn mssql_to_mysql_basic(mssql_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
+pub fn mssql_to_mysql_basic(
+    mssql_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> String {
     mssql_to_mysql(mssql_type, max_length, precision, scale).target_type
 }
 

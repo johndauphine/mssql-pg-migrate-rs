@@ -84,9 +84,7 @@ impl PostgresReader {
 
         let config = match ssl_mode {
             "require" => {
-                warn!(
-                    "ssl_mode=require: TLS enabled but server certificate is not verified."
-                );
+                warn!("ssl_mode=require: TLS enabled but server certificate is not verified.");
                 ClientConfig::builder()
                     .dangerous()
                     .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -157,7 +155,11 @@ impl PostgresReader {
             table.columns.push(col);
         }
 
-        debug!("Loaded {} columns for {}", table.columns.len(), table.full_name());
+        debug!(
+            "Loaded {} columns for {}",
+            table.columns.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
@@ -193,7 +195,11 @@ impl PostgresReader {
             }
         }
 
-        debug!("Primary key for {}: {:?}", table.full_name(), table.primary_key);
+        debug!(
+            "Primary key for {}: {:?}",
+            table.full_name(),
+            table.primary_key
+        );
         Ok(())
     }
 
@@ -212,7 +218,9 @@ impl PostgresReader {
             WHERE n.nspname = $1 AND c.relname = $2
         "#;
 
-        let row = client.query_one(query, &[&table.schema, &table.name]).await?;
+        let row = client
+            .query_one(query, &[&table.schema, &table.name])
+            .await?;
         table.row_count = row.get::<_, i64>(0);
 
         debug!("Row count for {}: {}", table.full_name(), table.row_count);
@@ -242,7 +250,10 @@ impl PostgresReader {
         debug!("COPY query: {}", query);
 
         let copy_stream = client.copy_out(&query).await.map_err(|e| {
-            MigrateError::transfer(format!("{}.{}", schema, table), format!("initiating COPY: {}", e))
+            MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                format!("initiating COPY: {}", e),
+            )
         })?;
 
         let mut parser = BinaryRowParser::from_type_names(col_types);
@@ -253,17 +264,18 @@ impl PostgresReader {
 
         while let Some(data) = copy_stream.next().await {
             let bytes = data.map_err(|e| {
-                MigrateError::transfer(format!("{}.{}", schema, table), format!("reading COPY data: {}", e))
+                MigrateError::transfer(
+                    format!("{}.{}", schema, table),
+                    format!("reading COPY data: {}", e),
+                )
             })?;
 
             parser.extend(&bytes);
 
             while let Some(row) = parser.next_row()? {
                 // Convert old SqlValue to new SqlValue
-                let converted_row: Vec<SqlValue<'static>> = row
-                    .into_iter()
-                    .map(convert_old_sql_value)
-                    .collect();
+                let converted_row: Vec<SqlValue<'static>> =
+                    row.into_iter().map(convert_old_sql_value).collect();
                 batch.push(converted_row);
                 total_rows += 1;
 
@@ -376,7 +388,11 @@ impl SourceReader for PostgresReader {
             table.indexes.push(index);
         }
 
-        debug!("Loaded {} indexes for {}", table.indexes.len(), table.full_name());
+        debug!(
+            "Loaded {} indexes for {}",
+            table.indexes.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
@@ -439,16 +455,19 @@ impl SourceReader for PostgresReader {
             table.foreign_keys.push(fk);
         }
 
-        debug!("Loaded {} foreign keys for {}", table.foreign_keys.len(), table.full_name());
+        debug!(
+            "Loaded {} foreign keys for {}",
+            table.foreign_keys.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting connection for load_check_constraints"))?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                MigrateError::pool(e, "getting connection for load_check_constraints")
+            })?;
 
         let query = r#"
             SELECT c.conname, pg_get_constraintdef(c.oid)
@@ -469,7 +488,11 @@ impl SourceReader for PostgresReader {
             table.check_constraints.push(constraint);
         }
 
-        debug!("Loaded {} check constraints for {}", table.check_constraints.len(), table.full_name());
+        debug!(
+            "Loaded {} check constraints for {}",
+            table.check_constraints.len(),
+            table.full_name()
+        );
         Ok(())
     }
 
@@ -499,11 +522,10 @@ impl SourceReader for PostgresReader {
         }
 
         let pk_col = &table.primary_key[0];
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting connection for partition boundaries"))?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                MigrateError::pool(e, "getting connection for partition boundaries")
+            })?;
 
         let query = format!(
             r#"
@@ -547,7 +569,11 @@ impl SourceReader for PostgresReader {
             partitions.push(partition);
         }
 
-        debug!("Created {} partitions for {}", partitions.len(), table.full_name());
+        debug!(
+            "Created {} partitions for {}",
+            partitions.len(),
+            table.full_name()
+        );
         Ok(partitions)
     }
 
@@ -716,17 +742,28 @@ fn build_copy_query(
         (Some(pk), Some(min), None) => {
             format!(
                 "COPY (SELECT {} FROM {} WHERE {} >= {} ORDER BY {}) TO STDOUT (FORMAT BINARY)",
-                col_list, table_ref, quote_ident(pk), min, quote_ident(pk)
+                col_list,
+                table_ref,
+                quote_ident(pk),
+                min,
+                quote_ident(pk)
             )
         }
         (Some(pk), None, Some(max)) => {
             format!(
                 "COPY (SELECT {} FROM {} WHERE {} <= {} ORDER BY {}) TO STDOUT (FORMAT BINARY)",
-                col_list, table_ref, quote_ident(pk), max, quote_ident(pk)
+                col_list,
+                table_ref,
+                quote_ident(pk),
+                max,
+                quote_ident(pk)
             )
         }
         _ => {
-            format!("COPY (SELECT {} FROM {}) TO STDOUT (FORMAT BINARY)", col_list, table_ref)
+            format!(
+                "COPY (SELECT {} FROM {}) TO STDOUT (FORMAT BINARY)",
+                col_list, table_ref
+            )
         }
     }
 }
@@ -745,7 +782,11 @@ fn estimate_column_size(col: &Column) -> i64 {
         "time" | "timetz" => 8,
         "timestamp" | "timestamptz" => 8,
         "varchar" | "character varying" | "text" | "char" | "character" => {
-            if col.max_length > 0 { col.max_length.min(100) as i64 } else { 100 }
+            if col.max_length > 0 {
+                col.max_length.min(100) as i64
+            } else {
+                100
+            }
         }
         "bytea" => 100,
         "numeric" | "decimal" => 16,
@@ -755,7 +796,11 @@ fn estimate_column_size(col: &Column) -> i64 {
 }
 
 /// Convert a PostgreSQL row value to SqlValue.
-fn convert_pg_row_value(row: &tokio_postgres::Row, idx: usize, data_type: &str) -> SqlValue<'static> {
+fn convert_pg_row_value(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    data_type: &str,
+) -> SqlValue<'static> {
     let dt = data_type.to_lowercase();
 
     match dt.as_str() {
@@ -839,8 +884,8 @@ fn convert_pg_row_value(row: &tokio_postgres::Row, idx: usize, data_type: &str) 
 
 /// Convert old SqlValue to new SqlValue.
 fn convert_old_sql_value(old: crate::target::SqlValue) -> SqlValue<'static> {
-    use crate::target::SqlValue as OldSqlValue;
     use crate::target::SqlNullType as OldNullType;
+    use crate::target::SqlValue as OldSqlValue;
 
     match old {
         OldSqlValue::Null(null_type) => {
