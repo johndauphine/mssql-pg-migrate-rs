@@ -8,13 +8,15 @@ use crate::config::AuthMethod as ConfigAuthMethod;
 use crate::config::TargetConfig;
 use crate::error::{MigrateError, Result};
 use crate::source::{CheckConstraint, ForeignKey, Index, Table};
-use crate::target::{SqlNullType, SqlValue, TargetPool};
+use crate::target::{SqlNullType, SqlValue, TargetPool, UpsertWriter};
 use crate::typemap::postgres_to_mssql;
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::Timelike;
 use std::borrow::Cow;
-use tiberius::{AuthMethod as TiberiusAuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow};
+use tiberius::{
+    AuthMethod as TiberiusAuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow,
+};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tracing::{debug, info, warn};
@@ -121,6 +123,7 @@ impl bb8::ManageConnection for TiberiusTargetConnectionManager {
 }
 
 /// MSSQL target pool implementation.
+#[derive(Clone)]
 pub struct MssqlTargetPool {
     pool: Pool<TiberiusTargetConnectionManager>,
 }
@@ -310,20 +313,18 @@ impl MssqlTargetPool {
         );
 
         // Check if staging table already exists using QUOTENAME for safe identifier handling
-        let check_sql = format!(
-            "SELECT OBJECT_ID(QUOTENAME(@P1) + '.' + QUOTENAME(@P2), 'U')"
-        );
-        let result = conn.query(&check_sql, &[&schema, &staging_table_name]).await.map_err(|e| {
-            MigrateError::transfer(&qualified_staging, format!("checking staging table: {}", e))
-        })?;
+        let check_sql = "SELECT OBJECT_ID(QUOTENAME(@P1) + '.' + QUOTENAME(@P2), 'U')".to_string();
+        let result = conn
+            .query(&check_sql, &[&schema, &staging_table_name])
+            .await
+            .map_err(|e| {
+                MigrateError::transfer(&qualified_staging, format!("checking staging table: {}", e))
+            })?;
         let rows = result.into_first_result().await.map_err(|e| {
             MigrateError::transfer(&qualified_staging, format!("reading staging check: {}", e))
         })?;
 
-        let table_exists = rows
-            .first()
-            .and_then(|r| r.get::<i32, _>(0))
-            .is_some();
+        let table_exists = rows.first().and_then(|r| r.get::<i32, _>(0)).is_some();
 
         if table_exists {
             // Drop existing staging table to ensure correct column types
@@ -489,12 +490,9 @@ impl MssqlTargetPool {
 
         if !has_oversized {
             // Fast path: no oversized strings, process all rows directly without cloning
-            let mut bulk_load = conn
-                .bulk_insert(qualified_table)
-                .await
-                .map_err(|e| {
-                    MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
-                })?;
+            let mut bulk_load = conn.bulk_insert(qualified_table).await.map_err(|e| {
+                MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
+            })?;
 
             for row in rows {
                 let mut token_row = TokenRow::new();
@@ -518,12 +516,9 @@ impl MssqlTargetPool {
         let mut bulk_count = 0u64;
 
         // First pass: bulk insert non-oversized rows directly
-        let mut bulk_load = conn
-            .bulk_insert(qualified_table)
-            .await
-            .map_err(|e| {
-                MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
-            })?;
+        let mut bulk_load = conn.bulk_insert(qualified_table).await.map_err(|e| {
+            MigrateError::transfer(qualified_table, format!("bulk insert init: {}", e))
+        })?;
 
         for row in rows {
             if Self::row_has_oversized_strings(row) {
@@ -551,7 +546,8 @@ impl MssqlTargetPool {
                 "Falling back to INSERT for {} rows with oversized strings",
                 oversized_rows.len()
             );
-            let inserted = Self::insert_rows_fallback(conn, qualified_table, cols, &oversized_rows).await?;
+            let inserted =
+                Self::insert_rows_fallback(conn, qualified_table, cols, &oversized_rows).await?;
             bulk_count += inserted;
         }
 
@@ -740,7 +736,7 @@ impl MssqlTargetPool {
             ));
         }
 
-        let max_rows_per_batch = (2100 / cols_per_row).min(1000).max(1);
+        let max_rows_per_batch = (2100 / cols_per_row).clamp(1, 1000);
 
         let mut total_inserted = 0u64;
 
@@ -1006,7 +1002,6 @@ impl MssqlTargetPool {
 
         Ok(partitions)
     }
-
 }
 
 #[async_trait]
@@ -1162,7 +1157,7 @@ impl TargetPool for MssqlTargetPool {
         let result = conn
             .query(check_query, &[&pk_name, &target_schema, &table.name])
             .await?;
-        if result.into_first_result().await?.first().is_some() {
+        if !result.into_first_result().await?.is_empty() {
             debug!(
                 "Primary key already exists on {}.{} (created with table)",
                 target_schema, table.name
@@ -1388,7 +1383,10 @@ impl TargetPool for MssqlTargetPool {
                     &qualified_table,
                     format!(
                         "row {} has {} columns, expected {} (columns: {:?})",
-                        i, row.len(), expected_cols, cols
+                        i,
+                        row.len(),
+                        expected_cols,
+                        cols
                     ),
                 ));
             }
@@ -1421,12 +1419,9 @@ impl TargetPool for MssqlTargetPool {
             let bulk_count = bulk_rows.len() as u64;
 
             // Start bulk insert - Tiberius reads column metadata from the target table
-            let mut bulk_load = conn
-                .bulk_insert(&qualified_table)
-                .await
-                .map_err(|e| {
-                    MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e))
-                })?;
+            let mut bulk_load = conn.bulk_insert(&qualified_table).await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("bulk insert init: {}", e))
+            })?;
 
             // Send each row
             for row in bulk_rows {
@@ -1504,7 +1499,8 @@ impl TargetPool for MssqlTargetPool {
         let row_count = rows.len() as u64;
         let chunk_start = Instant::now();
 
-        let qualified_target = format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
+        let qualified_target =
+            format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table));
 
         // Validate column count matches for each row.
         // Bulk insert to staging table requires rows to have the exact column count.
@@ -1515,7 +1511,10 @@ impl TargetPool for MssqlTargetPool {
                     &qualified_target,
                     format!(
                         "row {} has {} columns, expected {} (columns: {:?})",
-                        i, row.len(), expected_cols, cols
+                        i,
+                        row.len(),
+                        expected_cols,
+                        cols
                     ),
                 ));
             }
@@ -1542,7 +1541,8 @@ impl TargetPool for MssqlTargetPool {
         let has_identity = Self::has_identity_column(&mut conn, schema, table).await?;
 
         // Build MERGE SQL
-        let merge_sql = Self::build_staging_merge_sql(&qualified_target, &staging_table, cols, pk_cols);
+        let merge_sql =
+            Self::build_staging_merge_sql(&qualified_target, &staging_table, cols, pk_cols);
 
         // Wrap with IDENTITY_INSERT if needed
         let batch_sql = if has_identity {
@@ -1605,6 +1605,55 @@ impl TargetPool for MssqlTargetPool {
 
     async fn close(&self) {
         // bb8 handles cleanup automatically
+    }
+
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        // For MSSQL target, we don't support connection reuse in the writer yet due to lifetime complexity.
+        // We simply wrap the pool and delegate.
+        Ok(Box::new(MssqlUpsertWriter {
+            pool: self.clone(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+        }))
+    }
+}
+
+/// Stateful upsert writer for MSSQL.
+pub struct MssqlUpsertWriter {
+    pool: MssqlTargetPool,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+}
+
+#[async_trait]
+impl UpsertWriter for MssqlUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        self.pool
+            .upsert_chunk(
+                &self.schema,
+                &self.table,
+                cols,
+                pk_cols,
+                rows,
+                self.writer_id,
+                self.partition_id,
+            )
+            .await
     }
 }
 
@@ -1699,7 +1748,10 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             let days_i64 = (dt.date() - epoch).num_days();
             // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
             if days_i64 < 0 || days_i64 > u32::MAX as i64 {
-                warn!("DateTime out of valid range (days={}), converting to NULL", days_i64);
+                warn!(
+                    "DateTime out of valid range (days={}), converting to NULL",
+                    days_i64
+                );
                 return ColumnData::DateTime2(None);
             }
             let days = days_i64 as u32;
@@ -1721,7 +1773,10 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             let days_i64 = (naive.date() - epoch).num_days();
             // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
             if days_i64 < 0 || days_i64 > u32::MAX as i64 {
-                warn!("DateTimeOffset out of valid range (days={}), converting to NULL", days_i64);
+                warn!(
+                    "DateTimeOffset out of valid range (days={}), converting to NULL",
+                    days_i64
+                );
                 return ColumnData::DateTimeOffset(None);
             }
             let days = days_i64 as u32;
@@ -1751,7 +1806,10 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             let days_i64 = (*d - epoch).num_days();
             // Bounds check: dates before year 1 or beyond u32::MAX days are invalid
             if days_i64 < 0 || days_i64 > u32::MAX as i64 {
-                warn!("Date out of valid range (days={}), converting to NULL", days_i64);
+                warn!(
+                    "Date out of valid range (days={}), converting to NULL",
+                    days_i64
+                );
                 return ColumnData::DateTime2(None);
             }
             let days = days_i64 as u32;
@@ -1764,8 +1822,8 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             // Convert chrono::NaiveTime to Tiberius Time
             // Time is increments of 10^-scale seconds since midnight
             // Using scale=7 (100 nanosecond increments) for maximum precision
-            let nanos = t.num_seconds_from_midnight() as u64 * 1_000_000_000
-                + t.nanosecond() as u64;
+            let nanos =
+                t.num_seconds_from_midnight() as u64 * 1_000_000_000 + t.nanosecond() as u64;
             let increments = nanos / 100; // Convert to 100-nanosecond increments
             ColumnData::Time(Some(tiberius::time::Time::new(increments, 7)))
         }
@@ -1783,10 +1841,22 @@ mod tests {
         let inf_f32 = SqlValue::F32(f32::INFINITY);
         let neg_inf_f64 = SqlValue::F64(f64::NEG_INFINITY);
 
-        assert!(matches!(sql_value_to_column_data(&nan_f32), ColumnData::F32(None)));
-        assert!(matches!(sql_value_to_column_data(&nan_f64), ColumnData::F64(None)));
-        assert!(matches!(sql_value_to_column_data(&inf_f32), ColumnData::F32(None)));
-        assert!(matches!(sql_value_to_column_data(&neg_inf_f64), ColumnData::F64(None)));
+        assert!(matches!(
+            sql_value_to_column_data(&nan_f32),
+            ColumnData::F32(None)
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&nan_f64),
+            ColumnData::F64(None)
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&inf_f32),
+            ColumnData::F32(None)
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&neg_inf_f64),
+            ColumnData::F64(None)
+        ));
     }
 
     #[test]
@@ -1794,8 +1864,14 @@ mod tests {
         let f32_val = SqlValue::F32(3.14);
         let f64_val = SqlValue::F64(2.718281828);
 
-        assert!(matches!(sql_value_to_column_data(&f32_val), ColumnData::F32(Some(_))));
-        assert!(matches!(sql_value_to_column_data(&f64_val), ColumnData::F64(Some(_))));
+        assert!(matches!(
+            sql_value_to_column_data(&f32_val),
+            ColumnData::F32(Some(_))
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&f64_val),
+            ColumnData::F64(Some(_))
+        ));
     }
 
     #[test]
@@ -1804,9 +1880,18 @@ mod tests {
         let null_string = SqlValue::Null(SqlNullType::String);
         let null_datetime = SqlValue::Null(SqlNullType::DateTime);
 
-        assert!(matches!(sql_value_to_column_data(&null_bool), ColumnData::Bit(None)));
-        assert!(matches!(sql_value_to_column_data(&null_string), ColumnData::String(None)));
-        assert!(matches!(sql_value_to_column_data(&null_datetime), ColumnData::DateTime2(None)));
+        assert!(matches!(
+            sql_value_to_column_data(&null_bool),
+            ColumnData::Bit(None)
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&null_string),
+            ColumnData::String(None)
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&null_datetime),
+            ColumnData::DateTime2(None)
+        ));
     }
 
     #[test]
@@ -1816,9 +1901,18 @@ mod tests {
         let i64_val = SqlValue::I64(1234567890);
         let string_val = SqlValue::String("hello".to_string());
 
-        assert!(matches!(sql_value_to_column_data(&bool_val), ColumnData::Bit(Some(true))));
-        assert!(matches!(sql_value_to_column_data(&i32_val), ColumnData::I32(Some(42))));
-        assert!(matches!(sql_value_to_column_data(&i64_val), ColumnData::I64(Some(1234567890))));
+        assert!(matches!(
+            sql_value_to_column_data(&bool_val),
+            ColumnData::Bit(Some(true))
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&i32_val),
+            ColumnData::I32(Some(42))
+        ));
+        assert!(matches!(
+            sql_value_to_column_data(&i64_val),
+            ColumnData::I64(Some(1234567890))
+        ));
         if let ColumnData::String(Some(s)) = sql_value_to_column_data(&string_val) {
             assert_eq!(s.as_ref(), "hello");
         } else {
@@ -1832,7 +1926,10 @@ mod tests {
         let date_val = SqlValue::Date(date);
 
         // Date is converted to DateTime2 for bulk insert compatibility
-        assert!(matches!(sql_value_to_column_data(&date_val), ColumnData::DateTime2(Some(_))));
+        assert!(matches!(
+            sql_value_to_column_data(&date_val),
+            ColumnData::DateTime2(Some(_))
+        ));
     }
 
     #[test]
@@ -1840,7 +1937,10 @@ mod tests {
         let decimal = rust_decimal::Decimal::new(12345, 2); // 123.45
         let decimal_val = SqlValue::Decimal(decimal);
 
-        assert!(matches!(sql_value_to_column_data(&decimal_val), ColumnData::Numeric(Some(_))));
+        assert!(matches!(
+            sql_value_to_column_data(&decimal_val),
+            ColumnData::Numeric(Some(_))
+        ));
     }
 
     #[test]
@@ -1848,7 +1948,10 @@ mod tests {
         let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let uuid_val = SqlValue::Uuid(uuid);
 
-        assert!(matches!(sql_value_to_column_data(&uuid_val), ColumnData::Guid(Some(_))));
+        assert!(matches!(
+            sql_value_to_column_data(&uuid_val),
+            ColumnData::Guid(Some(_))
+        ));
     }
 
     #[test]
@@ -2022,19 +2125,17 @@ mod tests {
     #[test]
     fn test_partition_rows_by_string_size() {
         // Test helper to simulate the partitioning logic in bulk_insert_to_table
-        let normal_row1 = vec![
-            SqlValue::I32(1),
-            SqlValue::String("short".to_string()),
-        ];
-        let normal_row2 = vec![
-            SqlValue::I32(2),
-            SqlValue::String("also short".to_string()),
-        ];
+        let normal_row1 = vec![SqlValue::I32(1), SqlValue::String("short".to_string())];
+        let normal_row2 = vec![SqlValue::I32(2), SqlValue::String("also short".to_string())];
         let oversized_row = vec![
             SqlValue::I32(3),
             SqlValue::String("x".repeat(40000)), // 80000 UTF-16 bytes > 65535 limit
         ];
-        let rows = vec![normal_row1.clone(), oversized_row.clone(), normal_row2.clone()];
+        let rows = vec![
+            normal_row1.clone(),
+            oversized_row.clone(),
+            normal_row2.clone(),
+        ];
 
         // Partition rows (mimics bulk_insert_to_table logic)
         let mut bulk_rows = Vec::new();
@@ -2060,10 +2161,7 @@ mod tests {
     #[test]
     fn test_partition_rows_all_normal() {
         let rows: Vec<Vec<SqlValue>> = (0..100)
-            .map(|i| vec![
-                SqlValue::I32(i),
-                SqlValue::String(format!("row_{}", i)),
-            ])
+            .map(|i| vec![SqlValue::I32(i), SqlValue::String(format!("row_{}", i))])
             .collect();
 
         let mut bulk_rows = Vec::new();
@@ -2084,10 +2182,7 @@ mod tests {
     fn test_partition_rows_all_oversized() {
         let oversized_string = "x".repeat(40000);
         let rows: Vec<Vec<SqlValue>> = (0..5)
-            .map(|i| vec![
-                SqlValue::I32(i),
-                SqlValue::String(oversized_string.clone()),
-            ])
+            .map(|i| vec![SqlValue::I32(i), SqlValue::String(oversized_string.clone())])
             .collect();
 
         let mut bulk_rows = Vec::new();

@@ -14,7 +14,9 @@ pub fn validate(config: &Config) -> Result<()> {
     }
     // Username is required for native and ODBC auth, but optional for Kerberos (integrated auth)
     if config.source.user.is_empty() && config.source.auth != AuthMethod::Kerberos {
-        return Err(MigrateError::Config("source.user is required (unless using Kerberos auth)".into()));
+        return Err(MigrateError::Config(
+            "source.user is required (unless using Kerberos auth)".into(),
+        ));
     }
     let source_type = config.source.r#type.to_lowercase();
     if source_type != "mssql" && source_type != "postgres" && source_type != "postgresql" {
@@ -33,7 +35,9 @@ pub fn validate(config: &Config) -> Result<()> {
     }
     // Username is required for native and ODBC auth, but optional for Kerberos (integrated auth)
     if config.target.user.is_empty() && config.target.auth != AuthMethod::Kerberos {
-        return Err(MigrateError::Config("target.user is required (unless using Kerberos auth)".into()));
+        return Err(MigrateError::Config(
+            "target.user is required (unless using Kerberos auth)".into(),
+        ));
     }
     let target_type = config.target.r#type.to_lowercase();
     if target_type != "mssql" && target_type != "postgres" && target_type != "postgresql" {
@@ -45,7 +49,7 @@ pub fn validate(config: &Config) -> Result<()> {
 
     // Cannot migrate to the same database AND schema (but same database with different schemas is allowed)
     if config.source.host == config.target.host
-        && config.source.port as u16 == config.target.port
+        && config.source.port == config.target.port
         && config.source.database == config.target.database
         && config.source.schema == config.target.schema
     {

@@ -25,13 +25,15 @@ target:
 migration:
   target_mode: upsert
   # workers is now auto-tuned if too low for partition jobs
-  workers: 6
+  workers: 12
   chunk_size: 50000
-  parallel_readers: 8
-  parallel_writers: 8
-  max_mssql_connections: 50
-  max_pg_connections: 40
+  parallel_readers: 16
+  parallel_writers: 16
+  max_mssql_connections: 100
+  max_pg_connections: 100
   use_unlogged_tables: false
   # Enable intra-table partitioning (match Airflow settings)
   large_table_threshold: 1000000
-  max_partitions: 8
+  max_partitions: 16
+  exclude_tables:
+    - "_staging_*"

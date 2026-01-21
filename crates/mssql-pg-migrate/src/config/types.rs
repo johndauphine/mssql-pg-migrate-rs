@@ -160,7 +160,9 @@ impl Config {
         let resources = SystemResources::detect();
         resources.log();
         let target_type = DatabaseType::parse(&self.target.r#type);
-        self.migration = self.migration.with_auto_tuning(&resources, None, target_type);
+        self.migration = self
+            .migration
+            .with_auto_tuning(&resources, None, target_type);
         self
     }
 
@@ -192,10 +194,10 @@ impl Config {
         );
 
         let target_type = DatabaseType::parse(&self.target.r#type);
-        self.migration = self
-            .migration
-            .clone()
-            .with_auto_tuning(&resources, Some(avg_row_size), target_type);
+        self.migration =
+            self.migration
+                .clone()
+                .with_auto_tuning(&resources, Some(avg_row_size), target_type);
     }
 }
 
@@ -522,18 +524,18 @@ impl MigrationConfig {
         // Benchmarking shows 6 workers is optimal for most workloads.
         // Too few underutilizes parallelism, too many causes contention.
         if self.workers.is_none() {
-            let workers = (cores / 2).max(4).min(8);
+            let workers = (cores / 2).clamp(4, 16);
             self.workers = Some(workers);
         }
         let workers = self.workers.unwrap();
 
         // Parallel readers: conservative scaling based on cores.
-        // Formula: cores/4 clamped to 2-4 for optimal throughput without overwhelming source.
+        // Formula: cores/4 clamped to 2-16 for optimal throughput without overwhelming source.
         if self.parallel_readers.is_none() {
-            let readers = (cores / 4).max(2).min(4);
+            let readers = (cores / 4).clamp(2, 16);
             self.parallel_readers = Some(readers);
             info!(
-                "  ParallelReaders: {} (auto: cores/4 clamped 2-4, {} cores)",
+                "  ParallelReaders: {} (auto: cores/4 clamped 2-16, {} cores)",
                 readers, cores
             );
         }
@@ -548,14 +550,17 @@ impl MigrationConfig {
             let writers = if is_mssql_target {
                 2 // Fixed for MSSQL due to TABLOCK serialization
             } else {
-                (cores / 4).max(2).min(4)
+                (cores / 4).clamp(2, 16)
             };
             self.write_ahead_writers = Some(writers);
             if is_mssql_target {
-                info!("  WriteAheadWriters: {} (auto: fixed 2 for MSSQL TABLOCK)", writers);
+                info!(
+                    "  WriteAheadWriters: {} (auto: fixed 2 for MSSQL TABLOCK)",
+                    writers
+                );
             } else {
                 info!(
-                    "  WriteAheadWriters: {} (auto: cores/4 clamped 2-4, {} cores)",
+                    "  WriteAheadWriters: {} (auto: cores/4 clamped 2-16, {} cores)",
                     writers, cores
                 );
             }
@@ -563,7 +568,7 @@ impl MigrationConfig {
 
         // Max partitions: scale with cores
         if self.max_partitions.is_none() {
-            let partitions = (cores / 2).max(4).min(16);
+            let partitions = (cores / 2).clamp(4, 16);
             self.max_partitions = Some(partitions);
         }
 
@@ -573,7 +578,7 @@ impl MigrationConfig {
         // Solve for chunk_size with a safety factor of 2x
 
         // Start with desired read-ahead buffers
-        let desired_read_ahead = ((ram_gb / 4.0) as usize).max(4).min(32);
+        let desired_read_ahead = ((ram_gb / 4.0) as usize).clamp(4, 32);
 
         // Calculate max chunk size that fits in memory budget
         let max_chunk_from_memory = memory_budget_bytes
@@ -612,23 +617,20 @@ impl MigrationConfig {
                 memory_budget_bytes / (bytes_per_row * chunk_size * workers * MEMORY_SAFETY_FACTOR);
             let buffers = desired_read_ahead
                 .min(max_read_ahead_from_memory)
-                .max(2)
-                .min(32);
+                .clamp(2, 32);
             self.read_ahead_buffers = Some(buffers);
         }
 
         // Large table threshold: scale with RAM
         // More RAM = can handle larger tables before partitioning
         if self.large_table_threshold.is_none() {
-            let threshold = ((ram_gb / 8.0) as i64 * 1_000_000)
-                .max(1_000_000)
-                .min(20_000_000);
+            let threshold = ((ram_gb / 8.0) as i64 * 1_000_000).clamp(1_000_000, 20_000_000);
             self.large_table_threshold = Some(threshold);
         }
 
         // COPY buffer rows: scale with RAM
         if self.copy_buffer_rows.is_none() {
-            let rows = ((ram_gb / 4.0) as usize * 5_000).max(5_000).min(50_000);
+            let rows = ((ram_gb / 4.0) as usize * 5_000).clamp(5_000, 50_000);
             self.copy_buffer_rows = Some(rows);
         }
 
@@ -636,20 +638,20 @@ impl MigrationConfig {
         // Need enough connections for parallel readers + writers + workers
         if self.max_mssql_connections.is_none() {
             let readers = self.parallel_readers.unwrap_or(4);
-            let conns = (workers * readers + 4).max(8).min(80);
+            let conns = (workers * readers + 4).clamp(8, 80);
             self.max_mssql_connections = Some(conns);
         }
 
         if self.max_pg_connections.is_none() {
             let writers = self.write_ahead_writers.unwrap_or(4);
-            let conns = (workers * writers + 4).max(8).min(64);
+            let conns = (workers * writers + 4).clamp(8, 64);
             self.max_pg_connections = Some(conns);
         }
 
         // Upsert batch size: scale with RAM (more aggressive for better throughput)
         // Larger batches reduce round-trips but use more memory
         if self.upsert_batch_size.is_none() {
-            let batch = ((ram_gb / 4.0) as usize * 1_000).max(1_000).min(10_000);
+            let batch = ((ram_gb / 4.0) as usize * 1_000).clamp(1_000, 10_000);
             self.upsert_batch_size = Some(batch);
         }
 

@@ -6,10 +6,12 @@
 //! - PostgreSQL: `PgSourcePool` (for bidirectional migrations)
 
 mod bench_copy;
+mod direct_copy;
 mod pg_binary;
 mod postgres;
 mod types;
 
+pub use direct_copy::DirectCopyEncoder;
 pub use pg_binary::{BinaryColumnType, BinaryRowParser};
 pub use postgres::PgSourcePool;
 pub use types::*;
@@ -374,6 +376,76 @@ impl MssqlPool {
         Ok(result)
     }
 
+    /// Query rows and encode directly to PostgreSQL COPY binary format.
+    ///
+    /// This is the high-performance path that bypasses SqlValue entirely.
+    /// Returns (encoded_bytes, first_pk, last_pk, row_count).
+    pub async fn query_rows_direct_copy(
+        &self,
+        sql: &str,
+        col_types: &[String],
+        pk_idx: Option<usize>,
+    ) -> Result<(bytes::Bytes, Option<i64>, Option<i64>, usize)> {
+        use bytes::BytesMut;
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+        let mut client = self.get_client().await?;
+        let t_conn = t0.elapsed();
+
+        let t1 = Instant::now();
+        let stream = client.simple_query(sql).await?;
+        let t_query = t1.elapsed();
+
+        let t2 = Instant::now();
+        let rows = stream.into_first_result().await?;
+        let t_fetch = t2.elapsed();
+
+        let t3 = Instant::now();
+
+        // Create encoder with pre-computed column strategies
+        let encoder = direct_copy::DirectCopyEncoder::new(col_types);
+        // Pre-allocate buffer based on actual row count to minimize reallocations
+        let estimated_size = encoder.buffer_size_for_rows(rows.len());
+        let mut buf = BytesMut::with_capacity(estimated_size);
+
+        encoder.write_header(&mut buf);
+
+        let mut first_pk: Option<i64> = None;
+        let mut last_pk: Option<i64> = None;
+        let row_count = rows.len();
+
+        for (i, row) in rows.iter().enumerate() {
+            // Encode row directly - single type dispatch per value
+            // Pass pk_idx to extract the correct PK column value
+            let pk = encoder.encode_row(row, &mut buf, pk_idx);
+
+            // Track PKs from the specified PK column
+            if pk_idx.is_some() {
+                if i == 0 {
+                    first_pk = pk;
+                }
+                if pk.is_some() {
+                    last_pk = pk;
+                }
+            }
+        }
+
+        encoder.write_trailer(&mut buf);
+
+        let t_encode = t3.elapsed();
+
+        // Log timing breakdown for chunks with significant data
+        if row_count > 1000 {
+            debug!(
+                "PROFILE direct_copy: {} rows - conn={:?}, query={:?}, fetch={:?}, encode={:?}",
+                row_count, t_conn, t_query, t_fetch, t_encode
+            );
+        }
+
+        Ok((buf.freeze(), first_pk, last_pk, row_count))
+    }
+
     /// Get the maximum primary key value for a table.
     pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
         let mut client = self.get_client().await?;
@@ -568,8 +640,7 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use subquery approach for ordered string aggregation
-        let query = format!(
-            r#"
+        let query = r#"
             SELECT
                 i.name AS index_name,
                 i.is_unique,
@@ -598,8 +669,7 @@ impl SourcePool for MssqlPool {
               AND i.is_primary_key = 0
               AND i.type > 0
             ORDER BY i.name
-        "#
-        );
+        "#.to_string();
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
@@ -643,8 +713,7 @@ impl SourcePool for MssqlPool {
         let mut client = self.get_client().await?;
 
         // Use STUFF/FOR XML PATH for ordered string aggregation
-        let query = format!(
-            r#"
+        let query = r#"
             SELECT
                 fk.name AS fk_name,
                 STUFF((
@@ -674,8 +743,7 @@ impl SourcePool for MssqlPool {
             JOIN sys.schemas rs ON rt.schema_id = rs.schema_id
             WHERE ps.name = @P1 AND pt.name = @P2
             ORDER BY fk.name
-        "#
-        );
+        "#.to_string();
 
         let mut q = Query::new(&query);
         q.bind(&table.schema);
@@ -958,7 +1026,6 @@ impl MssqlPool {
 
         self.query_rows_fast(&query, &columns, &col_types).await
     }
-
 }
 
 /// Convert a row value to SqlValue based on the column type.

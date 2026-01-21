@@ -38,7 +38,9 @@ pub mod transfer;
 pub mod typemap;
 
 // Re-exports for convenient access
-pub use config::{Config, DatabaseType, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode};
+pub use config::{
+    Config, DatabaseType, MigrationConfig, SourceConfig, TableStats, TargetConfig, TargetMode,
+};
 pub use error::{MigrateError, Result};
 pub use orchestrator::{
     HealthCheckResult, MigrationResult, Orchestrator, ProgressUpdate, TableError,

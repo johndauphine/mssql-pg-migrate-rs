@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
-use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool};
+use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -58,7 +58,8 @@ impl SourcePoolImpl {
                          - Linux: apt install libgssapi-krb5-2\n\
                          - macOS: Uses GSS.framework (built-in on macOS 10.14+)\n\
                          - Windows: Uses SSPI (built-in)\n\n\
-                         Obtain a ticket before running: kinit user@REALM".into()
+                         Obtain a ticket before running: kinit user@REALM"
+                            .into(),
                     ));
                 }
             }
@@ -159,6 +160,33 @@ impl SourcePoolImpl {
         }
     }
 
+    /// Query rows and encode directly to PostgreSQL COPY binary format.
+    ///
+    /// This is the high-performance path for MSSQL->PG upsert that bypasses
+    /// SqlValue entirely. Returns (encoded_bytes, first_pk, last_pk, row_count).
+    ///
+    /// Only supported for MSSQL sources - returns None for PostgreSQL.
+    pub async fn query_rows_direct_copy(
+        &self,
+        sql: &str,
+        col_types: &[String],
+        pk_idx: Option<usize>,
+    ) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
+        match self {
+            Self::Mssql(p) => {
+                let result = p.query_rows_direct_copy(sql, col_types, pk_idx).await?;
+                Ok(Some(result))
+            }
+            // Direct copy is only optimized for MSSQL sources
+            Self::Postgres(_) => Ok(None),
+        }
+    }
+
+    /// Returns true if this source supports direct copy encoding.
+    pub fn supports_direct_copy(&self) -> bool {
+        matches!(self, Self::Mssql(_))
+    }
+
     /// Stream rows using PostgreSQL COPY TO BINARY protocol.
     /// Returns the total number of rows read.
     /// Only supported for PostgreSQL sources - returns an error for other sources.
@@ -256,7 +284,8 @@ impl TargetPoolImpl {
                          - Linux: apt install libgssapi-krb5-2\n\
                          - macOS: Uses GSS.framework (built-in on macOS 10.14+)\n\
                          - Windows: Uses SSPI (built-in)\n\n\
-                         Obtain a ticket before running: kinit user@REALM".into()
+                         Obtain a ticket before running: kinit user@REALM"
+                            .into(),
                     ));
                 }
             }
@@ -459,6 +488,26 @@ impl TargetPoolImpl {
             }
             Self::Postgres(p) => {
                 p.upsert_chunk(schema, table, cols, pk_cols, rows, writer_id, partition_id)
+                    .await
+            }
+        }
+    }
+
+    /// Get a dedicated upsert writer for a specific table/partition.
+    pub async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        match self {
+            Self::Mssql(p) => {
+                p.get_upsert_writer(schema, table, writer_id, partition_id)
+                    .await
+            }
+            Self::Postgres(p) => {
+                p.get_upsert_writer(schema, table, writer_id, partition_id)
                     .await
             }
         }

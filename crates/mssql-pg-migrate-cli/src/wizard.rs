@@ -43,10 +43,7 @@ impl From<std::io::Error> for WizardError {
 
 impl From<dialoguer::Error> for WizardError {
     fn from(e: dialoguer::Error) -> Self {
-        Self::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
+        Self::Io(std::io::Error::other(e.to_string()))
     }
 }
 
@@ -178,8 +175,8 @@ fn prompt_source_config(existing: Option<&SourceConfig>) -> WizardResult<SourceC
         .interact_text()?;
 
     let password = prompt_password("  Password", existing.is_some())?;
-    let password = if password.is_empty() && existing.is_some() {
-        existing.unwrap().password.clone()
+    let password = if password.is_empty() {
+        existing.map(|e| e.password.clone()).unwrap_or(password)
     } else {
         password
     };
@@ -244,8 +241,8 @@ fn prompt_target_config(existing: Option<&TargetConfig>) -> WizardResult<TargetC
         .interact_text()?;
 
     let password = prompt_password("  Password", existing.is_some())?;
-    let password = if password.is_empty() && existing.is_some() {
-        existing.unwrap().password.clone()
+    let password = if password.is_empty() {
+        existing.map(|e| e.password.clone()).unwrap_or(password)
     } else {
         password
     };
@@ -281,9 +278,9 @@ fn prompt_target_config(existing: Option<&TargetConfig>) -> WizardResult<TargetC
         password,
         schema,
         ssl_mode: ssl_modes[ssl_mode_idx].to_string(),
-        encrypt: true,             // Default for MSSQL targets (ignored for PostgreSQL)
-        trust_server_cert: false,  // Default for MSSQL targets (ignored for PostgreSQL)
-        auth: Default::default(),  // SQL Server auth by default (ignored for PostgreSQL)
+        encrypt: true,            // Default for MSSQL targets (ignored for PostgreSQL)
+        trust_server_cert: false, // Default for MSSQL targets (ignored for PostgreSQL)
+        auth: Default::default(), // SQL Server auth by default (ignored for PostgreSQL)
     })
 }
 

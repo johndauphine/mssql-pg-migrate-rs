@@ -663,9 +663,7 @@ impl Orchestrator {
             result.rows_per_second
         );
 
-        if let Err(e) = transfer_result {
-            return Err(e);
-        }
+        transfer_result?;
 
         Ok(result)
     }
@@ -710,14 +708,12 @@ impl Orchestrator {
                                 .set_table_unlogged(target_schema, &table.name)
                                 .await?;
                         }
+                    } else if self.config.migration.use_unlogged_tables {
+                        self.target
+                            .create_table_unlogged(table, target_schema)
+                            .await?;
                     } else {
-                        if self.config.migration.use_unlogged_tables {
-                            self.target
-                                .create_table_unlogged(table, target_schema)
-                                .await?;
-                        } else {
-                            self.target.create_table(table, target_schema).await?;
-                        }
+                        self.target.create_table(table, target_schema).await?;
                     }
 
                     // Mark as pending for data transfer
@@ -748,6 +744,19 @@ impl Orchestrator {
                         }
                         self.target.create_primary_key(table, target_schema).await?;
                     } else {
+                        // For existing tables, ensure primary key exists (required for upsert)
+                        if !self
+                            .target
+                            .has_primary_key(target_schema, &table.name)
+                            .await?
+                        {
+                            info!(
+                                "Adding missing primary key to existing table {}",
+                                table_name
+                            );
+                            self.target.create_primary_key(table, target_schema).await?;
+                        }
+
                         // Drop non-PK indexes for faster upserts (only recreated if create_indexes is enabled)
                         let dropped = self
                             .target
@@ -883,6 +892,7 @@ impl Orchestrator {
             parallel_readers: self.config.migration.get_parallel_readers(),
             parallel_writers: self.config.migration.get_write_ahead_writers(),
             use_copy_binary: true, // Enable COPY TO BINARY for PostgreSQL sources
+            use_direct_copy: true, // Enable direct COPY encoding for MSSQL->PG upsert
         };
 
         let engine = Arc::new(
@@ -968,7 +978,7 @@ impl Orchestrator {
                                 min_pk: partition.min_pk,
                                 max_pk: partition.max_pk,
                                 resume_from_pk: None, // Partitions don't support resume yet
-                                target_mode: self.config.migration.target_mode.clone(),
+                                target_mode: self.config.migration.target_mode,
                                 target_schema: self.config.target.schema.clone(),
                             };
 
@@ -1013,7 +1023,7 @@ impl Orchestrator {
                 min_pk: None,
                 max_pk: None,
                 resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
-                target_mode: self.config.migration.target_mode.clone(),
+                target_mode: self.config.migration.target_mode,
                 target_schema: self.config.target.schema.clone(),
             };
 

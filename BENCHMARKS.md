@@ -121,3 +121,25 @@ migration:
 ```
 
 See [PERFORMANCE.md](PERFORMANCE.md) for tuning recommendations.
+
+## Latest Upsert Optimization Results (Branch: perf/upsert-optimization-and-cleanup)
+
+**Date:** 2026-01-03
+**Configuration:**
+- Workers: 12
+- Parallel Readers: 16
+- Parallel Writers: 16
+- Chunk Size: 50,000
+- Change Detection: IS DISTINCT FROM (optimized)
+- Persistent Upsert Writer: Enabled (reusing connection & staging table)
+
+**Result:**
+- **Throughput:** 212,883 rows/sec
+- **Duration:** 90.7s
+- **Improvement:** ~17.3% faster than baseline (181k rows/s).
+- **Comparison:** Gap with Go closed significantly (Go: ~235k rows/s).
+
+**Analysis:**
+- Persistent Upsert Writer eliminated thousands of `CREATE TABLE` / `DROP TABLE` operations.
+- `IS DISTINCT FROM` reduced WAL generation by preventing unchanged row updates.
+- Transaction batching improved connection stability.

@@ -125,6 +125,54 @@ pub trait TargetPool: Send + Sync {
 
     /// Close all connections.
     async fn close(&self);
+
+    /// Get a dedicated upsert writer for a specific table/partition.
+    ///
+    /// The writer holds a persistent connection and reuses the staging table
+    /// across chunks to minimize overhead and system catalog churn.
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>>;
+}
+
+/// Trait for a stateful upsert writer that holds a connection.
+#[async_trait]
+pub trait UpsertWriter: Send {
+    /// Upsert a chunk of rows using the held connection.
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64>;
+
+    /// Upsert pre-encoded COPY binary data directly.
+    ///
+    /// This is the high-performance path that bypasses SqlValue encoding.
+    /// The `copy_data` must be valid PostgreSQL COPY binary format.
+    /// Default implementation falls back to upsert_chunk (for MSSQL target).
+    async fn upsert_chunk_direct(
+        &mut self,
+        _cols: &[String],
+        _pk_cols: &[String],
+        _copy_data: bytes::Bytes,
+        _row_count: usize,
+    ) -> Result<u64> {
+        // Default: not supported, caller should use upsert_chunk
+        Err(MigrateError::Transfer {
+            table: "unknown".to_string(),
+            message: "Direct copy not supported for this target".to_string(),
+        })
+    }
+
+    /// Returns true if this writer supports direct copy.
+    fn supports_direct_copy(&self) -> bool {
+        false
+    }
 }
 
 /// SQL value enum for type-safe row handling.
@@ -399,7 +447,7 @@ impl PgPool {
             ));
         }
 
-        ddl.push_str(")");
+        ddl.push(')');
         ddl
     }
 
@@ -1275,8 +1323,7 @@ impl TargetPool for PgPool {
             return Ok(0);
         }
 
-        // Use batched INSERT statements
-        // TODO: Implement COPY protocol for better performance
+        // Use COPY protocol for high-performance bulk inserts
         let count = self.insert_batch(schema, table, cols, rows).await?;
         Ok(count)
     }
@@ -1436,7 +1483,8 @@ impl TargetPool for PgPool {
         let merge_start = Instant::now();
 
         // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
-        let merge_sql = build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols);
+        let merge_sql =
+            build_staging_merge_sql(schema, table, &staging_table, cols, pk_cols, false);
         client.execute(&merge_sql, &[]).await.map_err(|e| {
             MigrateError::transfer(
                 format!("{}.{}", schema, table),
@@ -1475,6 +1523,378 @@ impl TargetPool for PgPool {
 
     async fn close(&self) {
         // Pool will be closed when dropped
+    }
+
+    async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        let client = self.pool.get().await.map_err(|e| {
+            MigrateError::pool(e, "getting PostgreSQL connection for upsert writer")
+        })?;
+
+        Ok(Box::new(PgUpsertWriter {
+            client,
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+            staging_table_created: false,
+            copy_buffer_rows: self.copy_buffer_rows,
+        }))
+    }
+}
+
+/// Stateful upsert writer for PostgreSQL.
+/// Holds a connection to reuse the staging table across chunks.
+pub struct PgUpsertWriter {
+    client: deadpool_postgres::Object,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+    staging_table_created: bool,
+    #[allow(dead_code)] // Reserved for future buffer tuning
+    copy_buffer_rows: usize,
+}
+
+#[async_trait]
+impl UpsertWriter for PgUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        use std::time::Instant;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        if pk_cols.is_empty() {
+            return Err(MigrateError::NoPrimaryKey(self.table.clone()));
+        }
+
+        let row_count = rows.len() as u64;
+        let chunk_start = Instant::now();
+
+        // Use per-writer staging table to avoid conflicts between parallel writers.
+        let staging_table =
+            pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
+
+        // Start a transaction for the entire chunk to ensure atomicity and connection stability
+        let tx = self.client.transaction().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("starting upsert transaction: {}", e),
+            )
+        })?;
+
+        // 1. Create temp staging table (only once per writer session)
+        // Even though it's a TEMP table, creating it inside a transaction is fine.
+        if !self.staging_table_created {
+            let create_staging_sql = format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT PRESERVE ROWS",
+                pg_quote_ident(&staging_table),
+                pg_qualify_table(&self.schema, &self.table)
+            );
+            tx.execute(&create_staging_sql, &[]).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("creating staging table: {}", e),
+                )
+            })?;
+            self.staging_table_created = true;
+        }
+
+        // Truncate to clear any previous batch data
+        let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
+        tx.execute(&truncate_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("truncating staging table: {}", e),
+            )
+        })?;
+
+        let staging_time = chunk_start.elapsed();
+        let copy_start = Instant::now();
+
+        // 2. COPY rows into staging table using binary format
+        let col_list: String = cols
+            .iter()
+            .map(|c| pg_quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let copy_stmt = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            pg_quote_ident(&staging_table),
+            col_list
+        );
+
+        // Execute COPY within the transaction
+        let sink = tx.copy_in(&copy_stmt).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("initiating COPY to staging: {}", e),
+            )
+        })?;
+
+        futures::pin_mut!(sink);
+
+        // Build binary COPY data
+        let mut buf = BytesMut::with_capacity(COPY_SEND_BUF_SIZE * 2);
+
+        // Write binary COPY header
+        buf.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        buf.put_i32(0); // Flags: no OIDs
+        buf.put_i32(0); // Header extension length: 0
+
+        let num_cols = cols.len() as i16;
+
+        for row in &rows {
+            // Field count (16-bit)
+            buf.put_i16(num_cols);
+
+            // Write each field
+            for value in row.iter() {
+                write_binary_value(&mut buf, value);
+            }
+
+            // Flush when buffer is large enough
+            if buf.len() > COPY_SEND_BUF_SIZE {
+                sink.send(buf.split().freeze()).await.map_err(|e| {
+                    MigrateError::transfer(
+                        format!("{}.{}", self.schema, self.table),
+                        format!("sending COPY data to staging: {}", e),
+                    )
+                })?;
+            }
+        }
+
+        // Write trailer (-1 as field count indicates end)
+        buf.put_i16(-1);
+
+        // Send remaining data
+        if !buf.is_empty() {
+            sink.send(buf.freeze()).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("sending final COPY data to staging: {}", e),
+                )
+            })?;
+        }
+
+        // Finish COPY
+        sink.finish().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("finishing COPY to staging: {}", e),
+            )
+        })?;
+
+        let copy_time = copy_start.elapsed();
+        let merge_start = Instant::now();
+
+        // 3. Merge staging into target with single INSERT...SELECT...ON CONFLICT
+        let merge_sql = build_staging_merge_sql(
+            &self.schema,
+            &self.table,
+            &staging_table,
+            cols,
+            pk_cols,
+            false,
+        );
+        tx.execute(&merge_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("merging staging to target: {}", e),
+            )
+        })?;
+
+        // Commit the transaction
+        tx.commit().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("committing upsert transaction: {}", e),
+            )
+        })?;
+
+        let merge_time = merge_start.elapsed();
+        let total_time = chunk_start.elapsed();
+
+        // Log detailed timing for profiling
+        if row_count >= UPSERT_PROFILING_ROW_THRESHOLD {
+            tracing::debug!(
+                "{}.{}: upsert chunk {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
+                self.schema,
+                self.table,
+                row_count,
+                staging_time,
+                copy_time,
+                merge_time,
+                total_time
+            );
+        }
+
+        Ok(row_count)
+    }
+
+    /// Upsert pre-encoded COPY binary data directly.
+    ///
+    /// This is the high-performance path that bypasses SqlValue encoding entirely.
+    /// The `copy_data` must be valid PostgreSQL COPY binary format (header + rows + trailer).
+    async fn upsert_chunk_direct(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        copy_data: bytes::Bytes,
+        row_count: usize,
+    ) -> Result<u64> {
+        use std::time::Instant;
+
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        if pk_cols.is_empty() {
+            return Err(MigrateError::NoPrimaryKey(self.table.clone()));
+        }
+
+        let chunk_start = Instant::now();
+
+        // Get staging table name
+        let staging_table =
+            pg_staging_table_name(&self.schema, &self.table, self.writer_id, self.partition_id);
+
+        // Start a transaction for the entire chunk
+        let tx = self.client.transaction().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("starting direct upsert transaction: {}", e),
+            )
+        })?;
+
+        // 1. Create or reuse staging table
+        if !self.staging_table_created {
+            let create_staging_sql = format!(
+                "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
+                pg_quote_ident(&staging_table),
+                pg_qualify_table(&self.schema, &self.table)
+            );
+            tx.execute(&create_staging_sql, &[]).await.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", self.schema, self.table),
+                    format!("creating staging table: {}", e),
+                )
+            })?;
+            self.staging_table_created = true;
+        }
+
+        // Truncate to clear any previous batch data
+        let truncate_sql = format!("TRUNCATE TABLE {}", pg_quote_ident(&staging_table));
+        tx.execute(&truncate_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("truncating staging table: {}", e),
+            )
+        })?;
+
+        let staging_time = chunk_start.elapsed();
+        let copy_start = Instant::now();
+
+        // 2. COPY pre-encoded binary data directly to staging
+        let col_list: String = cols
+            .iter()
+            .map(|c| pg_quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let copy_stmt = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT binary)",
+            pg_quote_ident(&staging_table),
+            col_list
+        );
+
+        // Execute COPY within the transaction - send pre-encoded data directly
+        let sink = tx.copy_in(&copy_stmt).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("initiating direct COPY to staging: {}", e),
+            )
+        })?;
+
+        futures::pin_mut!(sink);
+
+        // Send the pre-encoded data in one shot
+        sink.send(copy_data).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("sending direct COPY data to staging: {}", e),
+            )
+        })?;
+
+        // Finish COPY
+        sink.finish().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("finishing direct COPY to staging: {}", e),
+            )
+        })?;
+
+        let copy_time = copy_start.elapsed();
+        let merge_start = Instant::now();
+
+        // 3. Merge staging into target
+        let merge_sql = build_staging_merge_sql(
+            &self.schema,
+            &self.table,
+            &staging_table,
+            cols,
+            pk_cols,
+            false,
+        );
+        tx.execute(&merge_sql, &[]).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("merging staging to target: {}", e),
+            )
+        })?;
+
+        // Commit the transaction
+        tx.commit().await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", self.schema, self.table),
+                format!("committing direct upsert transaction: {}", e),
+            )
+        })?;
+
+        let merge_time = merge_start.elapsed();
+        let total_time = chunk_start.elapsed();
+
+        // Log detailed timing for profiling
+        if row_count >= UPSERT_PROFILING_ROW_THRESHOLD as usize {
+            tracing::debug!(
+                "{}.{}: DIRECT upsert {} rows - staging: {:?}, copy: {:?}, merge: {:?}, total: {:?}",
+                self.schema,
+                self.table,
+                row_count,
+                staging_time,
+                copy_time,
+                merge_time,
+                total_time
+            );
+        }
+
+        Ok(row_count as u64)
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        true
     }
 }
 
@@ -1665,13 +2085,13 @@ impl PgPool {
 
                 // Adaptive flush: send when buffer approaches target size
                 // Leave room for the largest row we've seen
-                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
-                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: "Receiver dropped".into(),
-                        });
-                    }
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len)
+                    && chunk_tx.send(buf.split().freeze()).await.is_err()
+                {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped".into(),
+                    });
                 }
             }
 
@@ -1679,13 +2099,11 @@ impl PgPool {
             buf.put_i16(-1);
 
             // Send remaining data
-            if !buf.is_empty() {
-                if chunk_tx.send(buf.freeze()).await.is_err() {
-                    return Err(MigrateError::Transfer {
-                        table: table_name_clone.clone(),
-                        message: "Receiver dropped (final)".into(),
-                    });
-                }
+            if !buf.is_empty() && chunk_tx.send(buf.freeze()).await.is_err() {
+                return Err(MigrateError::Transfer {
+                    table: table_name_clone.clone(),
+                    message: "Receiver dropped (final)".into(),
+                });
             }
 
             Ok::<usize, MigrateError>(largest_row_len)
@@ -1801,26 +2219,24 @@ impl PgPool {
                 row_count += 1;
 
                 // Adaptive flush
-                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len) {
-                    if chunk_tx.send(buf.split().freeze()).await.is_err() {
-                        return Err(MigrateError::Transfer {
-                            table: table_name_clone.clone(),
-                            message: "Receiver dropped".into(),
-                        });
-                    }
+                if buf.len() > COPY_SEND_BUF_SIZE.saturating_sub(largest_row_len)
+                    && chunk_tx.send(buf.split().freeze()).await.is_err()
+                {
+                    return Err(MigrateError::Transfer {
+                        table: table_name_clone.clone(),
+                        message: "Receiver dropped".into(),
+                    });
                 }
             }
 
             // Write trailer
             buf.put_i16(-1);
 
-            if !buf.is_empty() {
-                if chunk_tx.send(buf.freeze()).await.is_err() {
-                    return Err(MigrateError::Transfer {
-                        table: table_name_clone.clone(),
-                        message: "Receiver dropped (final)".into(),
-                    });
-                }
+            if !buf.is_empty() && chunk_tx.send(buf.freeze()).await.is_err() {
+                return Err(MigrateError::Transfer {
+                    table: table_name_clone.clone(),
+                    message: "Receiver dropped (final)".into(),
+                });
             }
 
             Ok::<u64, MigrateError>(row_count)
@@ -2176,7 +2592,7 @@ fn pg_staging_table_name(
 
     // Build the ideal name
     let prefix = "_staging";
-    let ideal_name = format!("{}_{}_{}{}",prefix, schema, table, suffix);
+    let ideal_name = format!("{}_{}_{}{}", prefix, schema, table, suffix);
 
     if ideal_name.len() <= PG_MAX_IDENTIFIER_LEN {
         return ideal_name;
@@ -2219,6 +2635,7 @@ fn build_staging_merge_sql(
     staging_table: &str,
     cols: &[String],
     pk_cols: &[String],
+    skip_change_detection: bool,
 ) -> String {
     let col_list: String = cols
         .iter()
@@ -2249,11 +2666,10 @@ fn build_staging_merge_sql(
             pg_quote_ident(staging_table),
             pk_list
         )
-    } else {
-        // Simple DO UPDATE SET without change detection.
-        // Previous approach used IS DISTINCT FROM for each column, which is expensive
-        // for tables with large TEXT/BYTEA columns (e.g., Posts.Body).
-        // PostgreSQL's MVCC handles unchanged rows efficiently anyway.
+    } else if skip_change_detection {
+        // Fast upsert without change detection.
+        // Updates all conflicting rows regardless of whether data changed.
+        // Faster merge but generates more WAL and index updates.
         format!(
             "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
             pg_qualify_table(schema, table),
@@ -2263,6 +2679,35 @@ fn build_staging_merge_sql(
             pk_list,
             update_cols.join(", ")
         )
+    } else {
+        // High-performance upsert with change detection.
+        // Using IS DISTINCT FROM prevents PostgreSQL from creating new dead tuples
+        // when data hasn't actually changed. This significantly reduces table bloat,
+        // index maintenance overhead, and WAL traffic.
+        let change_detection: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| {
+                let quoted = pg_quote_ident(c);
+                format!(
+                    "{}.{} IS DISTINCT FROM EXCLUDED.{}",
+                    pg_qualify_table(schema, table),
+                    quoted,
+                    quoted
+                )
+            })
+            .collect();
+
+        format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {} WHERE {}",
+            pg_qualify_table(schema, table),
+            col_list,
+            col_list,
+            pg_quote_ident(staging_table),
+            pk_list,
+            update_cols.join(", "),
+            change_detection.join(" OR ")
+        )
     }
 }
 
@@ -2271,16 +2716,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_staging_merge_sql() {
+    fn test_build_staging_merge_sql_with_change_detection() {
         let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql = build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols);
+        let sql =
+            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, false);
         assert!(sql.contains("DO UPDATE SET"));
         // Should update name and value columns
         assert!(sql.contains(r#""name" = EXCLUDED."name""#));
         assert!(sql.contains(r#""value" = EXCLUDED."value""#));
-        // Should not use expensive change detection
+        // Should use high-performance change detection
+        assert!(sql.contains("IS DISTINCT FROM"));
+        assert!(sql.contains(r#""public"."users"."name" IS DISTINCT FROM EXCLUDED."name""#));
+        assert!(sql.contains("WHERE"));
+    }
+
+    #[test]
+    fn test_build_staging_merge_sql_skip_change_detection() {
+        let cols = vec!["id".to_string(), "name".to_string(), "value".to_string()];
+        let pk_cols = vec!["id".to_string()];
+
+        let sql =
+            build_staging_merge_sql("public", "users", "_staging_users", &cols, &pk_cols, true);
+        assert!(sql.contains("DO UPDATE SET"));
+        // Should update name and value columns
+        assert!(sql.contains(r#""name" = EXCLUDED."name""#));
+        assert!(sql.contains(r#""value" = EXCLUDED."value""#));
+        // Should NOT have change detection
         assert!(!sql.contains("IS DISTINCT FROM"));
         assert!(!sql.contains("WHERE"));
     }
@@ -2291,7 +2754,14 @@ mod tests {
         let cols = vec!["id".to_string()];
         let pk_cols = vec!["id".to_string()];
 
-        let sql = build_staging_merge_sql("public", "lookup", "_staging_lookup", &cols, &pk_cols);
+        let sql = build_staging_merge_sql(
+            "public",
+            "lookup",
+            "_staging_lookup",
+            &cols,
+            &pk_cols,
+            false,
+        );
         assert!(sql.contains("DO NOTHING"));
         assert!(!sql.contains("DO UPDATE"));
     }
@@ -2323,9 +2793,16 @@ mod tests {
             PG_MAX_IDENTIFIER_LEN
         );
         // Should still end with the partition/writer suffix for uniqueness
-        assert!(name.ends_with("_p7_0"), "Name '{}' should end with _p7_0", name);
+        assert!(
+            name.ends_with("_p7_0"),
+            "Name '{}' should end with _p7_0",
+            name
+        );
         // Should contain hash (8 hex chars)
-        assert!(name.contains("_staging_"), "Name should start with _staging_");
+        assert!(
+            name.contains("_staging_"),
+            "Name should start with _staging_"
+        );
     }
 
     #[test]
@@ -2338,8 +2815,14 @@ mod tests {
         let name2 = pg_staging_table_name(long_schema, long_table, 0, Some(1));
         let name3 = pg_staging_table_name(long_schema, long_table, 1, Some(0));
 
-        assert_ne!(name1, name2, "Different partitions should have different names");
-        assert_ne!(name1, name3, "Different writers should have different names");
+        assert_ne!(
+            name1, name2,
+            "Different partitions should have different names"
+        );
+        assert_ne!(
+            name1, name3,
+            "Different writers should have different names"
+        );
         assert!(name1.len() <= PG_MAX_IDENTIFIER_LEN);
         assert!(name2.len() <= PG_MAX_IDENTIFIER_LEN);
         assert!(name3.len() <= PG_MAX_IDENTIFIER_LEN);
