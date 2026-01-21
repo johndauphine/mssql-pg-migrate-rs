@@ -280,6 +280,7 @@ impl PgSourcePool {
     ///
     /// # Returns
     /// Total number of rows read.
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_rows_binary(
         &self,
         schema: &str,

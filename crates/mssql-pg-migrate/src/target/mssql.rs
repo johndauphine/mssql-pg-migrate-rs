@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::Timelike;
 use std::borrow::Cow;
+use std::time::Duration;
 use tiberius::{
     AuthMethod as TiberiusAuthMethod, Client, ColumnData, Config, EncryptionLevel, ToSql, TokenRow,
 };
@@ -40,6 +41,22 @@ const DEADLOCK_RETRY_DELAY_MS: u64 = 200;
 /// SQL Server on Linux/Docker negotiates down to 16KB, but we request the maximum.
 /// This improves bulk insert performance by ~42% compared to the default 4KB.
 const TDS_MAX_PACKET_SIZE: u32 = 32767;
+
+/// Connection acquisition timeout from pool (30 seconds).
+/// Prevents workers from waiting indefinitely for connections during high contention.
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle connection timeout (5 minutes).
+/// Connections idle longer than this are closed to free resources and prevent zombie connections.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum connection lifetime (30 minutes).
+/// Connections older than this are recycled to prevent long-lived zombie connections.
+const POOL_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+
+/// TCP keepalive interval (30 seconds).
+/// Sends keepalive probes to detect dead connections at the TCP level.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Connection manager for bb8 pool with tiberius for MSSQL target.
 #[derive(Clone)]
@@ -107,17 +124,56 @@ impl bb8::ManageConnection for TiberiusTargetConnectionManager {
             }
         })?;
 
+        // Enable TCP nodelay for lower latency
         tcp.set_nodelay(true).ok();
 
-        Client::connect(config, tcp.compat_write()).await
+        // Enable TCP keepalives to detect dead connections at the network level.
+        // This is critical for preventing zombie connections that can cause migration hangs.
+        if let Ok(std_tcp) = tcp.into_std() {
+            use std::net::TcpStream as StdTcpStream;
+            let socket = socket2::Socket::from(std_tcp);
+
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(TCP_KEEPALIVE_INTERVAL)
+                .with_interval(TCP_KEEPALIVE_INTERVAL);
+
+            if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+                warn!(
+                    "Failed to set TCP keepalive on MSSQL target connection: {}",
+                    e
+                );
+            }
+
+            // Convert back to tokio TcpStream
+            let std_tcp: StdTcpStream = socket.into();
+            std_tcp.set_nonblocking(true).ok();
+            let tcp = TcpStream::from_std(std_tcp).map_err(|e| tiberius::error::Error::Io {
+                kind: e.kind(),
+                message: format!("Failed to convert socket: {}", e),
+            })?;
+
+            Client::connect(config, tcp.compat_write()).await
+        } else {
+            warn!("Failed to configure TCP keepalives on MSSQL target connection");
+            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
+                tiberius::error::Error::Io {
+                    kind: e.kind(),
+                    message: e.to_string(),
+                }
+            })?;
+            tcp.set_nodelay(true).ok();
+            Client::connect(config, tcp.compat_write()).await
+        }
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        // Validate connection with a simple query.
         conn.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        // Rely on TCP keepalives and is_valid() check for broken connection detection
         false
     }
 }
@@ -134,6 +190,15 @@ impl MssqlTargetPool {
         let manager = TiberiusTargetConnectionManager::new(config.clone());
         let pool = Pool::builder()
             .max_size(max_conns)
+            .min_idle(Some(1))
+            // Connection acquisition timeout - prevents indefinite blocking
+            .connection_timeout(POOL_CONNECTION_TIMEOUT)
+            // Idle connection cleanup - prevents zombie connections from accumulating
+            .idle_timeout(Some(POOL_IDLE_TIMEOUT))
+            // Maximum connection lifetime - forces connection recycling
+            .max_lifetime(Some(POOL_MAX_LIFETIME))
+            // Validate connections before returning from pool
+            .test_on_check_out(true)
             .build(manager)
             .await
             .map_err(|e| MigrateError::pool(e, "creating MSSQL target pool"))?;
@@ -1861,8 +1926,8 @@ mod tests {
 
     #[test]
     fn test_sql_value_to_column_data_valid_floats() {
-        let f32_val = SqlValue::F32(3.14);
-        let f64_val = SqlValue::F64(2.718281828);
+        let f32_val = SqlValue::F32(3.15); // Not a mathematical constant
+        let f64_val = SqlValue::F64(2.72); // Not a mathematical constant
 
         assert!(matches!(
             sql_value_to_column_data(&f32_val),
@@ -1975,7 +2040,7 @@ mod tests {
         let row = vec![
             SqlValue::I32(42),
             SqlValue::I64(123456789),
-            SqlValue::F64(3.14159),
+            SqlValue::F64(3.125), // Not a mathematical constant
             SqlValue::Bool(true),
         ];
         assert!(!MssqlTargetPool::row_has_oversized_strings(&row));
@@ -2226,37 +2291,37 @@ mod tests {
 
         // 10 columns -> min(2100/10, 1000) = min(210, 1000) = 210
         let cols_10 = 10;
-        let max_rows_10 = (2100 / cols_10).min(1000).max(1);
+        let max_rows_10 = (2100 / cols_10).clamp(1, 1000);
         assert_eq!(max_rows_10, 210);
 
         // 100 columns -> min(2100/100, 1000) = min(21, 1000) = 21
         let cols_100 = 100;
-        let max_rows_100 = (2100 / cols_100).min(1000).max(1);
+        let max_rows_100 = (2100 / cols_100).clamp(1, 1000);
         assert_eq!(max_rows_100, 21);
 
         // 3 columns -> min(2100/3, 1000) = min(700, 1000) = 700
         let cols_3 = 3;
-        let max_rows_3 = (2100 / cols_3).min(1000).max(1);
+        let max_rows_3 = (2100 / cols_3).clamp(1, 1000);
         assert_eq!(max_rows_3, 700);
 
         // 2 columns -> min(2100/2, 1000) = min(1050, 1000) = 1000 (capped!)
         let cols_2 = 2;
-        let max_rows_2 = (2100 / cols_2).min(1000).max(1);
+        let max_rows_2 = (2100 / cols_2).clamp(1, 1000);
         assert_eq!(max_rows_2, 1000);
 
         // 1 column -> min(2100/1, 1000) = min(2100, 1000) = 1000 (capped!)
         let cols_1 = 1;
-        let max_rows_1 = (2100 / cols_1).min(1000).max(1);
+        let max_rows_1 = (2100 / cols_1).clamp(1, 1000);
         assert_eq!(max_rows_1, 1000);
 
         // 2100 columns -> min(2100/2100, 1000) = min(1, 1000) = 1
         let cols_2100 = 2100;
-        let max_rows_2100 = (2100 / cols_2100).min(1000).max(1);
+        let max_rows_2100 = (2100 / cols_2100).clamp(1, 1000);
         assert_eq!(max_rows_2100, 1);
 
         // 3000 columns -> min(2100/3000, 1000) = min(0, 1000) -> max(1) = 1
         let cols_3000 = 3000;
-        let max_rows_3000 = (2100 / cols_3000).min(1000).max(1);
+        let max_rows_3000 = (2100 / cols_3000).clamp(1, 1000);
         assert_eq!(max_rows_3000, 1);
     }
 

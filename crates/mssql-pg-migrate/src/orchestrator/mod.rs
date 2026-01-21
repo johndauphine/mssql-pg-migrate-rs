@@ -7,7 +7,7 @@ pub use pools::{SourcePoolImpl, TargetPoolImpl};
 use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
-use crate::state::{MigrationState, RunStatus, StateBackend, TableState, TaskStatus};
+use crate::state::{MigrationState, RunStatus, StateBackendEnum, TableState, TaskStatus};
 use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Migration orchestrator.
 pub struct Orchestrator {
     config: Config,
-    state_backend: StateBackend,
+    state_backend: StateBackendEnum,
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
@@ -969,9 +969,11 @@ impl Orchestrator {
                 if let Some((col_name, col_type)) =
                     table.find_date_column(&self.config.migration.date_updated_columns)
                 {
-
                     // Get last sync timestamp from database (queries historical completed runs)
-                    let last_sync = self.state_backend.get_last_sync_timestamp(&table_name).await?;
+                    let last_sync = self
+                        .state_backend
+                        .get_last_sync_timestamp(&table_name)
+                        .await?;
 
                     if let Some(last_sync_ts) = last_sync {
                         // Incremental sync: only rows modified after last sync

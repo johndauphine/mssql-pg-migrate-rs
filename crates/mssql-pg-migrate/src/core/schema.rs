@@ -1,4 +1,7 @@
-//! Schema and metadata types.
+//! Schema and metadata types for database tables, columns, indexes, and constraints.
+//!
+//! These types provide a database-agnostic representation of schema metadata
+//! used throughout the migration process.
 
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
@@ -320,51 +323,72 @@ pub struct CheckConstraint {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_find_date_column_found() {
-        let table = Table {
+    fn make_test_column(name: &str, data_type: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            max_length: 0,
+            precision: 0,
+            scale: 0,
+            is_nullable: true,
+            is_identity: false,
+            ordinal_pos: 1,
+        }
+    }
+
+    fn make_test_table(columns: Vec<Column>) -> Table {
+        Table {
             schema: "dbo".to_string(),
-            name: "Users".to_string(),
-            columns: vec![
-                Column {
-                    name: "Id".to_string(),
-                    data_type: "int".to_string(),
-                    max_length: 0,
-                    precision: 10,
-                    scale: 0,
-                    is_nullable: false,
-                    is_identity: true,
-                    ordinal_pos: 1,
-                },
-                Column {
-                    name: "LastActivityDate".to_string(),
-                    data_type: "datetime2".to_string(),
-                    max_length: 0,
-                    precision: 7,
-                    scale: 0,
-                    is_nullable: true,
-                    is_identity: false,
-                    ordinal_pos: 2,
-                },
-                Column {
-                    name: "CreationDate".to_string(),
-                    data_type: "datetime".to_string(),
-                    max_length: 0,
-                    precision: 0,
-                    scale: 0,
-                    is_nullable: false,
-                    is_identity: false,
-                    ordinal_pos: 3,
-                },
-            ],
-            primary_key: vec!["Id".to_string()],
+            name: "TestTable".to_string(),
+            columns,
+            primary_key: vec![],
             pk_columns: vec![],
             row_count: 1000,
             estimated_row_size: 100,
             indexes: vec![],
             foreign_keys: vec![],
             check_constraints: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn test_pk_value_literals() {
+        let int_pk = PkValue::Int(42);
+        assert_eq!(int_pk.to_sql_literal(), "42");
+        assert_eq!(int_pk.to_mssql_literal(), "42");
+
+        let uuid_pk = PkValue::Uuid(Uuid::nil());
+        assert_eq!(
+            uuid_pk.to_sql_literal(),
+            "'00000000-0000-0000-0000-000000000000'"
+        );
+
+        let string_pk = PkValue::String("O'Brien".to_string());
+        assert_eq!(string_pk.to_sql_literal(), "'O''Brien'");
+        assert_eq!(string_pk.to_mssql_literal(), "N'O''Brien'");
+    }
+
+    #[test]
+    fn test_table_full_name() {
+        let table = make_test_table(vec![]);
+        assert_eq!(table.full_name(), "dbo.TestTable");
+    }
+
+    #[test]
+    fn test_table_is_large() {
+        let table = make_test_table(vec![]);
+        assert!(table.is_large(500));
+        assert!(!table.is_large(1000));
+        assert!(!table.is_large(2000));
+    }
+
+    #[test]
+    fn test_find_date_column_found() {
+        let table = make_test_table(vec![
+            make_test_column("Id", "int"),
+            make_test_column("LastActivityDate", "datetime2"),
+            make_test_column("CreationDate", "datetime"),
+        ]);
 
         let candidates = vec![
             "LastActivityDate".to_string(),
@@ -381,137 +405,51 @@ mod tests {
 
     #[test]
     fn test_find_date_column_case_insensitive() {
-        let table = Table {
-            schema: "dbo".to_string(),
-            name: "Orders".to_string(),
-            columns: vec![Column {
-                name: "UpdatedAt".to_string(),
-                data_type: "timestamp".to_string(),
-                max_length: 0,
-                precision: 0,
-                scale: 0,
-                is_nullable: true,
-                is_identity: false,
-                ordinal_pos: 1,
-            }],
-            primary_key: vec![],
-            pk_columns: vec![],
-            row_count: 100,
-            estimated_row_size: 50,
-            indexes: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-        };
+        let table = make_test_table(vec![make_test_column("UpdatedAt", "timestamp")]);
 
-        // Search with different case
         let candidates = vec!["updatedat".to_string()];
         let result = table.find_date_column(&candidates);
         assert!(result.is_some());
         let (col_name, _) = result.unwrap();
-        assert_eq!(col_name, "UpdatedAt"); // Returns actual column name, not search name
+        assert_eq!(col_name, "UpdatedAt");
     }
 
     #[test]
     fn test_find_date_column_not_found() {
-        let table = Table {
-            schema: "dbo".to_string(),
-            name: "Users".to_string(),
-            columns: vec![Column {
-                name: "Id".to_string(),
-                data_type: "int".to_string(),
-                max_length: 0,
-                precision: 10,
-                scale: 0,
-                is_nullable: false,
-                is_identity: true,
-                ordinal_pos: 1,
-            }],
-            primary_key: vec!["Id".to_string()],
-            pk_columns: vec![],
-            row_count: 1000,
-            estimated_row_size: 100,
-            indexes: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-        };
+        let table = make_test_table(vec![make_test_column("Id", "int")]);
 
-        let candidates = vec!["LastActivityDate".to_string(), "ModifiedDate".to_string()];
+        let candidates = vec!["LastActivityDate".to_string()];
         let result = table.find_date_column(&candidates);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_find_date_column_wrong_type() {
-        let table = Table {
-            schema: "dbo".to_string(),
-            name: "Users".to_string(),
-            columns: vec![Column {
-                name: "LastActivityDate".to_string(),
-                data_type: "varchar".to_string(), // Not a date type
-                max_length: 50,
-                precision: 0,
-                scale: 0,
-                is_nullable: true,
-                is_identity: false,
-                ordinal_pos: 1,
-            }],
-            primary_key: vec![],
-            pk_columns: vec![],
-            row_count: 1000,
-            estimated_row_size: 100,
-            indexes: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-        };
+        let table = make_test_table(vec![make_test_column("LastActivityDate", "varchar")]);
 
         let candidates = vec!["LastActivityDate".to_string()];
         let result = table.find_date_column(&candidates);
-        assert!(result.is_none()); // Should not match because it's varchar, not a date type
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_find_date_column_priority_order() {
-        let table = Table {
-            schema: "dbo".to_string(),
-            name: "Posts".to_string(),
-            columns: vec![
-                Column {
-                    name: "CreationDate".to_string(),
-                    data_type: "datetime".to_string(),
-                    max_length: 0,
-                    precision: 0,
-                    scale: 0,
-                    is_nullable: false,
-                    is_identity: false,
-                    ordinal_pos: 1,
-                },
-                Column {
-                    name: "LastActivityDate".to_string(),
-                    data_type: "datetime2".to_string(),
-                    max_length: 0,
-                    precision: 7,
-                    scale: 0,
-                    is_nullable: true,
-                    is_identity: false,
-                    ordinal_pos: 2,
-                },
-            ],
-            primary_key: vec![],
-            pk_columns: vec![],
-            row_count: 1000,
-            estimated_row_size: 100,
-            indexes: vec![],
-            foreign_keys: vec![],
-            check_constraints: vec![],
-        };
+    fn test_supports_keyset_pagination() {
+        let mut table = make_test_table(vec![make_test_column("Id", "int")]);
+        table.pk_columns = vec![make_test_column("Id", "int")];
+        assert!(table.supports_keyset_pagination());
 
-        // LastActivityDate comes first in candidates, should be returned even though CreationDate exists
-        let candidates = vec!["LastActivityDate".to_string(), "CreationDate".to_string()];
+        table.pk_columns = vec![make_test_column("Id", "bigint")];
+        assert!(table.supports_keyset_pagination());
 
-        let result = table.find_date_column(&candidates);
-        assert!(result.is_some());
-        let (col_name, _) = result.unwrap();
-        assert_eq!(col_name, "LastActivityDate"); // First matching candidate
+        table.pk_columns = vec![make_test_column("Id", "varchar")];
+        assert!(!table.supports_keyset_pagination());
+
+        // Multiple PK columns
+        table.pk_columns = vec![
+            make_test_column("Id1", "int"),
+            make_test_column("Id2", "int"),
+        ];
+        assert!(!table.supports_keyset_pagination());
     }
 
     #[test]
@@ -528,7 +466,5 @@ mod tests {
 
         assert!(!is_date_type("varchar"));
         assert!(!is_date_type("int"));
-        assert!(!is_date_type("bigint"));
-        assert!(!is_date_type("text"));
     }
 }

@@ -3,7 +3,18 @@
 //! Supports both database and file-based storage:
 //! - **Database** (recommended): Stores state in target database `_mssql_pg_migrate` schema
 //! - **File**: Legacy file-based state for backwards compatibility
+//!
+//! # Design Pattern
+//!
+//! The state module uses the Strategy pattern via [`StateBackend`] trait.
+//! Different backends can be swapped at runtime:
+//!
+//! - `DbStateBackend`: PostgreSQL storage
+//! - `MssqlStateBackend`: MSSQL storage
+//!
+//! The orchestrator works with `Arc<dyn StateBackend>` for flexibility.
 
+pub mod backend;
 pub mod db;
 pub mod mssql_db;
 
@@ -17,16 +28,31 @@ use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub use backend::StateBackend;
 pub use db::DbStateBackend;
 pub use mssql_db::MssqlStateBackend;
 
 /// Enum wrapper for database state backend implementations.
-pub enum StateBackend {
+///
+/// This enum provides a convenient way to hold different backend implementations
+/// and implements the [`StateBackend`] trait for polymorphic usage.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Using the enum directly
+/// let backend = StateBackendEnum::Postgres(DbStateBackend::new(pool));
+/// backend.init_schema().await?;
+///
+/// // Or as a trait object
+/// let backend: Arc<dyn StateBackend> = Arc::new(DbStateBackend::new(pool));
+/// ```
+pub enum StateBackendEnum {
     Postgres(DbStateBackend),
     Mssql(MssqlStateBackend),
 }
 
-impl StateBackend {
+impl StateBackendEnum {
     /// Initialize the state schema.
     pub async fn init_schema(&self) -> Result<()> {
         match self {
@@ -52,14 +78,43 @@ impl StateBackend {
     }
 
     /// Get the last sync timestamp for a specific table.
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         match self {
             Self::Postgres(backend) => backend.get_last_sync_timestamp(table_name).await,
             Self::Mssql(backend) => backend.get_last_sync_timestamp(table_name).await,
         }
+    }
+
+    /// Get the backend type name.
+    pub fn backend_type(&self) -> &'static str {
+        match self {
+            Self::Postgres(_) => "postgres",
+            Self::Mssql(_) => "mssql",
+        }
+    }
+}
+
+// Implement the StateBackend trait for the enum wrapper
+#[async_trait::async_trait]
+impl StateBackend for StateBackendEnum {
+    async fn init_schema(&self) -> Result<()> {
+        StateBackendEnum::init_schema(self).await
+    }
+
+    async fn save(&self, state: &MigrationState) -> Result<()> {
+        StateBackendEnum::save(self, state).await
+    }
+
+    async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        StateBackendEnum::load_latest(self, config_hash).await
+    }
+
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
+        StateBackendEnum::get_last_sync_timestamp(self, table_name).await
+    }
+
+    fn backend_type(&self) -> &'static str {
+        StateBackendEnum::backend_type(self)
     }
 }
 
@@ -184,8 +239,9 @@ impl MigrationState {
         let mut state_for_signing = self.clone();
         state_for_signing.hmac = None;
 
-        let content = serde_json::to_string(&state_for_signing)
-            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+        let content = serde_json::to_string(&state_for_signing).map_err(|e| {
+            MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e))
+        })?;
 
         let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
             .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
@@ -210,8 +266,9 @@ impl MigrationState {
         let mut state_for_signing = self.clone();
         state_for_signing.hmac = None;
 
-        let content = serde_json::to_string(&state_for_signing)
-            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+        let content = serde_json::to_string(&state_for_signing).map_err(|e| {
+            MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e))
+        })?;
 
         let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
             .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
@@ -219,10 +276,11 @@ impl MigrationState {
         mac.update(content.as_bytes());
 
         // Constant-time comparison to prevent timing attacks
-        mac.verify_slice(&stored_bytes)
-            .map_err(|_| MigrateError::Config(
-                "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
-            ))
+        mac.verify_slice(&stored_bytes).map_err(|_| {
+            MigrateError::Config(
+                "State file integrity check failed: HMAC mismatch (possible tampering)".to_string(),
+            )
+        })
     }
 
     /// Load state from a file with integrity validation.
@@ -243,7 +301,9 @@ impl MigrationState {
         }
         // If no HMAC present, accept for backward compatibility but log warning
         else {
-            tracing::warn!("State file has no HMAC signature (older format), integrity cannot be verified");
+            tracing::warn!(
+                "State file has no HMAC signature (older format), integrity cannot be verified"
+            );
         }
 
         Ok(state)
@@ -403,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut state = MigrationState::new("test-run".into(), "abc123".into());
+        let state = MigrationState::new("test-run".into(), "abc123".into());
         assert!(state.validate_config("abc123").is_ok());
         assert!(state.validate_config("different").is_err());
     }
@@ -539,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_sync_timestamp_nonexistent_table() {
-        let mut state = MigrationState::new("test-run".into(), "hash".into());
+        let state = MigrationState::new("test-run".into(), "hash".into());
 
         // Should return None for non-existent table
         assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
@@ -554,10 +614,7 @@ mod tests {
         state.update_sync_timestamp("dbo.NonExistent", timestamp);
 
         // Should still return None
-        assert_eq!(
-            state.get_last_sync_timestamp("dbo.NonExistent"),
-            None
-        );
+        assert_eq!(state.get_last_sync_timestamp("dbo.NonExistent"), None);
     }
 
     #[test]

@@ -38,11 +38,28 @@ crates/
 ├── mssql-pg-migrate/        # Core library
 │   └── src/
 │       ├── config/          # Config loading, types, validation
+│       ├── core/            # Plugin architecture abstractions
+│       │   ├── traits.rs    # SourceReader, TargetWriter, Dialect, TypeMapper
+│       │   ├── catalog.rs   # DriverCatalog for dependency injection
+│       │   ├── schema.rs    # Table, Column, Index, ForeignKey
+│       │   └── value.rs     # SqlValue with Cow<'a, str> for zero-copy
+│       ├── drivers/         # Database driver implementations
+│       │   ├── mssql/       # MSSQL dialect
+│       │   ├── postgres/    # PostgreSQL dialect
+│       │   └── common/      # Shared utilities (TLS)
+│       ├── dialect/         # Type mapping registry
+│       │   └── typemap.rs   # MssqlToPostgres, PostgresToMssql mappers
+│       ├── pipeline/        # Transfer pipeline (Template Method)
+│       │   ├── template.rs  # TransferPipeline trait, PipelineConfig
+│       │   └── job.rs       # TransferJob (Command pattern)
 │       ├── orchestrator/    # Main coordinator, connection pools
 │       ├── transfer/        # Parallel read/write engine
 │       ├── source/          # SourcePool trait: MssqlPool, PgSourcePool
 │       ├── target/          # TargetPool trait: PgPool, MssqlTargetPool
 │       ├── state/           # Database-backed migration state
+│       │   ├── backend.rs   # StateBackend trait (Strategy pattern)
+│       │   ├── db.rs        # PostgreSQL state backend
+│       │   └── mssql_db.rs  # MSSQL state backend
 │       ├── typemap/         # Bidirectional MSSQL ↔ PostgreSQL type mapping
 │       └── error.rs         # Error types and exit codes
 │
@@ -70,8 +87,27 @@ crates/
 
 - **`SourcePool` trait** (`source/mod.rs`): Database-agnostic source operations. Implementations: `MssqlPool`, `PgSourcePool`
 - **`TargetPool` trait** (`target/mod.rs`): Database-agnostic target operations. Implementations: `PgPool`, `MssqlTargetPool`
-- **`StateBackend` enum** (`state/mod.rs`): Migration state stored in target DB (`_mssql_pg_migrate` schema)
+- **`StateBackend` trait** (`state/backend.rs`): Migration state storage strategy. Implementations: `DbStateBackend`, `MssqlStateBackend`
 - **`TransferEngine`** (`transfer/mod.rs`): Manages parallel read-ahead pipeline with configurable workers
+
+### Plugin Architecture (GoF Patterns)
+
+The codebase uses Gang of Four design patterns for extensibility:
+
+| Pattern | Implementation | Purpose |
+|---------|----------------|---------|
+| **Strategy** | `Dialect` trait, `StateBackend` trait | Interchangeable SQL syntax and state storage |
+| **Abstract Factory** | `DriverCatalog` | Creates related driver objects (dialect, mapper) |
+| **Template Method** | `TransferPipeline` trait | Algorithm skeleton with customizable steps |
+| **Command** | `TransferJob` | Encapsulates transfer work units for queuing |
+
+**Key Components:**
+
+- **`DriverCatalog`** (`core/catalog.rs`): Explicit dependency injection for dialects and type mappers
+- **`Dialect`** (`core/traits.rs`): SQL syntax strategy (quoting, upserts, pagination)
+- **`TypeMapper`** (`core/traits.rs`): Type conversion with (source, target) pair keying
+- **`TransferPipeline`** (`pipeline/template.rs`): Transfer algorithm with setup/execute/finalize phases
+- **`SqlValue`** (`core/value.rs`): Universal value type with `Cow<'a, str>` for zero-copy efficiency
 
 ### Concurrency Model
 

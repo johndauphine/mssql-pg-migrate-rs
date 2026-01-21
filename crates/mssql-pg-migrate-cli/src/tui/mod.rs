@@ -6,6 +6,8 @@
 //! - Streaming log output
 //! - Interactive migration control
 
+#![allow(dead_code, unused_imports)]
+
 mod actions;
 mod app;
 mod events;

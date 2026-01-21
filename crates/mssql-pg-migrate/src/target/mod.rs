@@ -110,6 +110,7 @@ pub trait TargetPool: Send + Sync {
     /// `writer_id` is used to create a unique staging table per writer to avoid conflicts.
     /// `partition_id` is used to create partition-specific staging tables when intra-table
     /// partitioning is enabled, avoiding collisions between parallel partition jobs.
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_chunk(
         &self,
         schema: &str,

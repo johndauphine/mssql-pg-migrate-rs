@@ -8,6 +8,7 @@ use predicates::prelude::*;
 use std::io::Write;
 
 /// Get a command for the mssql-pg-migrate binary.
+#[allow(deprecated)]
 fn cmd() -> Command {
     Command::cargo_bin("mssql-pg-migrate").unwrap()
 }
@@ -92,14 +93,8 @@ fn test_output_json_flag_exists() {
         .stdout(predicate::str::contains("--output-json"));
 }
 
-#[test]
-fn test_state_file_flag_exists() {
-    cmd()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--state-file"));
-}
+// Note: --state-file flag removed - state is now stored in target database
+// (_mssql_pg_migrate schema) instead of a file
 
 #[test]
 fn test_log_format_flag_exists() {

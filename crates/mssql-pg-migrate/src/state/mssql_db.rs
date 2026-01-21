@@ -1,12 +1,17 @@
 //! MSSQL database-backed state storage for migration runs.
 
-use crate::error::{MigrateError, Result};
-use crate::target::MssqlTargetPool;
-use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tiberius::Row;
+
+use crate::error::{MigrateError, Result};
+use crate::state::backend::{
+    run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend,
+};
+use crate::state::{MigrationState, RunStatus, TableState};
+use crate::target::MssqlTargetPool;
 
 /// MSSQL database state backend for migration runs.
 pub struct MssqlStateBackend {
@@ -135,7 +140,7 @@ impl MssqlStateBackend {
                         &state.config_hash,
                         &state.started_at,
                         &state.completed_at,
-                        &status_to_str(state.status),
+                        &run_status_to_str(state.status),
                         table_name,
                         &task_status_to_str(table_state.status),
                         &table_state.rows_total,
@@ -200,12 +205,16 @@ impl MssqlStateBackend {
 
         // Extract run-level fields from first row (all rows have same values)
         let first_row = &rows[0];
-        let run_id: String = first_row.get::<&str, _>(0).ok_or_else(|| {
-            MigrateError::State("Failed to get run_id from database".to_string())
-        })?.to_string();
-        let config_hash: String = first_row.get::<&str, _>(1).ok_or_else(|| {
-            MigrateError::State("Failed to get config_hash from database".to_string())
-        })?.to_string();
+        let run_id: String = first_row
+            .get::<&str, _>(0)
+            .ok_or_else(|| MigrateError::State("Failed to get run_id from database".to_string()))?
+            .to_string();
+        let config_hash: String = first_row
+            .get::<&str, _>(1)
+            .ok_or_else(|| {
+                MigrateError::State("Failed to get config_hash from database".to_string())
+            })?
+            .to_string();
         let started_at: DateTime<Utc> = first_row.get(2).ok_or_else(|| {
             MigrateError::State("Failed to get run_started_at from database".to_string())
         })?;
@@ -262,10 +271,7 @@ impl MssqlStateBackend {
     }
 
     /// Get the last sync timestamp for a specific table (for incremental sync).
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         let mut conn = self.pool.get_conn().await?;
 
         let sql = format!(
@@ -288,42 +294,33 @@ impl MssqlStateBackend {
 
         Ok(row.and_then(|r| r.get(0)))
     }
-}
 
-fn status_to_str(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Running => "running",
-        RunStatus::Completed => "completed",
-        RunStatus::Failed => "failed",
-        RunStatus::Cancelled => "cancelled",
+    /// Get the backend type name.
+    pub fn backend_type(&self) -> &'static str {
+        "mssql"
     }
 }
 
-fn str_to_run_status(s: &str) -> Result<RunStatus> {
-    match s {
-        "running" => Ok(RunStatus::Running),
-        "completed" => Ok(RunStatus::Completed),
-        "failed" => Ok(RunStatus::Failed),
-        "cancelled" => Ok(RunStatus::Cancelled),
-        _ => Err(MigrateError::Config(format!("Invalid run status: {}", s))),
+// Implement the StateBackend trait for MssqlStateBackend
+#[async_trait]
+impl StateBackend for MssqlStateBackend {
+    async fn init_schema(&self) -> Result<()> {
+        MssqlStateBackend::init_schema(self).await
     }
-}
 
-fn task_status_to_str(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Pending => "pending",
-        TaskStatus::InProgress => "in_progress",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
+    async fn save(&self, state: &MigrationState) -> Result<()> {
+        MssqlStateBackend::save(self, state).await
     }
-}
 
-fn str_to_task_status(s: &str) -> Result<TaskStatus> {
-    match s {
-        "pending" => Ok(TaskStatus::Pending),
-        "in_progress" => Ok(TaskStatus::InProgress),
-        "completed" => Ok(TaskStatus::Completed),
-        "failed" => Ok(TaskStatus::Failed),
-        _ => Err(MigrateError::Config(format!("Invalid task status: {}", s))),
+    async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        MssqlStateBackend::load_latest(self, config_hash).await
+    }
+
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
+        MssqlStateBackend::get_last_sync_timestamp(self, table_name).await
+    }
+
+    fn backend_type(&self) -> &'static str {
+        MssqlStateBackend::backend_type(self)
     }
 }

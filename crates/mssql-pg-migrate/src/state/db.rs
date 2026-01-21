@@ -7,11 +7,16 @@
 //! - No file system access required
 //! - Built-in audit trail
 
-use crate::error::{MigrateError, Result};
-use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use std::collections::HashMap;
+
+use crate::error::Result;
+use crate::state::backend::{
+    run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend,
+};
+use crate::state::{MigrationState, TableState};
 
 /// Database state backend for migration runs.
 pub struct DbStateBackend {
@@ -33,11 +38,8 @@ impl DbStateBackend {
         let conn = self.pool.get().await?;
 
         // Create schema
-        conn.execute(
-            &format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema),
-            &[],
-        )
-        .await?;
+        conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema), &[])
+            .await?;
 
         // Create denormalized table_state table (includes run-level fields)
         conn.execute(
@@ -127,7 +129,7 @@ impl DbStateBackend {
                     &state.config_hash,
                     &state.started_at,
                     &state.completed_at,
-                    &status_to_str(state.status),
+                    &run_status_to_str(state.status),
                     &table_name,
                     &task_status_to_str(table_state.status),
                     &table_state.rows_total,
@@ -226,10 +228,7 @@ impl DbStateBackend {
 
     /// Get the last sync timestamp for a specific table (for incremental sync).
     /// Returns the most recent completed run's timestamp for this table.
-    pub async fn get_last_sync_timestamp(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<DateTime<Utc>>> {
+    pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
         let conn = self.pool.get().await?;
 
         let row = conn
@@ -250,42 +249,33 @@ impl DbStateBackend {
 
         Ok(row.and_then(|r| r.get(0)))
     }
-}
 
-fn status_to_str(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Running => "running",
-        RunStatus::Completed => "completed",
-        RunStatus::Failed => "failed",
-        RunStatus::Cancelled => "cancelled",
+    /// Get the backend type name.
+    pub fn backend_type(&self) -> &'static str {
+        "postgres"
     }
 }
 
-fn str_to_run_status(s: &str) -> Result<RunStatus> {
-    match s {
-        "running" => Ok(RunStatus::Running),
-        "completed" => Ok(RunStatus::Completed),
-        "failed" => Ok(RunStatus::Failed),
-        "cancelled" => Ok(RunStatus::Cancelled),
-        _ => Err(MigrateError::Config(format!("Invalid run status: {}", s))),
+// Implement the StateBackend trait for DbStateBackend
+#[async_trait]
+impl StateBackend for DbStateBackend {
+    async fn init_schema(&self) -> Result<()> {
+        DbStateBackend::init_schema(self).await
     }
-}
 
-fn task_status_to_str(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Pending => "pending",
-        TaskStatus::InProgress => "in_progress",
-        TaskStatus::Completed => "completed",
-        TaskStatus::Failed => "failed",
+    async fn save(&self, state: &MigrationState) -> Result<()> {
+        DbStateBackend::save(self, state).await
     }
-}
 
-fn str_to_task_status(s: &str) -> Result<TaskStatus> {
-    match s {
-        "pending" => Ok(TaskStatus::Pending),
-        "in_progress" => Ok(TaskStatus::InProgress),
-        "completed" => Ok(TaskStatus::Completed),
-        "failed" => Ok(TaskStatus::Failed),
-        _ => Err(MigrateError::Config(format!("Invalid task status: {}", s))),
+    async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        DbStateBackend::load_latest(self, config_hash).await
+    }
+
+    async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
+        DbStateBackend::get_last_sync_timestamp(self, table_name).await
+    }
+
+    fn backend_type(&self) -> &'static str {
+        DbStateBackend::backend_type(self)
     }
 }
