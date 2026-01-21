@@ -19,6 +19,7 @@ use futures::SinkExt;
 use rustls::ClientConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_postgres::Config as PgConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -290,6 +291,13 @@ impl PgPool {
         pg_config.user(&config.user);
         pg_config.password(&config.password);
 
+        // Configure TCP keepalives and timeouts to detect dead connections
+        // This ensures zombie connections are cleaned up even after ungraceful shutdown (SIGKILL)
+        pg_config.keepalives(true);
+        pg_config.keepalives_idle(Duration::from_secs(30)); // Send keepalive after 30s idle
+        pg_config.tcp_user_timeout(Duration::from_secs(60)); // Close dead connection after 60s
+        pg_config.connect_timeout(Duration::from_secs(30)); // Timeout on initial connect
+
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
@@ -301,6 +309,8 @@ impl PgPool {
                 let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
                 Pool::builder(mgr)
                     .max_size(max_conns)
+                    .wait_timeout(Some(Duration::from_secs(30))) // Timeout waiting for connection from pool
+                    .recycle_timeout(Some(Duration::from_secs(5))) // Timeout recycling connection
                     .build()
                     .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?
             }
@@ -311,6 +321,8 @@ impl PgPool {
                 let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
                 let pool = Pool::builder(mgr)
                     .max_size(max_conns)
+                    .wait_timeout(Some(Duration::from_secs(30))) // Timeout waiting for connection from pool
+                    .recycle_timeout(Some(Duration::from_secs(5))) // Timeout recycling connection
                     .build()
                     .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?;
                 info!("PostgreSQL TLS enabled (ssl_mode={})", ssl_mode);
