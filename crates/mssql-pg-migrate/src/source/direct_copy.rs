@@ -340,20 +340,20 @@ impl DirectCopyEncoder {
             .encoders
             .iter()
             .map(|e| match e {
-                ColumnEncoder::Bool => 1 + 4,       // value + length
-                ColumnEncoder::TinyInt => 2 + 4,    // smallint + length
-                ColumnEncoder::SmallInt => 2 + 4,   // smallint + length
-                ColumnEncoder::Int => 4 + 4,        // int + length
-                ColumnEncoder::BigInt => 8 + 4,     // bigint + length
-                ColumnEncoder::Real => 4 + 4,       // float4 + length
-                ColumnEncoder::Float => 8 + 4,      // float8 + length
-                ColumnEncoder::DateTime => 8 + 4,   // timestamp + length
-                ColumnEncoder::Date => 4 + 4,       // date + length
-                ColumnEncoder::Time => 8 + 4,       // time + length
-                ColumnEncoder::Uuid => 16 + 4,      // uuid + length
-                ColumnEncoder::Decimal => 20 + 4,   // avg decimal + length
-                ColumnEncoder::String => 50 + 4,    // avg varchar + length
-                ColumnEncoder::Bytes => 100 + 4,    // avg varbinary + length
+                ColumnEncoder::Bool => 1 + 4,     // value + length
+                ColumnEncoder::TinyInt => 2 + 4,  // smallint + length
+                ColumnEncoder::SmallInt => 2 + 4, // smallint + length
+                ColumnEncoder::Int => 4 + 4,      // int + length
+                ColumnEncoder::BigInt => 8 + 4,   // bigint + length
+                ColumnEncoder::Real => 4 + 4,     // float4 + length
+                ColumnEncoder::Float => 8 + 4,    // float8 + length
+                ColumnEncoder::DateTime => 8 + 4, // timestamp + length
+                ColumnEncoder::Date => 4 + 4,     // date + length
+                ColumnEncoder::Time => 8 + 4,     // time + length
+                ColumnEncoder::Uuid => 16 + 4,    // uuid + length
+                ColumnEncoder::Decimal => 20 + 4, // avg decimal + length
+                ColumnEncoder::String => 50 + 4,  // avg varchar + length
+                ColumnEncoder::Bytes => 100 + 4,  // avg varbinary + length
             })
             .sum();
 
