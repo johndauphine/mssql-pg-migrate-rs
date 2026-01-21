@@ -429,6 +429,14 @@ pub struct MigrationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upsert_parallel_tasks: Option<usize>,
 
+    /// Date-based incremental sync column names (upsert mode only).
+    /// When set, the tool will look for these columns in each table (in order)
+    /// and only sync rows where column > last_sync_timestamp.
+    /// Significantly speeds up incremental syncs by filtering at source.
+    /// Example: ["LastActivityDate", "ModifiedDate", "UpdatedAt", "CreationDate"]
+    #[serde(default)]
+    pub date_updated_columns: Vec<String>,
+
     /// Memory budget as percentage of available RAM (default: 70).
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
@@ -460,6 +468,7 @@ impl Default for MigrationConfig {
             use_unlogged_tables: false,
             upsert_batch_size: None,
             upsert_parallel_tasks: None,
+            date_updated_columns: Vec::new(),
             memory_budget_percent: default_memory_budget_percent(),
         }
     }

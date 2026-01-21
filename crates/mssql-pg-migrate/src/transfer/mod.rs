@@ -10,6 +10,7 @@ use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
 use crate::source::Table;
 use crate::target::SqlValue;
+use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -17,6 +18,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Date-based incremental sync filter.
+/// Only sync rows where the specified column is greater than the timestamp (or is NULL).
+#[derive(Debug, Clone)]
+pub struct DateFilter {
+    /// Date column name to filter on.
+    pub column: String,
+    /// Only sync rows where column > timestamp (or column IS NULL).
+    pub timestamp: DateTime<Utc>,
+}
 
 /// Transfer job for a single table or partition.
 #[derive(Debug, Clone)]
@@ -41,6 +52,9 @@ pub struct TransferJob {
 
     /// Target schema name.
     pub target_schema: String,
+
+    /// Date filter for incremental sync (upsert mode only).
+    pub date_filter: Option<DateFilter>,
 }
 
 /// Statistics from a transfer job.

@@ -980,6 +980,7 @@ impl Orchestrator {
                                 resume_from_pk: None, // Partitions don't support resume yet
                                 target_mode: self.config.migration.target_mode,
                                 target_schema: self.config.target.schema.clone(),
+                                date_filter: None, // TODO: Add date filter support
                             };
 
                             let engine_clone = engine.clone();
@@ -1025,6 +1026,7 @@ impl Orchestrator {
                 resume_from_pk: state.tables.get(&table_name).and_then(|ts| ts.last_pk),
                 target_mode: self.config.migration.target_mode,
                 target_schema: self.config.target.schema.clone(),
+                date_filter: None, // TODO: Add date filter support
             };
 
             let engine_clone = engine.clone();

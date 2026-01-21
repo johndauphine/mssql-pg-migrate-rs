@@ -65,6 +65,12 @@ pub struct TableState {
 
     /// Error message if failed.
     pub error: Option<String>,
+
+    /// Last sync timestamp for incremental upsert (date watermark).
+    /// Stores the sync start time after successful completion.
+    /// Used to filter source rows on next run: WHERE date_column > last_sync_timestamp.
+    #[serde(default)]
+    pub last_sync_timestamp: Option<DateTime<Utc>>,
 }
 
 /// Per-partition state.
@@ -145,6 +151,7 @@ impl MigrationState {
                 partitions: None,
                 completed_at: None,
                 error: None,
+                last_sync_timestamp: None,
             })
     }
 
@@ -154,6 +161,22 @@ impl MigrationState {
             .get(table_name)
             .map(|t| t.status == TaskStatus::Completed)
             .unwrap_or(false)
+    }
+
+    /// Get last sync timestamp for a table (for incremental upsert).
+    /// Returns None if table hasn't been synced before or doesn't exist.
+    pub fn get_last_sync_timestamp(&self, table_name: &str) -> Option<DateTime<Utc>> {
+        self.tables
+            .get(table_name)
+            .and_then(|t| t.last_sync_timestamp)
+    }
+
+    /// Update last sync timestamp for a table (for incremental upsert).
+    /// This should be called with the sync start time after successful completion.
+    pub fn update_sync_timestamp(&mut self, table_name: &str, timestamp: DateTime<Utc>) {
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.last_sync_timestamp = Some(timestamp);
+        }
     }
 
     /// Mark the migration as completed.
@@ -181,6 +204,7 @@ impl TableState {
             partitions: None,
             completed_at: None,
             error: None,
+            last_sync_timestamp: None,
         }
     }
 
