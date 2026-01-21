@@ -269,6 +269,11 @@ pub trait TargetWriter: Send + Sync {
 ///
 /// This is a **Strategy** pattern - different implementations provide
 /// interchangeable SQL syntax rules.
+///
+/// # enum_dispatch
+///
+/// This trait is used with `enum_dispatch` to enable zero-cost
+/// polymorphism via the `DialectImpl` enum in the `drivers` module.
 pub trait Dialect: Send + Sync {
     /// Get the dialect identifier (e.g., "mssql", "postgres").
     fn name(&self) -> &str;
