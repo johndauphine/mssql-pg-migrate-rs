@@ -680,49 +680,6 @@ fn bind_value<'q>(
     }
 }
 
-/// Format MySQL type.
-fn format_mysql_type(data_type: &str, max_length: i32, precision: i32, scale: i32) -> String {
-    let lower = data_type.to_lowercase();
-    match lower.as_str() {
-        "decimal" | "numeric" => {
-            if precision > 0 {
-                format!("DECIMAL({},{})", precision, scale)
-            } else {
-                "DECIMAL(10,0)".to_string()
-            }
-        }
-        "varchar" => {
-            if max_length > 0 && max_length <= 65535 {
-                format!("VARCHAR({})", max_length)
-            } else {
-                "TEXT".to_string()
-            }
-        }
-        "char" => {
-            if max_length > 0 && max_length <= 255 {
-                format!("CHAR({})", max_length)
-            } else {
-                "TEXT".to_string()
-            }
-        }
-        "binary" => {
-            if max_length > 0 && max_length <= 255 {
-                format!("BINARY({})", max_length)
-            } else {
-                "BLOB".to_string()
-            }
-        }
-        "varbinary" => {
-            if max_length > 0 && max_length <= 65535 {
-                format!("VARBINARY({})", max_length)
-            } else {
-                "BLOB".to_string()
-            }
-        }
-        _ => data_type.to_string(),
-    }
-}
-
 /// Map referential action.
 fn map_referential_action(action: &str) -> &str {
     match action.to_uppercase().as_str() {
