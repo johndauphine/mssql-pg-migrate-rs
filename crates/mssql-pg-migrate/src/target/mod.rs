@@ -307,10 +307,11 @@ impl PgPool {
             "disable" => {
                 warn!("PostgreSQL TLS is disabled. Credentials will be transmitted in plaintext.");
                 let mgr = Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
+                // Note: Pool-level timeouts (.wait_timeout, .recycle_timeout) removed
+                // due to incompatibility with deadpool 0.14 runtime requirements.
+                // TCP keepalives (configured above) provide connection-level dead connection detection.
                 Pool::builder(mgr)
                     .max_size(max_conns)
-                    .wait_timeout(Some(Duration::from_secs(30))) // Timeout waiting for connection from pool
-                    .recycle_timeout(Some(Duration::from_secs(5))) // Timeout recycling connection
                     .build()
                     .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?
             }
@@ -319,10 +320,11 @@ impl PgPool {
                 let tls_config = Self::build_tls_config(ssl_mode)?;
                 let tls_connector = MakeRustlsConnect::new(tls_config);
                 let mgr = Manager::from_config(pg_config, tls_connector, mgr_config);
+                // Note: Pool-level timeouts (.wait_timeout, .recycle_timeout) removed
+                // due to incompatibility with deadpool 0.14 runtime requirements.
+                // TCP keepalives (configured above) provide connection-level dead connection detection.
                 let pool = Pool::builder(mgr)
                     .max_size(max_conns)
-                    .wait_timeout(Some(Duration::from_secs(30))) // Timeout waiting for connection from pool
-                    .recycle_timeout(Some(Duration::from_secs(5))) // Timeout recycling connection
                     .build()
                     .map_err(|e| MigrateError::pool(e, "creating PostgreSQL connection pool"))?;
                 info!("PostgreSQL TLS enabled (ssl_mode={})", ssl_mode);
