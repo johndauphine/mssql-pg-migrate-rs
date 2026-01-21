@@ -79,6 +79,9 @@ hex = { workspace = true }
 # Connection pooling
 bb8 = { workspace = true }
 
+# Socket configuration for TCP keepalives
+socket2 = { version = "0.5", features = ["all"] }
+
 # System info detection
 sysinfo = { workspace = true }
 

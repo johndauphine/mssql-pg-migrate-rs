@@ -24,16 +24,33 @@ use crate::target::{SqlNullType, SqlValue};
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
 use chrono::NaiveDateTime;
+use std::time::Duration;
 use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Maximum TDS packet size (32767 bytes, ~32KB).
 /// SQL Server on Linux/Docker negotiates down to 16KB, but we request the maximum.
 /// This improves bulk read performance by ~42% compared to the default 4KB.
 const TDS_MAX_PACKET_SIZE: u32 = 32767;
+
+/// Connection acquisition timeout from pool (30 seconds).
+/// Prevents workers from waiting indefinitely for connections during high contention.
+const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle connection timeout (5 minutes).
+/// Connections idle longer than this are closed to free resources and prevent zombie connections.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum connection lifetime (30 minutes).
+/// Connections older than this are recycled to prevent long-lived zombie connections.
+const POOL_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+
+/// TCP keepalive interval (30 seconds).
+/// Sends keepalive probes to detect dead connections at the TCP level.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Trait for source database operations.
 #[async_trait]
@@ -132,17 +149,62 @@ impl bb8::ManageConnection for TiberiusConnectionManager {
             }
         })?;
 
+        // Enable TCP nodelay for lower latency
         tcp.set_nodelay(true).ok();
 
-        Client::connect(config, tcp.compat_write()).await
+        // Enable TCP keepalives to detect dead connections at the network level.
+        // This is critical for preventing zombie connections that can cause migration hangs.
+        // Note: Tokio's TcpStream doesn't directly expose keepalive settings, so we use
+        // the lower-level socket API via into_std().
+        if let Ok(std_tcp) = tcp.into_std() {
+            // Set TCP keepalive using socket2 for cross-platform support
+            use std::net::TcpStream as StdTcpStream;
+            let socket = socket2::Socket::from(std_tcp);
+
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(TCP_KEEPALIVE_INTERVAL)
+                .with_interval(TCP_KEEPALIVE_INTERVAL);
+
+            if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+                warn!("Failed to set TCP keepalive on MSSQL connection: {}", e);
+            }
+
+            // Convert back to tokio TcpStream
+            let std_tcp: StdTcpStream = socket.into();
+            std_tcp.set_nonblocking(true).ok();
+            let tcp = TcpStream::from_std(std_tcp).map_err(|e| tiberius::error::Error::Io {
+                kind: e.kind(),
+                message: format!("Failed to convert socket: {}", e),
+            })?;
+
+            Client::connect(config, tcp.compat_write()).await
+        } else {
+            // Fallback if we can't set keepalives (shouldn't happen)
+            warn!("Failed to configure TCP keepalives on MSSQL connection");
+            let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
+                tiberius::error::Error::Io {
+                    kind: e.kind(),
+                    message: e.to_string(),
+                }
+            })?;
+            tcp.set_nodelay(true).ok();
+            Client::connect(config, tcp.compat_write()).await
+        }
     }
 
     async fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        // Validate connection with a simple query.
+        // This catches connections that are broken but not detected by TCP keepalives.
         conn.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        // bb8 calls this synchronously to check if connection should be discarded.
+        // Tiberius Client doesn't expose a direct "is_broken" flag, but we rely on:
+        // 1. TCP keepalives to detect dead connections at network level
+        // 2. is_valid() check on checkout (test_on_checkout enabled)
+        // 3. Pool-level timeouts to recycle stale connections
         false
     }
 }
@@ -164,6 +226,14 @@ impl MssqlPool {
         let pool = Pool::builder()
             .max_size(max_size)
             .min_idle(Some(1))
+            // Connection acquisition timeout - prevents indefinite blocking
+            .connection_timeout(POOL_CONNECTION_TIMEOUT)
+            // Idle connection cleanup - prevents zombie connections from accumulating
+            .idle_timeout(Some(POOL_IDLE_TIMEOUT))
+            // Maximum connection lifetime - forces connection recycling
+            .max_lifetime(Some(POOL_MAX_LIFETIME))
+            // Validate connections before returning from pool
+            .test_on_check_out(true)
             .build(manager)
             .await
             .map_err(|e| MigrateError::pool(e, "creating MSSQL connection pool"))?;
