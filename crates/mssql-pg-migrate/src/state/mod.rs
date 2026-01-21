@@ -195,25 +195,51 @@ impl MigrationState {
         Ok(hex::encode(result.into_bytes()))
     }
 
+    /// Verify HMAC signature using constant-time comparison.
+    ///
+    /// # Security
+    ///
+    /// Uses HMAC's verify_slice() which performs constant-time comparison
+    /// to prevent timing attacks that could leak information about the expected HMAC.
+    fn verify_hmac(&self, stored_hmac: &str) -> Result<()> {
+        // Decode stored hex HMAC to bytes
+        let stored_bytes = hex::decode(stored_hmac)
+            .map_err(|e| MigrateError::Config(format!("Invalid HMAC format: {}", e)))?;
+
+        // Create a copy without HMAC for verification
+        let mut state_for_signing = self.clone();
+        state_for_signing.hmac = None;
+
+        let content = serde_json::to_string(&state_for_signing)
+            .map_err(|e| MigrateError::Config(format!("Failed to serialize state for HMAC: {}", e)))?;
+
+        let mut mac = HmacSha256::new_from_slice(self.config_hash.as_bytes())
+            .map_err(|e| MigrateError::Config(format!("Failed to create HMAC: {}", e)))?;
+
+        mac.update(content.as_bytes());
+
+        // Constant-time comparison to prevent timing attacks
+        mac.verify_slice(&stored_bytes)
+            .map_err(|_| MigrateError::Config(
+                "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
+            ))
+    }
+
     /// Load state from a file with integrity validation.
     ///
     /// # Security
     ///
     /// Validates HMAC signature if present to detect tampering.
+    /// Uses constant-time comparison to prevent timing attacks.
     /// Older state files without HMAC are still accepted for backward compatibility,
     /// but will be upgraded to include HMAC on next save.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let state: Self = serde_json::from_str(&content)?;
 
-        // Validate HMAC if present
+        // Validate HMAC if present using constant-time comparison
         if let Some(stored_hmac) = &state.hmac {
-            let expected_hmac = state.compute_hmac()?;
-            if stored_hmac != &expected_hmac {
-                return Err(MigrateError::Config(
-                    "State file integrity check failed: HMAC mismatch (possible tampering)".to_string()
-                ));
-            }
+            state.verify_hmac(stored_hmac)?;
         }
         // If no HMAC present, accept for backward compatibility but log warning
         else {
@@ -278,8 +304,17 @@ impl MigrationState {
             .unwrap_or(false)
     }
 
-    /// Get last sync timestamp for a table (for incremental upsert).
-    /// Returns None if table hasn't been synced before or doesn't exist.
+    /// Get last sync timestamp from in-memory state.
+    ///
+    /// # Test-Only Method
+    ///
+    /// This method is restricted to test code only via `#[cfg(test)]`.
+    /// For production incremental sync logic, use `StateBackend::get_last_sync_timestamp()`
+    /// which queries the database for historical completed runs.
+    ///
+    /// This in-memory method only returns timestamps from the current run's state,
+    /// which is not useful for incremental sync (needs historical data).
+    #[cfg(test)]
     pub fn get_last_sync_timestamp(&self, table_name: &str) -> Option<DateTime<Utc>> {
         self.tables
             .get(table_name)

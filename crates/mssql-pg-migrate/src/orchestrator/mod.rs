@@ -944,6 +944,11 @@ impl Orchestrator {
         // Track sync start times per table (for updating watermark after successful completion)
         let mut table_sync_start_times: HashMap<String, DateTime<Utc>> = HashMap::new();
 
+        // Track incremental sync statistics for summary logging
+        let mut tables_incremental: usize = 0;
+        let mut tables_first_sync: usize = 0;
+        let mut tables_no_date_column: usize = 0;
+
         for table in pending_tables {
             // Check for cancellation
             if cancel.is_cancelled() {
@@ -965,13 +970,14 @@ impl Orchestrator {
                     table.find_date_column(&self.config.migration.date_updated_columns)
                 {
 
-                    // Get last sync timestamp from state
-                    let last_sync = state.get_last_sync_timestamp(&table_name);
+                    // Get last sync timestamp from database (queries historical completed runs)
+                    let last_sync = self.state_backend.get_last_sync_timestamp(&table_name).await?;
 
                     if let Some(last_sync_ts) = last_sync {
                         // Incremental sync: only rows modified after last sync
                         match DateFilter::new(col_name.clone(), last_sync_ts) {
                             Ok(filter) => {
+                                tables_incremental += 1;
                                 info!(
                                     "{}: incremental sync from {} using {} ({})",
                                     table_name,
@@ -982,6 +988,7 @@ impl Orchestrator {
                                 Some(filter)
                             }
                             Err(e) => {
+                                tables_first_sync += 1;
                                 warn!(
                                     "{}: invalid sync timestamp, falling back to full sync: {}",
                                     table_name, e
@@ -991,6 +998,7 @@ impl Orchestrator {
                         }
                     } else {
                         // First sync: full load, but record timestamp for next run
+                        tables_first_sync += 1;
                         info!(
                             "{}: first sync (full load), date column {} found",
                             table_name, col_name
@@ -999,8 +1007,9 @@ impl Orchestrator {
                     }
                 } else {
                     // No matching date column found, use full sync
-                    debug!(
-                        "{}: no date column found in {:?}, using full sync",
+                    tables_no_date_column += 1;
+                    info!(
+                        "{}: no matching date column (configured: {:?}), using full sync",
                         table_name, self.config.migration.date_updated_columns
                     );
                     None
@@ -1112,6 +1121,14 @@ impl Orchestrator {
                 let result = engine_clone.execute(job).await;
                 (job_name, result)
             });
+        }
+
+        // Log incremental sync summary if date-based sync is enabled
+        if date_incremental_enabled {
+            info!(
+                "Sync mode summary: {} incremental, {} first-time full, {} no date column",
+                tables_incremental, tables_first_sync, tables_no_date_column
+            );
         }
 
         // Collect results using JoinSet.join_next() for completion-order processing.

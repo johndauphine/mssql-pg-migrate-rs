@@ -89,6 +89,11 @@ impl SlashCommand {
                 shortcut: None,
             },
             SlashCommand {
+                name: "/config",
+                description: "Show config (reloads from disk) [@path]",
+                shortcut: None,
+            },
+            SlashCommand {
                 name: "/logs",
                 description: "Save logs to file",
                 shortcut: None,
@@ -779,6 +784,10 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Reload config before running
+                if !self.try_load_config(None) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting migration..."));
                 self.spawn_migration(false, false).await;
             }
@@ -787,12 +796,20 @@ impl App {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
                     return Ok(());
                 }
+                // Reload config before running
+                if !self.try_load_config(None) {
+                    return Ok(());
+                }
                 self.add_transcript(TranscriptEntry::info("Starting dry run..."));
                 self.spawn_migration(true, false).await;
             }
             Action::Resume => {
                 if !self.can_start_migration() {
                     self.add_transcript(TranscriptEntry::error("Migration already in progress"));
+                    return Ok(());
+                }
+                // Reload config before running
+                if !self.try_load_config(None) {
                     return Ok(());
                 }
                 self.add_transcript(TranscriptEntry::info("Resuming migration..."));
@@ -871,7 +888,7 @@ impl App {
             .with_progress_channel(progress_tx);
 
         if resume {
-            orchestrator = orchestrator.resume()?;
+            orchestrator = orchestrator.resume().await?;
         }
 
         orchestrator.run(cancel, dry_run).await
@@ -1132,29 +1149,34 @@ impl App {
     }
 
     /// Try to load a config file if a path is provided.
-    /// Returns true if successful or if no path was provided.
+    /// If no path is provided, reloads the current config file.
+    /// Returns true if successful.
     /// Returns false if loading failed (error is added to transcript).
     fn try_load_config(&mut self, file_path: Option<&str>) -> bool {
-        if let Some(path) = file_path.filter(|p| !p.is_empty()) {
-            match Config::load(path) {
-                Ok(new_config) => {
-                    self.config_path = PathBuf::from(path);
-                    self.config_summary =
-                        ConfigSummary::from_config(&new_config, &self.config_path);
-                    self.config = new_config;
-                    self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
-                    true
-                }
-                Err(e) => {
-                    self.add_transcript(TranscriptEntry::error(format!(
-                        "Failed to load config: {}",
-                        e
-                    )));
-                    false
-                }
-            }
+        // Use provided path or fall back to current config_path
+        let path = if let Some(p) = file_path.filter(|p| !p.is_empty()) {
+            p.to_string()
         } else {
-            true // No path provided, use existing config
+            // Auto-reload current config file
+            self.config_path.to_str().unwrap_or("config.yaml").to_string()
+        };
+
+        match Config::load(&path) {
+            Ok(new_config) => {
+                self.config_path = PathBuf::from(&path);
+                self.config_summary =
+                    ConfigSummary::from_config(&new_config, &self.config_path);
+                self.config = new_config;
+                self.add_transcript(TranscriptEntry::info(format!("Loaded config: {}", path)));
+                true
+            }
+            Err(e) => {
+                self.add_transcript(TranscriptEntry::error(format!(
+                    "Failed to load config: {}",
+                    e
+                )));
+                false
+            }
         }
     }
 
@@ -1423,6 +1445,26 @@ impl App {
                     "Starting configuration wizard (output: {})...",
                     path_display
                 )));
+            }
+            "/config" => {
+                // Reload the config file and display it
+                if self.try_load_config(file_path) {
+                    // Convert config to YAML for display
+                    match serde_yaml::to_string(&self.config) {
+                        Ok(yaml) => {
+                            self.add_transcript(TranscriptEntry::info("Current configuration:"));
+                            for line in yaml.lines() {
+                                self.add_transcript(TranscriptEntry::info(format!("  {}", line)));
+                            }
+                        }
+                        Err(e) => {
+                            self.add_transcript(TranscriptEntry::error(format!(
+                                "Failed to serialize config: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
             }
             "/logs" => {
                 self.save_logs();
