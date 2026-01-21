@@ -59,11 +59,24 @@ impl DriverCatalog {
     ///
     /// This is a convenience method that registers MSSQL and PostgreSQL
     /// dialects and their type mappers.
-    #[allow(dead_code)]
     pub fn with_builtins() -> Self {
-        let catalog = Self::new();
-        // Builtins will be registered by drivers module
-        // This method exists so drivers/mod.rs can populate it
+        use crate::dialect::{IdentityMapper, MssqlToPostgresMapper, PostgresToMssqlMapper};
+        use crate::drivers::{MssqlDialect, PostgresDialect};
+
+        let mut catalog = Self::new();
+
+        // Register dialects
+        catalog.register_dialect("mssql", MssqlDialect::new());
+        catalog.register_dialect("postgres", PostgresDialect::new());
+
+        // Register type mappers for all source→target combinations
+        catalog.register_mapper("mssql", "postgres", Arc::new(MssqlToPostgresMapper::new()));
+        catalog.register_mapper("postgres", "mssql", Arc::new(PostgresToMssqlMapper::new()));
+
+        // Identity mappers for same-dialect transfers
+        catalog.register_mapper("mssql", "mssql", Arc::new(IdentityMapper::new("mssql")));
+        catalog.register_mapper("postgres", "postgres", Arc::new(IdentityMapper::new("postgres")));
+
         catalog
     }
 
