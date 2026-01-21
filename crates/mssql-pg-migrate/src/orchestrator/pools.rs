@@ -80,6 +80,75 @@ fn convert_sql_value(old: SqlValue) -> NewSqlValue<'static> {
     }
 }
 
+/// MySQL UpsertWriter wrapper that implements the UpsertWriter trait using the new TargetWriter API.
+#[cfg(feature = "mysql")]
+pub struct MysqlUpsertWriter {
+    writer: Arc<MysqlWriter>,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+}
+
+#[cfg(feature = "mysql")]
+impl MysqlUpsertWriter {
+    /// Create a new MySQL upsert writer.
+    pub fn new(
+        writer: Arc<MysqlWriter>,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Self {
+        Self {
+            writer,
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+        }
+    }
+}
+
+#[cfg(feature = "mysql")]
+#[async_trait::async_trait]
+impl UpsertWriter for MysqlUpsertWriter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<u64> {
+        // Convert old SqlValue to new SqlValue
+        let new_rows: Vec<Vec<NewSqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_sql_value).collect())
+            .collect();
+
+        let batch = Batch {
+            rows: new_rows,
+            last_key: None,
+            is_last: false,
+        };
+
+        NewTargetWriter::upsert_batch(
+            self.writer.as_ref(),
+            &self.schema,
+            &self.table,
+            cols,
+            pk_cols,
+            batch,
+            self.writer_id,
+            self.partition_id,
+        )
+        .await
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        false
+    }
+}
+
 /// Enum wrapper for source pool implementations.
 pub enum SourcePoolImpl {
     Mssql(Arc<MssqlPool>),
@@ -459,6 +528,12 @@ impl TargetPoolImpl {
         }
     }
 
+    /// Returns true if this target supports direct copy encoding (PostgreSQL binary format).
+    /// Only PostgreSQL targets support this - MSSQL and MySQL use parameterized inserts.
+    pub fn supports_direct_copy(&self) -> bool {
+        matches!(self, Self::Postgres(_))
+    }
+
     /// Create a state backend appropriate for this target database type.
     pub fn create_state_backend(&self) -> Result<StateBackendEnum> {
         match self {
@@ -736,13 +811,15 @@ impl TargetPoolImpl {
                     .await
             }
             #[cfg(feature = "mysql")]
-            Self::Mysql(_) => {
-                // MySQL uses the new trait-based API
-                Err(crate::error::MigrateError::Config(
-                    "MySQL target does not support get_upsert_writer. \
-                     Use the new TargetWriter API with upsert_batch."
-                        .to_string(),
-                ))
+            Self::Mysql(p) => {
+                // MySQL uses the MysqlUpsertWriter wrapper
+                Ok(Box::new(MysqlUpsertWriter::new(
+                    Arc::clone(p),
+                    schema,
+                    table,
+                    writer_id,
+                    partition_id,
+                )))
             }
         }
     }
