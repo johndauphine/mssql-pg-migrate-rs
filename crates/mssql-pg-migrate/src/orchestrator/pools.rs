@@ -16,6 +16,7 @@ use crate::source::{
     CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
 };
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
+use deadpool_postgres::Pool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -310,6 +311,16 @@ impl TargetPoolImpl {
         match self {
             Self::Mssql(p) => p.db_type(),
             Self::Postgres(p) => p.db_type(),
+        }
+    }
+
+    /// Get the PostgreSQL pool (only available for Postgres targets).
+    pub fn postgres_pool(&self) -> Result<Pool> {
+        match self {
+            Self::Postgres(p) => Ok(p.pool().clone()),
+            Self::Mssql(_) => Err(MigrateError::Config(
+                "Migration state storage requires PostgreSQL target database".to_string(),
+            )),
         }
     }
 

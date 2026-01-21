@@ -1913,6 +1913,11 @@ impl UpsertWriter for PgUpsertWriter {
 }
 
 impl PgPool {
+    /// Get the underlying connection pool.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     /// Test the connection to the PostgreSQL database.
     pub async fn test_connection(&self) -> Result<()> {
         let client = self

@@ -7,13 +7,12 @@ pub use pools::{SourcePoolImpl, TargetPoolImpl};
 use crate::config::{Config, TableStats, TargetMode};
 use crate::error::{MigrateError, Result};
 use crate::source::Table;
-use crate::state::{MigrationState, RunStatus, TableState, TaskStatus};
+use crate::state::{DbStateBackend, MigrationState, RunStatus, TableState, TaskStatus};
 use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,7 +24,7 @@ use tracing::{debug, error, info, warn};
 /// Migration orchestrator.
 pub struct Orchestrator {
     config: Config,
-    state_file: Option<PathBuf>,
+    state_backend: DbStateBackend,
     state: Option<MigrationState>,
     source: SourcePoolImpl,
     target: TargetPoolImpl,
@@ -285,21 +284,20 @@ impl Orchestrator {
         let target = TargetPoolImpl::from_config(&config).await?;
         info!("Connected to {} target database", target.db_type());
 
+        // Initialize database state backend (requires PostgreSQL target)
+        let state_backend = DbStateBackend::new(target.postgres_pool()?);
+        state_backend.init_schema().await?;
+        info!("Initialized migration state schema in target database");
+
         Ok(Self {
             config,
-            state_file: None,
+            state_backend,
             state: None,
             source,
             target,
             progress_enabled: false,
             progress_tx: None,
         })
-    }
-
-    /// Set the state file path for resume capability.
-    pub fn with_state_file(mut self, path: PathBuf) -> Self {
-        self.state_file = Some(path);
-        self
     }
 
     /// Enable progress reporting to stderr as JSON lines.
@@ -341,16 +339,20 @@ impl Orchestrator {
         }
     }
 
-    /// Load existing state for resume.
-    pub fn resume(mut self) -> Result<Self> {
-        if let Some(ref path) = self.state_file {
-            if path.exists() {
-                let state = MigrationState::load(path)?;
-                state.validate_config(&self.config.hash())?;
-                self.state = Some(state);
-                info!("Resuming from state file: {:?}", path);
-            }
+    /// Load existing state for resume from database.
+    pub async fn resume(mut self) -> Result<Self> {
+        let config_hash = self.config.hash();
+
+        // Try to load latest state from database
+        if let Some(state) = self.state_backend.load_latest(&config_hash).await? {
+            info!(
+                "Resuming from database state: run_id={}, started={}",
+                state.run_id,
+                state.started_at.format("%Y-%m-%d %H:%M:%S")
+            );
+            self.state = Some(state);
         }
+
         Ok(self)
     }
 
@@ -529,7 +531,7 @@ impl Orchestrator {
             self.prepare_target(&tables, &mut state).await?;
 
             // Save state after preparation
-            self.save_state(&mut state)?;
+            self.save_state(&state).await?;
         } else {
             info!(
                 "Phase 2: [DRY RUN] Would prepare target database (mode: {:?})",
@@ -632,7 +634,7 @@ impl Orchestrator {
 
         // Save final state (skip in dry-run)
         if !dry_run {
-            self.save_state(&mut state)?;
+            self.save_state(&state).await?;
         }
 
         let result = MigrationResult {
@@ -1029,7 +1031,7 @@ impl Orchestrator {
                         if let Some(ts) = state.tables.get_mut(&table_name) {
                             ts.status = TaskStatus::InProgress;
                         }
-                        self.save_state(state)?;
+                        self.save_state(state).await?;
 
                         // Emit "started" progress event for the table
                         progress.emit("transferring", Some(table_name.clone()), Some("started"));
@@ -1082,7 +1084,7 @@ impl Orchestrator {
             if let Some(ts) = state.tables.get_mut(&table_name) {
                 ts.status = TaskStatus::InProgress;
             }
-            self.save_state(state)?;
+            self.save_state(state).await?;
 
             // Emit "started" progress event
             progress.emit("transferring", Some(table_name.clone()), Some("started"));
@@ -1126,7 +1128,7 @@ impl Orchestrator {
                 );
                 join_set.abort_all();
                 // Save current state before breaking
-                self.save_state(state)?;
+                self.save_state(state).await?;
                 break;
             }
 
@@ -1201,7 +1203,7 @@ impl Orchestrator {
                         }
                     }
 
-                    self.save_state(state)?;
+                    self.save_state(state).await?;
                     // Progress tracking
                     if table_errors.contains_key(&base_table) {
                         progress.increment_table_count();
@@ -1246,7 +1248,7 @@ impl Orchestrator {
                     }
                 }
 
-                self.save_state(state)?;
+                self.save_state(state).await?;
                 if is_success {
                     progress.complete_table(rows);
                 } else {
@@ -1290,7 +1292,7 @@ impl Orchestrator {
         progress_handle.abort();
 
         // Save final state
-        self.save_state(state)?;
+        self.save_state(state).await?;
 
         // Check for failures
         let failed: Vec<_> = state
@@ -1403,12 +1405,9 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Save state to file.
-    fn save_state(&self, state: &mut MigrationState) -> Result<()> {
-        if let Some(ref path) = self.state_file {
-            state.save(path)?;
-        }
-        Ok(())
+    /// Save state to database.
+    async fn save_state(&self, state: &MigrationState) -> Result<()> {
+        self.state_backend.save(state).await
     }
 
     /// Validate row counts between source and target.

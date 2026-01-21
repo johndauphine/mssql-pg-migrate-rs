@@ -1,4 +1,10 @@
-//! File-based state management for resume capability.
+//! State management for migration runs.
+//!
+//! Supports both database and file-based storage:
+//! - **Database** (recommended): Stores state in PostgreSQL `_mssql_pg_migrate` schema
+//! - **File**: Legacy file-based state for backwards compatibility
+
+pub mod db;
 
 use crate::error::{MigrateError, Result};
 use chrono::{DateTime, Utc};
@@ -9,6 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
+
+pub use db::DbStateBackend;
 
 /// Migration state for resume capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
