@@ -900,16 +900,28 @@ impl Orchestrator {
                 .with_progress_counter(progress.rows_counter()),
         );
 
+        // Check if date-based incremental sync is enabled (upsert mode + date_updated_columns configured)
+        let date_incremental_enabled = self.config.migration.target_mode == TargetMode::Upsert
+            && !self.config.migration.date_updated_columns.is_empty();
+
         // Filter tables that need processing
+        // For incremental sync: process all tables (using date filters for completed ones)
+        // For resume: skip completed tables (crash recovery)
         let pending_tables: Vec<_> = tables
             .iter()
             .filter(|t| {
-                let table_name = t.full_name();
-                state
-                    .tables
-                    .get(&table_name)
-                    .map(|ts| ts.status != TaskStatus::Completed)
-                    .unwrap_or(true)
+                if date_incremental_enabled {
+                    // Incremental sync: process all tables
+                    true
+                } else {
+                    // Resume: skip completed tables
+                    let table_name = t.full_name();
+                    state
+                        .tables
+                        .get(&table_name)
+                        .map(|ts| ts.status != TaskStatus::Completed)
+                        .unwrap_or(true)
+                }
             })
             .collect();
 
@@ -926,10 +938,6 @@ impl Orchestrator {
 
         // Track expected partition counts per table (populated during spawning)
         let mut expected_partitions: HashMap<String, usize> = HashMap::new();
-
-        // Check if date-based incremental sync is enabled (upsert mode + date_updated_columns configured)
-        let date_incremental_enabled = self.config.migration.target_mode == TargetMode::Upsert
-            && !self.config.migration.date_updated_columns.is_empty();
 
         // Track sync start times per table (for updating watermark after successful completion)
         let mut table_sync_start_times: HashMap<String, DateTime<Utc>> = HashMap::new();

@@ -189,6 +189,10 @@ async fn run() -> Result<(), MigrateError> {
             // Apply global state_file if provided
             if let Some(ref path) = cli.state_file {
                 orchestrator = orchestrator.with_state_file(path.clone());
+                // Auto-resume from state file if it exists (enables incremental sync)
+                if path.exists() {
+                    orchestrator = orchestrator.resume()?;
+                }
             }
 
             // Enable progress reporting if requested
@@ -196,7 +200,7 @@ async fn run() -> Result<(), MigrateError> {
                 orchestrator = orchestrator.with_progress(true);
             }
 
-            // Run fresh migration (or dry-run)
+            // Run migration (or dry-run)
             let result = orchestrator.run(cancel_token, dry_run).await?;
 
             if cli.output_json {

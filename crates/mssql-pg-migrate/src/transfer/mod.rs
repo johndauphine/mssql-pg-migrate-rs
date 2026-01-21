@@ -64,16 +64,23 @@ impl DateFilter {
         Ok(Self { column, timestamp })
     }
 
-    /// Get the timestamp as a validated RFC3339 string suitable for SQL.
+    /// Get the timestamp as a validated ISO 8601 string suitable for SQL.
     ///
     /// # Security
     ///
-    /// Returns a validated RFC3339 timestamp that has been bounds-checked.
-    /// The RFC3339 format is guaranteed to not contain SQL metacharacters.
+    /// Returns a validated ISO 8601 timestamp that has been bounds-checked.
+    /// The ISO 8601 format is guaranteed to not contain SQL metacharacters.
+    ///
+    /// # Format
+    ///
+    /// Returns "YYYY-MM-DD HH:MM:SS.fff" format compatible with both:
+    /// - SQL Server datetime/datetime2 (timezone-naive)
+    /// - PostgreSQL timestamp (with implicit UTC assumption)
     pub fn timestamp_sql_safe(&self) -> String {
-        // RFC3339 format is guaranteed safe: YYYY-MM-DDTHH:MM:SS.sssZ
+        // ISO 8601 format without timezone: YYYY-MM-DD HH:MM:SS.fff
+        // Compatible with SQL Server datetime and PostgreSQL timestamp
         // No single quotes, no semicolons, no SQL injection risk
-        self.timestamp.to_rfc3339()
+        self.timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
     }
 }
 
@@ -1308,8 +1315,8 @@ async fn read_chunk_keyset_fast(
         } else {
             quote_mssql_ident(&filter.column)
         };
-        // SECURITY: timestamp_sql_safe() returns bounds-validated RFC3339 string
-        // RFC3339 format (YYYY-MM-DDTHH:MM:SS.sssZ) contains no SQL metacharacters
+        // SECURITY: timestamp_sql_safe() returns bounds-validated ISO 8601 string
+        // ISO 8601 format (YYYY-MM-DD HH:MM:SS.fff) contains no SQL metacharacters
         let timestamp_str = filter.timestamp_sql_safe();
         // Include NULL values to catch rows without timestamps
         conditions.push(format!(
@@ -1399,8 +1406,8 @@ async fn read_chunk_keyset_direct(
     // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
     if let Some(filter) = date_filter {
         let date_quoted = quote_mssql_ident(&filter.column);
-        // SECURITY: timestamp_sql_safe() returns bounds-validated RFC3339 string
-        // RFC3339 format (YYYY-MM-DDTHH:MM:SS.sssZ) contains no SQL metacharacters
+        // SECURITY: timestamp_sql_safe() returns bounds-validated ISO 8601 string
+        // ISO 8601 format (YYYY-MM-DD HH:MM:SS.fff) contains no SQL metacharacters
         let timestamp_str = filter.timestamp_sql_safe();
         // Include NULL values to catch rows without timestamps
         conditions.push(format!(
