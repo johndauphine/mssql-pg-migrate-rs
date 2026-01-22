@@ -493,11 +493,33 @@ impl TargetWriter for MysqlWriter {
             return Ok(0);
         };
 
+        let num_sub_batches = (rows.len() + max_rows_per_batch - 1) / max_rows_per_batch;
+        info!(
+            "MySQL write_batch: {} rows, {} cols, {} sub-batches to {}",
+            row_count, num_cols, num_sub_batches, qualified_table
+        );
+
         // Use explicit transaction for batch safety
+        debug!(
+            "MySQL write_batch: acquiring connection from pool for {}",
+            qualified_table
+        );
         let mut tx = self.pool.begin().await?;
+        debug!(
+            "MySQL write_batch: transaction started for {}",
+            qualified_table
+        );
 
         // Process rows in sub-batches to respect MySQL placeholder limit
-        for chunk in rows.chunks(max_rows_per_batch) {
+        for (sub_batch_idx, chunk) in rows.chunks(max_rows_per_batch).enumerate() {
+            debug!(
+                "MySQL write_batch: preparing sub-batch {}/{} ({} rows) for {}",
+                sub_batch_idx + 1,
+                num_sub_batches,
+                chunk.len(),
+                qualified_table
+            );
+
             let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
             let all_placeholders: Vec<String> =
                 std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
@@ -517,12 +539,32 @@ impl TargetWriter for MysqlWriter {
                 }
             }
 
+            debug!(
+                "MySQL write_batch: executing sub-batch {}/{} for {}",
+                sub_batch_idx + 1,
+                num_sub_batches,
+                qualified_table
+            );
             query.execute(&mut *tx).await.map_err(|e| {
                 MigrateError::transfer(&qualified_table, format!("INSERT batch: {}", e))
             })?;
+            debug!(
+                "MySQL write_batch: sub-batch {}/{} complete for {}",
+                sub_batch_idx + 1,
+                num_sub_batches,
+                qualified_table
+            );
         }
 
+        debug!(
+            "MySQL write_batch: committing transaction for {}",
+            qualified_table
+        );
         tx.commit().await?;
+        debug!(
+            "MySQL write_batch: transaction committed for {}",
+            qualified_table
+        );
 
         debug!("MySQL: wrote {} rows to {}", row_count, qualified_table);
         Ok(row_count)
@@ -560,6 +602,12 @@ impl TargetWriter for MysqlWriter {
             return Ok(0);
         };
 
+        let num_sub_batches = (rows.len() + max_rows_per_batch - 1) / max_rows_per_batch;
+        info!(
+            "MySQL upsert_batch: {} rows, {} cols, {} sub-batches to {} (writer {})",
+            row_count, num_cols, num_sub_batches, qualified_target, writer_id
+        );
+
         // Create staging table
         let staging_name = match partition_id {
             Some(pid) => format!("_staging_{}_p{}_{}", table, pid, writer_id),
@@ -567,9 +615,21 @@ impl TargetWriter for MysqlWriter {
         };
         let staging_qualified = Self::qualify_table(schema, &staging_name);
 
+        debug!(
+            "MySQL upsert_batch: acquiring connection for {} (writer {})",
+            qualified_target, writer_id
+        );
         let mut tx = self.pool.begin().await?;
+        debug!(
+            "MySQL upsert_batch: transaction started for {} (writer {})",
+            qualified_target, writer_id
+        );
 
         // Drop if exists, create staging as copy of target structure
+        debug!(
+            "MySQL upsert_batch: creating staging table {} (writer {})",
+            staging_qualified, writer_id
+        );
         let drop_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
         sqlx::query(&drop_sql).execute(&mut *tx).await?;
 
@@ -578,9 +638,22 @@ impl TargetWriter for MysqlWriter {
             staging_qualified, qualified_target
         );
         sqlx::query(&create_sql).execute(&mut *tx).await?;
+        debug!(
+            "MySQL upsert_batch: staging table created {} (writer {})",
+            staging_qualified, writer_id
+        );
 
         // Insert into staging table in sub-batches to respect MySQL placeholder limit
-        for chunk in rows.chunks(max_rows_per_batch) {
+        for (sub_batch_idx, chunk) in rows.chunks(max_rows_per_batch).enumerate() {
+            debug!(
+                "MySQL upsert_batch: inserting sub-batch {}/{} ({} rows) into staging {} (writer {})",
+                sub_batch_idx + 1,
+                num_sub_batches,
+                chunk.len(),
+                staging_qualified,
+                writer_id
+            );
+
             let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
             let all_placeholders: Vec<String> =
                 std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
@@ -600,6 +673,12 @@ impl TargetWriter for MysqlWriter {
             }
 
             insert_query.execute(&mut *tx).await?;
+            debug!(
+                "MySQL upsert_batch: sub-batch {}/{} complete (writer {})",
+                sub_batch_idx + 1,
+                num_sub_batches,
+                writer_id
+            );
         }
 
         // Build INSERT ... ON DUPLICATE KEY UPDATE from staging
@@ -637,13 +716,37 @@ impl TargetWriter for MysqlWriter {
             )
         };
 
+        debug!(
+            "MySQL upsert_batch: executing merge from staging to {} (writer {})",
+            qualified_target, writer_id
+        );
         sqlx::query(&upsert_sql).execute(&mut *tx).await?;
+        debug!(
+            "MySQL upsert_batch: merge complete for {} (writer {})",
+            qualified_target, writer_id
+        );
 
         // Drop staging
+        debug!(
+            "MySQL upsert_batch: dropping staging table {} (writer {})",
+            staging_qualified, writer_id
+        );
         let drop_staging_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
         sqlx::query(&drop_staging_sql).execute(&mut *tx).await?;
+        debug!(
+            "MySQL upsert_batch: staging table dropped {} (writer {})",
+            staging_qualified, writer_id
+        );
 
+        debug!(
+            "MySQL upsert_batch: committing transaction for {} (writer {})",
+            qualified_target, writer_id
+        );
         tx.commit().await?;
+        debug!(
+            "MySQL upsert_batch: transaction committed for {} (writer {})",
+            qualified_target, writer_id
+        );
 
         debug!("MySQL: upserted {} rows to {}", row_count, qualified_target);
         Ok(row_count)
