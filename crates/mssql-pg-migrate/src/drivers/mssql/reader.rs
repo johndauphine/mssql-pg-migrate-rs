@@ -445,7 +445,7 @@ impl SourceReader for MssqlReader {
             self.load_row_count(&mut client, &mut table).await?;
 
             // Estimate row size
-            table.estimated_row_size = table.columns.iter().map(|c| estimate_column_size(c)).sum();
+            table.estimated_row_size = table.columns.iter().map(estimate_column_size).sum();
 
             tables.push(table);
         }

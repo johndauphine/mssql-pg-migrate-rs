@@ -228,6 +228,7 @@ impl PostgresReader {
     }
 
     /// Read rows using PostgreSQL COPY TO BINARY format.
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_rows_binary(
         &self,
         schema: &str,
