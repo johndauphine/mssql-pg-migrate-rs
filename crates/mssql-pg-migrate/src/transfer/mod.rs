@@ -1748,7 +1748,7 @@ fn quote_mysql_ident(name: &str) -> String {
         );
     }
 
-    // MySQL identifier length limit is 64 characters
+    // MySQL identifier length limit is 64 characters, but we're more conservative here
     if name.len() > 128 {
         panic!(
             "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",

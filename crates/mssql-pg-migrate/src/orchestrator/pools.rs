@@ -326,7 +326,7 @@ impl SourcePoolImpl {
             Self::Mssql(p) => p.query_rows_fast(sql, columns, col_types).await,
             Self::Postgres(p) => p.query_rows_fast(sql, columns, col_types).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => p.query_rows_fast(sql, col_types).await,
+            Self::Mysql(p) => p.query_rows_fast(sql, columns, col_types).await,
         }
     }
 

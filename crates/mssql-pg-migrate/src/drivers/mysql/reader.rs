@@ -285,6 +285,7 @@ impl MysqlReader {
     pub async fn query_rows_fast(
         &self,
         sql: &str,
+        _columns: &[String],
         col_types: &[String],
     ) -> Result<Vec<Vec<TargetSqlValue>>> {
         let rows: Vec<MySqlRow> = sqlx::query(sql)
