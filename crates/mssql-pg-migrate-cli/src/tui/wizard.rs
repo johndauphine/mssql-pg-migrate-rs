@@ -16,6 +16,7 @@ pub enum WizardStep {
     SourceUser,
     SourcePassword,
     SourceTrustCert,
+    TargetType,
     TargetHost,
     TargetPort,
     TargetDatabase,
@@ -39,7 +40,7 @@ pub struct EnumOption {
 impl WizardStep {
     /// Check if this step is an enum selection (not free text input).
     pub fn is_enum_selection(&self) -> bool {
-        matches!(self, Self::SourceType | Self::SourceTrustCert | Self::TargetMode | Self::Confirm)
+        matches!(self, Self::SourceType | Self::SourceTrustCert | Self::TargetType | Self::TargetMode | Self::Confirm)
     }
 
     /// Get the available options for enum selection steps.
@@ -55,6 +56,11 @@ impl WizardStep {
                     value: "mysql",
                     label: "MySQL",
                     description: "MySQL or MariaDB",
+                },
+                EnumOption {
+                    value: "postgres",
+                    label: "PostgreSQL",
+                    description: "PostgreSQL database",
                 },
             ],
             Self::TargetMode => vec![
@@ -86,6 +92,23 @@ impl WizardStep {
                     description: "Trust server certificate without verification (for development/self-signed certs)",
                 },
             ],
+            Self::TargetType => vec![
+                EnumOption {
+                    value: "postgres",
+                    label: "PostgreSQL",
+                    description: "PostgreSQL database",
+                },
+                EnumOption {
+                    value: "mysql",
+                    label: "MySQL",
+                    description: "MySQL or MariaDB",
+                },
+                EnumOption {
+                    value: "mssql",
+                    label: "SQL Server",
+                    description: "Microsoft SQL Server (MSSQL)",
+                },
+            ],
             Self::Confirm => vec![
                 EnumOption {
                     value: "y",
@@ -111,7 +134,8 @@ impl WizardStep {
             Self::SourceDatabase => Self::SourceUser,
             Self::SourceUser => Self::SourcePassword,
             Self::SourcePassword => Self::SourceTrustCert,
-            Self::SourceTrustCert => Self::TargetHost,
+            Self::SourceTrustCert => Self::TargetType,
+            Self::TargetType => Self::TargetHost,
             Self::TargetHost => Self::TargetPort,
             Self::TargetPort => Self::TargetDatabase,
             Self::TargetDatabase => Self::TargetUser,
@@ -135,7 +159,8 @@ impl WizardStep {
             Self::SourceUser => Self::SourceDatabase,
             Self::SourcePassword => Self::SourceUser,
             Self::SourceTrustCert => Self::SourcePassword,
-            Self::TargetHost => Self::SourceTrustCert,
+            Self::TargetType => Self::SourceTrustCert,
+            Self::TargetHost => Self::TargetType,
             Self::TargetPort => Self::TargetHost,
             Self::TargetDatabase => Self::TargetPort,
             Self::TargetUser => Self::TargetDatabase,
@@ -163,22 +188,23 @@ impl WizardStep {
             Self::SourceUser => 5,
             Self::SourcePassword => 6,
             Self::SourceTrustCert => 7,
-            Self::TargetHost => 8,
-            Self::TargetPort => 9,
-            Self::TargetDatabase => 10,
-            Self::TargetUser => 11,
-            Self::TargetPassword => 12,
-            Self::TargetMode => 13,
-            Self::Workers => 14,
-            Self::OutputFile => 15,
-            Self::Confirm => 16,
-            Self::Done => 16,
+            Self::TargetType => 8,
+            Self::TargetHost => 9,
+            Self::TargetPort => 10,
+            Self::TargetDatabase => 11,
+            Self::TargetUser => 12,
+            Self::TargetPassword => 13,
+            Self::TargetMode => 14,
+            Self::Workers => 15,
+            Self::OutputFile => 16,
+            Self::Confirm => 17,
+            Self::Done => 17,
         }
     }
 
     /// Get the total number of steps.
     pub fn total_steps() -> usize {
-        16
+        17
     }
 }
 
@@ -192,6 +218,7 @@ pub struct WizardConfig {
     pub source_user: String,
     pub source_password: String,
     pub source_trust_cert: bool,
+    pub target_type: String,
     pub target_host: String,
     pub target_port: u16,
     pub target_database: String,
@@ -212,6 +239,7 @@ impl WizardConfig {
             source_user: String::new(),
             source_password: String::new(),
             source_trust_cert: false,
+            target_type: "postgres".to_string(),
             target_host: "localhost".to_string(),
             target_port: 5432,
             target_database: String::new(),
@@ -230,13 +258,6 @@ impl WizardConfig {
             TargetMode::Truncate => "truncate",
             TargetMode::Upsert => "upsert",
         };
-        // Wizard always outputs postgres as target, so ensure port is correct
-        // even if loaded config had a different target type
-        let target_port = if config.target.r#type == "postgres" || config.target.r#type == "postgresql" {
-            config.target.port
-        } else {
-            5432 // Default postgres port
-        };
         Self {
             source_type: config.source.r#type.clone(),
             source_host: config.source.host.clone(),
@@ -245,8 +266,9 @@ impl WizardConfig {
             source_user: config.source.user.clone(),
             source_password: config.source.password.clone(),
             source_trust_cert: config.source.trust_server_cert,
+            target_type: config.target.r#type.clone(),
             target_host: config.target.host.clone(),
-            target_port,
+            target_port: config.target.port,
             target_database: config.target.database.clone(),
             target_user: config.target.user.clone(),
             target_password: config.target.password.clone(),
@@ -275,7 +297,7 @@ source:
   password: {}
 {}
 target:
-  type: postgres
+  type: {}
   host: {}
   port: {}
   database: {}
@@ -293,6 +315,7 @@ migration:
             self.source_user,
             self.source_password,
             trust_cert_line,
+            self.target_type,
             self.target_host,
             self.target_port,
             self.target_database,
@@ -391,6 +414,7 @@ impl WizardState {
         let current_value = match self.step {
             WizardStep::SourceType => &self.config.source_type,
             WizardStep::SourceTrustCert => trust_cert_str,
+            WizardStep::TargetType => &self.config.target_type,
             WizardStep::TargetMode => &self.config.target_mode,
             WizardStep::Confirm => return, // Always start at "Yes"
             _ => return,
@@ -416,6 +440,7 @@ impl WizardState {
             WizardStep::SourceHost => {
                 let db_name = match self.config.source_type.as_str() {
                     "mysql" => "MySQL",
+                    "postgres" => "PostgreSQL",
                     _ => "SQL Server",
                 };
                 format!(
@@ -454,10 +479,21 @@ impl WizardState {
                 "{}Trust server certificate (for self-signed certs)?",
                 step_info
             ),
-            WizardStep::TargetHost => format!(
-                "{}Target PostgreSQL Host [{}]: ",
-                step_info, self.config.target_host
+            WizardStep::TargetType => format!(
+                "{}Select target database type:",
+                step_info
             ),
+            WizardStep::TargetHost => {
+                let db_name = match self.config.target_type.as_str() {
+                    "mysql" => "MySQL",
+                    "mssql" => "SQL Server",
+                    _ => "PostgreSQL",
+                };
+                format!(
+                    "{}Target {} Host [{}]: ",
+                    step_info, db_name, self.config.target_host
+                )
+            }
             WizardStep::TargetPort => {
                 format!("{}Target Port [{}]: ", step_info, self.config.target_port)
             }
@@ -516,7 +552,8 @@ impl WizardState {
                     // Update port default based on type selection
                     self.config.source_port = match option.value {
                         "mysql" => 3306,
-                        _ => 1433,
+                        "postgres" => 5432,
+                        _ => 1433, // mssql
                     };
                     self.transcript
                         .push(format!("Source Type: {} ({})", option.label, option.value));
@@ -573,6 +610,21 @@ impl WizardState {
                     self.config.source_trust_cert = option.value == "true";
                     self.transcript
                         .push(format!("Trust Server Certificate: {}", option.label));
+                }
+            }
+            WizardStep::TargetType => {
+                // Use selected option from enum selector
+                let options = self.step.get_options();
+                if let Some(option) = options.get(self.selected_option) {
+                    self.config.target_type = option.value.to_string();
+                    // Update port default based on type selection
+                    self.config.target_port = match option.value {
+                        "mysql" => 3306,
+                        "mssql" => 1433,
+                        _ => 5432, // postgres
+                    };
+                    self.transcript
+                        .push(format!("Target Type: {} ({})", option.label, option.value));
                 }
             }
             WizardStep::TargetHost => {

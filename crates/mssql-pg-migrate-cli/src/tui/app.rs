@@ -1443,7 +1443,9 @@ impl App {
                     self.config.clone()
                 };
 
-                self.wizard = Some(WizardState::with_config(output_path, &config_for_wizard));
+                let mut wizard_state = WizardState::with_config(output_path, &config_for_wizard);
+                wizard_state.init_selection_for_step();
+                self.wizard = Some(wizard_state);
                 self.input_mode = InputMode::Wizard;
                 self.shared_input_mode
                     .store(INPUT_MODE_WIZARD, Ordering::Relaxed);

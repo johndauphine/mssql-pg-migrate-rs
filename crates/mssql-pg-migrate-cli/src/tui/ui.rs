@@ -626,7 +626,7 @@ fn render_wizard(frame: &mut Frame, app: &App) {
         None => return,
     };
 
-    let area = centered_rect(70, 70, frame.area());
+    let area = centered_rect(70, 90, frame.area());
     frame.render_widget(Clear, area);
 
     // Determine if editing existing file or creating new
