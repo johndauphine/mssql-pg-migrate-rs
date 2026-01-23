@@ -1,0 +1,23 @@
+# Prep: PostgreSQL → MySQL (to populate MySQL with data)
+source:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow
+  schema: public
+  user: postgres
+  password: PostgresPassword123
+  ssl_mode: disable
+
+target:
+  type: mysql
+  host: localhost
+  port: 3307
+  database: stackoverflow_target
+  user: root
+  password: "rootpassword"
+
+migration:
+  target_mode: drop_recreate
+  workers: 4
+  chunk_size: 50000

@@ -1025,16 +1025,13 @@ fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i3
                 "datetimeoffset".to_string()
             }
         }
+        // Note: max_length comes from INFORMATION_SCHEMA.CHARACTER_MAXIMUM_LENGTH
+        // which is already in character units (not bytes), so no division needed
         "char" | "varchar" | "nchar" | "nvarchar" => {
             if max_length == -1 {
                 format!("{}(max)", data_type)
             } else if max_length > 0 {
-                let len = if lower.starts_with('n') && max_length > 0 {
-                    max_length / 2
-                } else {
-                    max_length
-                };
-                format!("{}({})", data_type, len)
+                format!("{}({})", data_type, max_length)
             } else {
                 format!("{}(255)", data_type)
             }

@@ -1,0 +1,23 @@
+# Test: PostgreSQL → MySQL (drop_recreate mode)
+source:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow
+  schema: public
+  user: postgres
+  password: PostgresPassword123
+  ssl_mode: disable
+
+target:
+  type: mysql
+  host: localhost
+  port: 3307
+  database: stackoverflow_test3
+  user: root
+  password: "rootpassword"
+
+migration:
+  target_mode: drop_recreate
+  workers: 4
+  chunk_size: 50000
