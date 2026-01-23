@@ -986,9 +986,10 @@ fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i3
     let lower = data_type.to_lowercase();
     match lower.as_str() {
         "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney" | "real"
-        | "datetime" | "smalldatetime" | "date" | "image" | "uniqueidentifier" | "xml" => {
-            data_type.to_string()
-        }
+        | "date" | "image" | "uniqueidentifier" | "xml" => data_type.to_string(),
+        // Convert datetime/smalldatetime to datetime2 for bulk insert compatibility
+        // (sql_value_to_column_data always sends DateTime2 data)
+        "datetime" | "smalldatetime" => "datetime2(7)".to_string(),
         "float" => {
             if precision > 0 {
                 format!("float({})", precision)
@@ -1024,16 +1025,13 @@ fn format_mssql_type(data_type: &str, max_length: i32, precision: i32, scale: i3
                 "datetimeoffset".to_string()
             }
         }
+        // Note: max_length comes from INFORMATION_SCHEMA.CHARACTER_MAXIMUM_LENGTH
+        // which is already in character units (not bytes), so no division needed
         "char" | "varchar" | "nchar" | "nvarchar" => {
             if max_length == -1 {
                 format!("{}(max)", data_type)
             } else if max_length > 0 {
-                let len = if lower.starts_with('n') && max_length > 0 {
-                    max_length / 2
-                } else {
-                    max_length
-                };
-                format!("{}({})", data_type, len)
+                format!("{}({})", data_type, max_length)
             } else {
                 format!("{}(255)", data_type)
             }

@@ -1,0 +1,25 @@
+# Test: MySQL → MSSQL (drop_recreate mode)
+# Note: First we need to populate MySQL from PostgreSQL
+source:
+  type: mysql
+  host: localhost
+  port: 3306
+  database: stackoverflow_test
+  user: root
+  password: "MySqlPassword123"
+
+target:
+  type: mssql
+  host: localhost
+  port: 1434
+  database: stackoverflow_test_mssql2
+  user: sa
+  password: "YourStrong@Passw0rd"
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+migration:
+  target_mode: drop_recreate
+  workers: 4
+  chunk_size: 50000
