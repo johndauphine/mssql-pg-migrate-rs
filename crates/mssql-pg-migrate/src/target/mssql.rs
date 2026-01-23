@@ -673,9 +673,13 @@ impl MssqlTargetPool {
         match lower.as_str() {
             // Fixed-length types
             "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney" | "real"
-            | "datetime" | "smalldatetime" | "date" | "text" | "ntext" | "image"
+            | "date" | "text" | "ntext" | "image"
             | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
             | "geography" | "geometry" | "hierarchyid" => data_type.to_string(),
+
+            // Convert datetime/smalldatetime to datetime2 for bulk insert compatibility
+            // (sql_value_to_column_data always sends DateTime2 data)
+            "datetime" | "smalldatetime" => "datetime2(7)".to_string(),
 
             // Float can have optional precision
             "float" => {
