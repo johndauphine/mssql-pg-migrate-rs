@@ -53,6 +53,32 @@ Upsert mode (`target_mode: upsert`) uses a staging table approach with `INSERT..
 - Uses binary COPY protocol for fast staging table population
 - PostgreSQL's MVCC handles unchanged rows efficiently at the storage level
 
+### Cross-Database Performance
+
+Benchmark comparing different source databases migrating to PostgreSQL target:
+
+**Test configuration**: StackOverflow 2010 dataset (19.3M rows, 9 tables), auto-tuned settings, local Docker containers.
+
+| Source | Target | Mode | Duration | Throughput |
+|--------|--------|------|----------|------------|
+| MSSQL | PostgreSQL | drop_recreate | 75.28s | 256,508 rows/sec |
+| MSSQL | PostgreSQL | upsert | 62.47s | 309,124 rows/sec |
+| MySQL | PostgreSQL | drop_recreate | 44.94s | 429,699 rows/sec |
+| MySQL | PostgreSQL | upsert | 41.87s | 461,239 rows/sec |
+| PostgreSQL | PostgreSQL | drop_recreate | 32.92s | 586,559 rows/sec |
+| PostgreSQL | PostgreSQL | upsert | 37.64s | 513,091 rows/sec |
+
+**Average throughput by source**:
+- PostgreSQL source: 549,825 rows/sec (fastest - no type conversion, native binary protocol)
+- MySQL source: 445,469 rows/sec (57% faster than MSSQL)
+- MSSQL source: 282,816 rows/sec
+
+**Key observations**:
+- PostgreSQL-to-PostgreSQL achieves highest throughput due to native binary COPY on both ends
+- MySQL outperforms MSSQL due to simpler wire protocol and efficient SQLx bulk reads
+- MSSQL upsert outperforms drop_recreate due to index creation overhead in the latter
+- For MySQL/PostgreSQL sources, both modes perform similarly
+
 ## Key Findings
 
 ### 1. UNLOGGED Tables (`use_unlogged_tables: true`)
@@ -80,7 +106,7 @@ The number of concurrent table workers has a significant impact:
 
 ### 3. Parallel Readers/Writers
 
-These control per-table parallelism for reading from MSSQL and writing to PostgreSQL:
+These control per-table parallelism for reading from the source database and writing to PostgreSQL:
 
 - **Sweet spot**: 12-14 readers, 8-10 writers
 - **Diminishing returns**: Beyond 14 readers, contention increases
