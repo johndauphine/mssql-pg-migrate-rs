@@ -326,14 +326,7 @@ impl SourcePoolImpl {
             Self::Mssql(p) => p.query_rows_fast(sql, columns, col_types).await,
             Self::Postgres(p) => p.query_rows_fast(sql, columns, col_types).await,
             #[cfg(feature = "mysql")]
-            Self::Mysql(_) => {
-                // MySQL uses the new trait-based API which doesn't have query_rows_fast
-                // This path shouldn't be called for MySQL sources using the new transfer engine
-                Err(crate::error::MigrateError::Config(
-                    "MySQL source does not support query_rows_fast. Use the new SourceReader API."
-                        .to_string(),
-                ))
-            }
+            Self::Mysql(p) => p.query_rows_fast(sql, columns, col_types).await,
         }
     }
 

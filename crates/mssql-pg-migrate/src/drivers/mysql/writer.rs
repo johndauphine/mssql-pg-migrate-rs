@@ -493,7 +493,7 @@ impl TargetWriter for MysqlWriter {
             return Ok(0);
         };
 
-        let num_sub_batches = (rows.len() + max_rows_per_batch - 1) / max_rows_per_batch;
+        let num_sub_batches = rows.len().div_ceil(max_rows_per_batch);
         info!(
             "MySQL write_batch: {} rows, {} cols, {} sub-batches to {}",
             row_count, num_cols, num_sub_batches, qualified_table
@@ -602,7 +602,7 @@ impl TargetWriter for MysqlWriter {
             return Ok(0);
         };
 
-        let num_sub_batches = (rows.len() + max_rows_per_batch - 1) / max_rows_per_batch;
+        let num_sub_batches = rows.len().div_ceil(max_rows_per_batch);
         info!(
             "MySQL upsert_batch: {} rows, {} cols, {} sub-batches to {} (writer {})",
             row_count, num_cols, num_sub_batches, qualified_target, writer_id

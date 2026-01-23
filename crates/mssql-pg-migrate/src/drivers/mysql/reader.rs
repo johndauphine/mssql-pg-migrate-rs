@@ -17,6 +17,8 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition,
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
+// Import target::SqlValue for legacy transfer engine compatibility
+use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// Connection pool timeout.
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,16 +70,22 @@ impl MysqlReader {
 
     /// Load columns for a table.
     async fn load_columns(&self, table: &mut Table) -> Result<()> {
+        // CAST string columns to CHAR and numeric to SIGNED to handle type differences
+        // Cap max_length at 2147483647 (i32 max) or -1 for very large values (LONGTEXT etc)
         let query = r#"
             SELECT
-                COLUMN_NAME,
-                DATA_TYPE,
-                COALESCE(CHARACTER_MAXIMUM_LENGTH, 0) AS max_length,
-                COALESCE(NUMERIC_PRECISION, 0) AS num_precision,
-                COALESCE(NUMERIC_SCALE, 0) AS num_scale,
+                CAST(COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME,
+                CAST(DATA_TYPE AS CHAR(255)) AS DATA_TYPE,
+                CAST(CASE
+                    WHEN CHARACTER_MAXIMUM_LENGTH IS NULL THEN 0
+                    WHEN CHARACTER_MAXIMUM_LENGTH > 2147483647 THEN -1
+                    ELSE CHARACTER_MAXIMUM_LENGTH
+                END AS SIGNED) AS max_length,
+                CAST(COALESCE(NUMERIC_PRECISION, 0) AS SIGNED) AS num_precision,
+                CAST(COALESCE(NUMERIC_SCALE, 0) AS SIGNED) AS num_scale,
                 IF(IS_NULLABLE = 'YES', 1, 0) AS is_nullable,
                 IF(EXTRA LIKE '%auto_increment%', 1, 0) AS is_identity,
-                ORDINAL_POSITION
+                CAST(ORDINAL_POSITION AS SIGNED) AS ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
@@ -109,8 +117,9 @@ impl MysqlReader {
 
     /// Load primary key columns for a table.
     async fn load_primary_key(&self, table: &mut Table) -> Result<()> {
+        // CAST to CHAR to handle collation differences
         let query = r#"
-            SELECT COLUMN_NAME
+            SELECT CAST(COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME
             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
             ORDER BY ORDINAL_POSITION
@@ -269,13 +278,160 @@ impl MysqlReader {
             .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
         Ok(())
     }
+
+    /// Query rows with pre-computed column types for O(1) lookup.
+    /// Compatible with legacy transfer engine API.
+    /// Returns target::SqlValue for compatibility with transfer engine.
+    pub async fn query_rows_fast(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<TargetSqlValue>>> {
+        let rows: Vec<MySqlRow> = sqlx::query(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MigrateError::pool(e, "query_rows_fast"))?;
+
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = Self::convert_value_for_target(&row, idx, data_type);
+                values.push(value);
+            }
+
+            result.push(values);
+        }
+
+        Ok(result)
+    }
+
+    /// Convert a MySQL row value to target::SqlValue for legacy API.
+    fn convert_value_for_target(row: &MySqlRow, idx: usize, data_type: &str) -> TargetSqlValue {
+        let data_type = data_type.to_lowercase();
+
+        // Handle NULL values
+        let is_null: bool = row.try_get_raw(idx).map(|r| r.is_null()).unwrap_or(true);
+        if is_null {
+            return TargetSqlValue::Null(Self::target_null_type_for(&data_type));
+        }
+
+        // Convert based on data type
+        match data_type.as_str() {
+            // Integer types
+            "tinyint" => row
+                .try_get::<i8, _>(idx)
+                .map(|v| TargetSqlValue::I16(v as i16))
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
+            "smallint" => row
+                .try_get::<i16, _>(idx)
+                .map(TargetSqlValue::I16)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
+            "mediumint" | "int" | "integer" => row
+                .try_get::<i32, _>(idx)
+                .map(TargetSqlValue::I32)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I32)),
+            "bigint" => row
+                .try_get::<i64, _>(idx)
+                .map(TargetSqlValue::I64)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I64)),
+
+            // Floating point
+            "float" => row
+                .try_get::<f32, _>(idx)
+                .map(TargetSqlValue::F32)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F32)),
+            "double" | "real" => row
+                .try_get::<f64, _>(idx)
+                .map(TargetSqlValue::F64)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F64)),
+
+            // Decimal
+            "decimal" | "numeric" => row
+                .try_get::<rust_decimal::Decimal, _>(idx)
+                .map(TargetSqlValue::Decimal)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Decimal)),
+
+            // Boolean
+            "bit" | "boolean" | "bool" => row
+                .try_get::<bool, _>(idx)
+                .map(TargetSqlValue::Bool)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bool)),
+
+            // String types
+            "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum"
+            | "set" => row
+                .try_get::<String, _>(idx)
+                .map(TargetSqlValue::String)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
+
+            // Binary types
+            "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => row
+                .try_get::<Vec<u8>, _>(idx)
+                .map(TargetSqlValue::Bytes)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bytes)),
+
+            // Date/Time types
+            "date" => row
+                .try_get::<chrono::NaiveDate, _>(idx)
+                .map(TargetSqlValue::Date)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
+            "time" => row
+                .try_get::<chrono::NaiveTime, _>(idx)
+                .map(TargetSqlValue::Time)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
+            "datetime" | "timestamp" => row
+                .try_get::<chrono::NaiveDateTime, _>(idx)
+                .map(TargetSqlValue::DateTime)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
+
+            // UUID (MySQL stores as CHAR(36))
+            "uuid" => row
+                .try_get::<String, _>(idx)
+                .ok()
+                .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                .map(TargetSqlValue::Uuid)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Uuid)),
+
+            // Default to string
+            _ => row
+                .try_get::<String, _>(idx)
+                .map(TargetSqlValue::String)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
+        }
+    }
+
+    /// Get target null type for a data type string.
+    fn target_null_type_for(data_type: &str) -> TargetSqlNullType {
+        match data_type {
+            "tinyint" | "smallint" => TargetSqlNullType::I16,
+            "mediumint" | "int" | "integer" => TargetSqlNullType::I32,
+            "bigint" => TargetSqlNullType::I64,
+            "float" => TargetSqlNullType::F32,
+            "double" | "real" => TargetSqlNullType::F64,
+            "decimal" | "numeric" => TargetSqlNullType::Decimal,
+            "bit" | "boolean" | "bool" => TargetSqlNullType::Bool,
+            "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => {
+                TargetSqlNullType::Bytes
+            }
+            "date" => TargetSqlNullType::Date,
+            "time" => TargetSqlNullType::Time,
+            "datetime" | "timestamp" => TargetSqlNullType::DateTime,
+            _ => TargetSqlNullType::String,
+        }
+    }
 }
 
 #[async_trait]
 impl SourceReader for MysqlReader {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
+        // CAST to CHAR to handle collation differences where information_schema
+        // may return VARBINARY instead of VARCHAR
         let query = r#"
-            SELECT TABLE_NAME
+            SELECT CAST(TABLE_NAME AS CHAR(255)) AS TABLE_NAME
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
             ORDER BY TABLE_NAME
@@ -320,10 +476,11 @@ impl SourceReader for MysqlReader {
     }
 
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
+        // CAST to CHAR to handle collation differences
         let query = r#"
             SELECT
-                INDEX_NAME,
-                GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
+                CAST(INDEX_NAME AS CHAR(255)) AS INDEX_NAME,
+                GROUP_CONCAT(CAST(COLUMN_NAME AS CHAR(255)) ORDER BY SEQ_IN_INDEX) AS columns,
                 IF(NON_UNIQUE = 0, 1, 0) AS is_unique
             FROM INFORMATION_SCHEMA.STATISTICS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -364,13 +521,14 @@ impl SourceReader for MysqlReader {
     }
 
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
+        // CAST to CHAR to handle collation differences
         let query = r#"
             SELECT
-                rc.CONSTRAINT_NAME,
-                kcu.COLUMN_NAME,
-                kcu.REFERENCED_TABLE_SCHEMA,
-                kcu.REFERENCED_TABLE_NAME,
-                kcu.REFERENCED_COLUMN_NAME
+                CAST(rc.CONSTRAINT_NAME AS CHAR(255)) AS CONSTRAINT_NAME,
+                CAST(kcu.COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME,
+                CAST(kcu.REFERENCED_TABLE_SCHEMA AS CHAR(255)) AS REFERENCED_TABLE_SCHEMA,
+                CAST(kcu.REFERENCED_TABLE_NAME AS CHAR(255)) AS REFERENCED_TABLE_NAME,
+                CAST(kcu.REFERENCED_COLUMN_NAME AS CHAR(255)) AS REFERENCED_COLUMN_NAME
             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
                 ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
@@ -426,10 +584,11 @@ impl SourceReader for MysqlReader {
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
         // MySQL 8.0+ supports check constraints via INFORMATION_SCHEMA.CHECK_CONSTRAINTS
         // For older versions, this returns empty
+        // CAST to CHAR to handle collation differences
         let query = r#"
             SELECT
-                cc.CONSTRAINT_NAME,
-                cc.CHECK_CLAUSE
+                CAST(cc.CONSTRAINT_NAME AS CHAR(255)) AS CONSTRAINT_NAME,
+                CAST(cc.CHECK_CLAUSE AS CHAR(4000)) AS CHECK_CLAUSE
             FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc
             JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
                 ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA

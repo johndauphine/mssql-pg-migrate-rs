@@ -1284,7 +1284,9 @@ async fn read_chunk_keyset_fast(
     date_filter: Option<&DateFilter>,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
     let pk_col = &table.primary_key[0];
-    let is_postgres = source.db_type() == "postgres";
+    let db_type = source.db_type();
+    let is_postgres = db_type == "postgres";
+    let is_mysql = db_type == "mysql";
 
     // Build column list with appropriate quoting
     let col_list = columns
@@ -1292,6 +1294,8 @@ async fn read_chunk_keyset_fast(
         .map(|c| {
             if is_postgres {
                 quote_pg_ident(c)
+            } else if is_mysql {
+                quote_mysql_ident(c)
             } else {
                 quote_mssql_ident(c)
             }
@@ -1301,19 +1305,25 @@ async fn read_chunk_keyset_fast(
 
     let pk_quoted = if is_postgres {
         quote_pg_ident(pk_col)
+    } else if is_mysql {
+        quote_mysql_ident(pk_col)
     } else {
         quote_mssql_ident(pk_col)
     };
     let table_ref = if is_postgres {
         qualify_pg_table(&table.schema, &table.name)
+    } else if is_mysql {
+        qualify_mysql_table(&table.schema, &table.name)
     } else {
         qualify_mssql_table(&table.schema, &table.name)
     };
 
     // Build query with database-specific syntax
-    let mut query = if is_postgres {
+    let mut query = if is_postgres || is_mysql {
+        // PostgreSQL and MySQL use LIMIT clause at the end
         format!("SELECT {} FROM {}", col_list, table_ref)
     } else {
+        // MSSQL uses TOP and WITH (NOLOCK)
         format!(
             "SELECT TOP {} {} FROM {} WITH (NOLOCK)",
             chunk_size, col_list, table_ref
@@ -1335,6 +1345,8 @@ async fn read_chunk_keyset_fast(
     if let Some(filter) = date_filter {
         let date_quoted = if is_postgres {
             quote_pg_ident(&filter.column)
+        } else if is_mysql {
+            quote_mysql_ident(&filter.column)
         } else {
             quote_mssql_ident(&filter.column)
         };
@@ -1355,8 +1367,8 @@ async fn read_chunk_keyset_fast(
 
     query.push_str(&format!(" ORDER BY {}", pk_quoted));
 
-    // PostgreSQL uses LIMIT instead of TOP
-    if is_postgres {
+    // PostgreSQL and MySQL use LIMIT instead of TOP
+    if is_postgres || is_mysql {
         query.push_str(&format!(" LIMIT {}", chunk_size));
     }
 
@@ -1465,13 +1477,17 @@ async fn read_chunk_offset(
     offset: usize,
     chunk_size: usize,
 ) -> Result<(Vec<Vec<SqlValue>>, Option<i64>)> {
-    let is_postgres = source.db_type() == "postgres";
+    let db_type = source.db_type();
+    let is_postgres = db_type == "postgres";
+    let is_mysql = db_type == "mysql";
 
     let col_list = columns
         .iter()
         .map(|c| {
             if is_postgres {
                 quote_pg_ident(c)
+            } else if is_mysql {
+                quote_mysql_ident(c)
             } else {
                 quote_mssql_ident(c)
             }
@@ -1481,6 +1497,8 @@ async fn read_chunk_offset(
 
     let table_ref = if is_postgres {
         qualify_pg_table(&table.schema, &table.name)
+    } else if is_mysql {
+        qualify_mysql_table(&table.schema, &table.name)
     } else {
         qualify_mssql_table(&table.schema, &table.name)
     };
@@ -1490,6 +1508,8 @@ async fn read_chunk_offset(
         if !columns.is_empty() {
             if is_postgres {
                 quote_pg_ident(&columns[0])
+            } else if is_mysql {
+                quote_mysql_ident(&columns[0])
             } else {
                 quote_mssql_ident(&columns[0])
             }
@@ -1506,6 +1526,8 @@ async fn read_chunk_offset(
             .map(|c| {
                 if is_postgres {
                     quote_pg_ident(c)
+                } else if is_mysql {
+                    quote_mysql_ident(c)
                 } else {
                     quote_mssql_ident(c)
                 }
@@ -1514,12 +1536,14 @@ async fn read_chunk_offset(
             .join(", ")
     };
 
-    let query = if is_postgres {
+    let query = if is_postgres || is_mysql {
+        // PostgreSQL and MySQL use LIMIT ... OFFSET syntax
         format!(
             "SELECT {} FROM {} ORDER BY {} LIMIT {} OFFSET {}",
             col_list, table_ref, order_by, chunk_size, offset
         )
     } else {
+        // MSSQL uses OFFSET ... FETCH NEXT syntax with WITH (NOLOCK)
         format!(
             "SELECT {} FROM {} WITH (NOLOCK) ORDER BY {} OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
             col_list, table_ref, order_by, offset, chunk_size
@@ -1704,8 +1728,44 @@ fn qualify_pg_table(schema: &str, table: &str) -> String {
     format!("{}.{}", quote_pg_ident(schema), quote_pg_ident(table))
 }
 
+/// Quote a MySQL identifier using backticks.
+///
+/// Escapes backticks by doubling them and wraps in backticks.
+/// Includes defensive validation for suspicious patterns.
+///
+/// # Security
+///
+/// Runtime validation prevents SQL injection via identifier manipulation.
+/// Panics on invalid identifiers (null bytes, excessive length) as these
+/// indicate corruption or attack attempts.
+fn quote_mysql_ident(name: &str) -> String {
+    // SECURITY: Runtime validation (not debug-only)
+    // Null bytes should never appear in legitimate identifiers
+    if name.contains('\0') {
+        panic!(
+            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
+            name
+        );
+    }
+
+    // MySQL identifier length limit is 64 characters, but we're more conservative here
+    if name.len() > 128 {
+        panic!(
+            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
+            name.len()
+        );
+    }
+
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// Qualify a MySQL table name with schema/database and proper quoting.
+fn qualify_mysql_table(schema: &str, table: &str) -> String {
+    format!("{}.{}", quote_mysql_ident(schema), quote_mysql_ident(table))
+}
+
 /// Check if the primary key is a sortable integer type.
-/// Supports both MSSQL and PostgreSQL type names.
+/// Supports MSSQL, PostgreSQL, and MySQL type names.
 fn is_pk_sortable(table: &Table) -> bool {
     if table.pk_columns.is_empty() {
         return false;
@@ -1719,7 +1779,9 @@ fn is_pk_sortable(table: &Table) -> bool {
         // PostgreSQL types
         "integer" | "int4" | "int8" | "int2" |
         // PostgreSQL aliases
-        "serial" | "bigserial" | "smallserial"
+        "serial" | "bigserial" | "smallserial" |
+        // MySQL types
+        "mediumint"
     )
 }
 
@@ -1734,7 +1796,9 @@ fn is_integer_type(col_type: &str) -> bool {
         // PostgreSQL types
         "integer" | "int4" | "int8" | "int2" |
         // PostgreSQL aliases
-        "serial" | "bigserial" | "smallserial"
+        "serial" | "bigserial" | "smallserial" |
+        // MySQL types
+        "mediumint"
     )
 }
 
