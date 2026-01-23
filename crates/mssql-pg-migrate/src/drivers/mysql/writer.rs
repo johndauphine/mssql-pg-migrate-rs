@@ -260,7 +260,7 @@ impl TargetWriter for MysqlWriter {
             .map(|col_name| {
                 let quoted = Self::quote_ident(col_name);
                 // Look up column type to check if it needs a prefix length
-                if let Some(col) = table.columns.iter().find(|c| c.name == *col_name) {
+                if let Some(col) = table.columns.iter().find(|c| &c.name == col_name) {
                     let dtype = col.data_type.to_lowercase();
                     // TEXT/BLOB types require prefix length for indexing
                     if dtype.contains("text") || dtype.contains("blob") {
