@@ -15,6 +15,7 @@ path = "src/main.rs"
 default = []
 tui = ["ratatui", "crossterm", "fuzzy-matcher"]
 kerberos = ["mssql-pg-migrate/kerberos"]
+mysql = ["mssql-pg-migrate/mysql"]
 
 [dependencies]
 mssql-pg-migrate = { path = "../mssql-pg-migrate" }

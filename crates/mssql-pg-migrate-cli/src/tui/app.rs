@@ -237,6 +237,7 @@ impl TranscriptEntry {
 #[derive(Debug, Clone)]
 pub struct ConfigSummary {
     pub config_path: PathBuf,
+    pub source_type: String,
     pub source_host: String,
     pub source_database: String,
     pub target_host: String,
@@ -251,6 +252,7 @@ impl ConfigSummary {
     pub fn from_config(config: &Config, path: &Path) -> Self {
         Self {
             config_path: path.to_path_buf(),
+            source_type: config.source.r#type.clone(),
             source_host: config.source.host.clone(),
             source_database: config.source.database.clone(),
             target_host: config.target.host.clone(),
