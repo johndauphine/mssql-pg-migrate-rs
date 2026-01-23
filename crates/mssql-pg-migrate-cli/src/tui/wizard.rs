@@ -298,11 +298,35 @@ impl WizardConfig {
         }
     }
 
+    /// Get the default schema for a database type.
+    pub fn default_schema_for_type(db_type: &str) -> &'static str {
+        match db_type {
+            "postgres" => "public",
+            "mssql" => "dbo",
+            _ => "", // MySQL doesn't use schema
+        }
+    }
+
     /// Generate YAML configuration string.
     pub fn to_yaml(&self) -> String {
         // Only include trust_server_cert for MSSQL (it's not applicable to MySQL)
         let trust_cert_line = if self.source_type == "mssql" {
             format!("  trust_server_cert: {}\n", self.source_trust_cert)
+        } else {
+            String::new()
+        };
+
+        // Add schema for non-MySQL databases
+        let source_schema = Self::default_schema_for_type(&self.source_type);
+        let source_schema_line = if !source_schema.is_empty() {
+            format!("  schema: {}\n", source_schema)
+        } else {
+            String::new()
+        };
+
+        let target_schema = Self::default_schema_for_type(&self.target_type);
+        let target_schema_line = if !target_schema.is_empty() {
+            format!("  schema: {}\n", target_schema)
         } else {
             String::new()
         };
@@ -314,7 +338,7 @@ source:
   host: {}
   port: {}
   database: {}
-  user: {}
+{}  user: {}
   password: {}
 {}
 target:
@@ -322,7 +346,7 @@ target:
   host: {}
   port: {}
   database: {}
-  user: {}
+{}  user: {}
   password: {}
 
 migration:
@@ -333,6 +357,7 @@ migration:
             self.source_host,
             self.source_port,
             self.source_database,
+            source_schema_line,
             self.source_user,
             self.source_password,
             trust_cert_line,
@@ -340,6 +365,7 @@ migration:
             self.target_host,
             self.target_port,
             self.target_database,
+            target_schema_line,
             self.target_user,
             self.target_password,
             self.target_mode,
