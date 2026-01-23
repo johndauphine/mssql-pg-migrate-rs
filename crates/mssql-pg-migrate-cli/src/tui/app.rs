@@ -691,6 +691,8 @@ impl App {
                     if wizard.step.is_enum_selection() {
                         // On enum steps, backspace goes back to previous step
                         wizard.step = wizard.step.prev();
+                        // Skip SourceTrustCert for non-MSSQL sources
+                        wizard.skip_trust_cert_if_needed_backward();
                         wizard.input.clear();
                         wizard.error = None;
                         wizard.selected_option = 0;
@@ -698,6 +700,8 @@ impl App {
                     } else if wizard.input.is_empty() {
                         // On text steps with empty input, go back to previous step
                         wizard.step = wizard.step.prev();
+                        // Skip SourceTrustCert for non-MSSQL sources
+                        wizard.skip_trust_cert_if_needed_backward();
                         wizard.input.clear();
                         wizard.error = None;
                         wizard.selected_option = 0;

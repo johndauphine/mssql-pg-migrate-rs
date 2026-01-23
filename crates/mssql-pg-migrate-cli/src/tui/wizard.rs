@@ -404,6 +404,13 @@ impl WizardState {
         }
     }
 
+    /// Skip SourceTrustCert step when going backward for non-MSSQL sources.
+    pub fn skip_trust_cert_if_needed_backward(&mut self) {
+        if self.step == WizardStep::SourceTrustCert && self.config.source_type != "mssql" {
+            self.step = self.step.prev();
+        }
+    }
+
     /// Initialize selection to match current config value when entering an enum step.
     pub fn init_selection_for_step(&mut self) {
         if !self.step.is_enum_selection() {
@@ -726,6 +733,10 @@ impl WizardState {
 
         // Advance to next step
         self.step = self.step.next();
+        // Skip SourceTrustCert for non-MSSQL sources (only MSSQL uses trust_server_cert)
+        if self.step == WizardStep::SourceTrustCert && self.config.source_type != "mssql" {
+            self.step = self.step.next();
+        }
         self.input.clear();
         self.selected_option = 0;
         self.init_selection_for_step();
