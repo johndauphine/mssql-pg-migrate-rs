@@ -212,6 +212,13 @@ impl WizardConfig {
             TargetMode::Truncate => "truncate",
             TargetMode::Upsert => "upsert",
         };
+        // Wizard always outputs postgres as target, so ensure port is correct
+        // even if loaded config had a different target type
+        let target_port = if config.target.r#type == "postgres" || config.target.r#type == "postgresql" {
+            config.target.port
+        } else {
+            5432 // Default postgres port
+        };
         Self {
             source_type: config.source.r#type.clone(),
             source_host: config.source.host.clone(),
@@ -220,7 +227,7 @@ impl WizardConfig {
             source_user: config.source.user.clone(),
             source_password: config.source.password.clone(),
             target_host: config.target.host.clone(),
-            target_port: config.target.port,
+            target_port,
             target_database: config.target.database.clone(),
             target_user: config.target.user.clone(),
             target_password: config.target.password.clone(),

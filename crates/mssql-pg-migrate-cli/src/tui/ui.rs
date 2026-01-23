@@ -273,6 +273,10 @@ fn render_side_panel(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("Target: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("[{}] ", app.config_summary.target_type.to_uppercase()),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw(&app.config_summary.target_host),
         ]),
         Line::from(vec![
