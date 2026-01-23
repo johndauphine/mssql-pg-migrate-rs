@@ -96,80 +96,66 @@ impl MssqlStateBackend {
     }
 
     /// Save a migration state to the database.
+    ///
+    /// Note: Each MERGE statement is atomic, so we don't use explicit transaction
+    /// handling here. Using BEGIN TRANSACTION/COMMIT with Tiberius can cause
+    /// "Transaction count mismatch" errors (code 266) due to how the driver
+    /// manages implicit transactions internally.
     pub async fn save(&self, state: &MigrationState) -> Result<()> {
         let mut conn = self.pool.get_conn().await?;
 
-        // Begin transaction
-        conn.execute("BEGIN TRANSACTION", &[]).await?;
+        // Upsert table states with denormalized run-level fields
+        // Each MERGE is atomic, providing row-level consistency
+        for (table_name, table_state) in &state.tables {
+            let sql = format!(
+                "MERGE [{}].[table_state] AS target
+                 USING (SELECT @P1 AS run_id, @P6 AS table_name) AS source
+                 ON target.run_id = source.run_id AND target.table_name = source.table_name
+                 WHEN MATCHED THEN
+                     UPDATE SET
+                         config_hash = @P2,
+                         run_started_at = @P3,
+                         run_completed_at = @P4,
+                         run_status = @P5,
+                         table_status = @P7,
+                         rows_total = @P8,
+                         rows_transferred = @P9,
+                         rows_skipped = @P10,
+                         last_pk = @P11,
+                         last_sync_timestamp = @P12,
+                         table_completed_at = @P13,
+                         error = @P14,
+                         updated_at = GETUTCDATE()
+                 WHEN NOT MATCHED THEN
+                     INSERT (run_id, config_hash, run_started_at, run_completed_at, run_status,
+                             table_name, table_status, rows_total, rows_transferred, rows_skipped,
+                             last_pk, last_sync_timestamp, table_completed_at, error, updated_at)
+                     VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10, @P11, @P12, @P13, @P14, GETUTCDATE());",
+                self.schema
+            );
 
-        // Execute upserts with proper error handling and rollback
-        let result: Result<()> = async {
-            // Upsert table states with denormalized run-level fields
-            for (table_name, table_state) in &state.tables {
-                let sql = format!(
-                    "MERGE [{}].[table_state] AS target
-                     USING (SELECT @P1 AS run_id, @P6 AS table_name) AS source
-                     ON target.run_id = source.run_id AND target.table_name = source.table_name
-                     WHEN MATCHED THEN
-                         UPDATE SET
-                             config_hash = @P2,
-                             run_started_at = @P3,
-                             run_completed_at = @P4,
-                             run_status = @P5,
-                             table_status = @P7,
-                             rows_total = @P8,
-                             rows_transferred = @P9,
-                             rows_skipped = @P10,
-                             last_pk = @P11,
-                             last_sync_timestamp = @P12,
-                             table_completed_at = @P13,
-                             error = @P14,
-                             updated_at = GETUTCDATE()
-                     WHEN NOT MATCHED THEN
-                         INSERT (run_id, config_hash, run_started_at, run_completed_at, run_status,
-                                 table_name, table_status, rows_total, rows_transferred, rows_skipped,
-                                 last_pk, last_sync_timestamp, table_completed_at, error, updated_at)
-                         VALUES (@P1, @P2, @P3, @P4, @P5, @P6, @P7, @P8, @P9, @P10, @P11, @P12, @P13, @P14, GETUTCDATE());",
-                    self.schema
-                );
-
-                conn.execute(
-                    sql,
-                    &[
-                        &state.run_id,
-                        &state.config_hash,
-                        &state.started_at,
-                        &state.completed_at,
-                        &run_status_to_str(state.status),
-                        table_name,
-                        &task_status_to_str(table_state.status),
-                        &table_state.rows_total,
-                        &table_state.rows_transferred,
-                        &table_state.rows_skipped,
-                        &table_state.last_pk,
-                        &table_state.last_sync_timestamp,
-                        &table_state.completed_at,
-                        &table_state.error,
-                    ],
-                )
-                .await?;
-            }
-            Ok(())
+            conn.execute(
+                sql,
+                &[
+                    &state.run_id,
+                    &state.config_hash,
+                    &state.started_at,
+                    &state.completed_at,
+                    &run_status_to_str(state.status),
+                    table_name,
+                    &task_status_to_str(table_state.status),
+                    &table_state.rows_total,
+                    &table_state.rows_transferred,
+                    &table_state.rows_skipped,
+                    &table_state.last_pk,
+                    &table_state.last_sync_timestamp,
+                    &table_state.completed_at,
+                    &table_state.error,
+                ],
+            )
+            .await?;
         }
-        .await;
-
-        // Commit or rollback based on result
-        match result {
-            Ok(_) => {
-                conn.execute("COMMIT", &[]).await?;
-                Ok(())
-            }
-            Err(e) => {
-                // Critical: rollback transaction on error to prevent connection pool corruption
-                let _ = conn.execute("ROLLBACK", &[]).await;
-                Err(e)
-            }
-        }
+        Ok(())
     }
 
     /// Load the latest migration state for a given config hash.

@@ -252,7 +252,25 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn create_index(&self, table: &Table, idx: &Index, target_schema: &str) -> Result<()> {
-        let idx_cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
+        // Build column list with prefix lengths for TEXT/BLOB types
+        // MySQL requires a prefix length for these types in indexes
+        let idx_cols: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|col_name| {
+                let quoted = Self::quote_ident(col_name);
+                // Look up column type to check if it needs a prefix length
+                if let Some(col) = table.columns.iter().find(|c| c.name == *col_name) {
+                    let dtype = col.data_type.to_lowercase();
+                    // TEXT/BLOB types require prefix length for indexing
+                    if dtype.contains("text") || dtype.contains("blob") {
+                        return format!("{}(255)", quoted);
+                    }
+                }
+                quoted
+            })
+            .collect();
+
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
 
         let sql = format!(
