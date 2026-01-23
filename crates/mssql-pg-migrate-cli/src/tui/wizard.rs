@@ -229,6 +229,16 @@ pub struct WizardConfig {
 }
 
 impl WizardConfig {
+    /// Get the default username for a database type.
+    pub fn default_user_for_type(db_type: &str) -> &'static str {
+        match db_type {
+            "mssql" => "sa",
+            "mysql" => "root",
+            "postgres" => "postgres",
+            _ => "",
+        }
+    }
+
     /// Create a new config with defaults.
     pub fn new() -> Self {
         Self {
@@ -236,14 +246,14 @@ impl WizardConfig {
             source_host: "localhost".to_string(),
             source_port: 1433,
             source_database: String::new(),
-            source_user: String::new(),
+            source_user: "sa".to_string(),
             source_password: String::new(),
             source_trust_cert: false,
             target_type: "postgres".to_string(),
             target_host: "localhost".to_string(),
             target_port: 5432,
             target_database: String::new(),
-            target_user: String::new(),
+            target_user: "postgres".to_string(),
             target_password: String::new(),
             target_mode: "drop_recreate".to_string(),
             workers: 4,
@@ -258,19 +268,30 @@ impl WizardConfig {
             TargetMode::Truncate => "truncate",
             TargetMode::Upsert => "upsert",
         };
+        // Use existing values, falling back to smart defaults for empty fields
+        let source_user = if config.source.user.is_empty() {
+            Self::default_user_for_type(&config.source.r#type).to_string()
+        } else {
+            config.source.user.clone()
+        };
+        let target_user = if config.target.user.is_empty() {
+            Self::default_user_for_type(&config.target.r#type).to_string()
+        } else {
+            config.target.user.clone()
+        };
         Self {
             source_type: config.source.r#type.clone(),
             source_host: config.source.host.clone(),
             source_port: config.source.port,
             source_database: config.source.database.clone(),
-            source_user: config.source.user.clone(),
+            source_user,
             source_password: config.source.password.clone(),
             source_trust_cert: config.source.trust_server_cert,
             target_type: config.target.r#type.clone(),
             target_host: config.target.host.clone(),
             target_port: config.target.port,
             target_database: config.target.database.clone(),
-            target_user: config.target.user.clone(),
+            target_user,
             target_password: config.target.password.clone(),
             target_mode: target_mode.to_string(),
             workers: config.migration.get_workers(),
@@ -469,11 +490,7 @@ impl WizardState {
                 }
             }
             WizardStep::SourceUser => {
-                if self.config.source_user.is_empty() {
-                    format!("{}Source User: ", step_info)
-                } else {
-                    format!("{}Source User [{}]: ", step_info, self.config.source_user)
-                }
+                format!("{}Source User [{}]: ", step_info, self.config.source_user)
             }
             WizardStep::SourcePassword => {
                 if self.config.source_password.is_empty() {
@@ -515,11 +532,7 @@ impl WizardState {
                 }
             }
             WizardStep::TargetUser => {
-                if self.config.target_user.is_empty() {
-                    format!("{}Target User: ", step_info)
-                } else {
-                    format!("{}Target User [{}]: ", step_info, self.config.target_user)
-                }
+                format!("{}Target User [{}]: ", step_info, self.config.target_user)
             }
             WizardStep::TargetPassword => {
                 if self.config.target_password.is_empty() {
@@ -555,13 +568,16 @@ impl WizardState {
                 // Use selected option from enum selector
                 let options = self.step.get_options();
                 if let Some(option) = options.get(self.selected_option) {
+                    // Only update port/user defaults if the type actually changed
+                    if self.config.source_type != option.value {
+                        self.config.source_port = match option.value {
+                            "mysql" => 3306,
+                            "postgres" => 5432,
+                            _ => 1433, // mssql
+                        };
+                        self.config.source_user = WizardConfig::default_user_for_type(option.value).to_string();
+                    }
                     self.config.source_type = option.value.to_string();
-                    // Update port default based on type selection
-                    self.config.source_port = match option.value {
-                        "mysql" => 3306,
-                        "postgres" => 5432,
-                        _ => 1433, // mssql
-                    };
                     self.transcript
                         .push(format!("Source Type: {} ({})", option.label, option.value));
                 }
@@ -623,13 +639,16 @@ impl WizardState {
                 // Use selected option from enum selector
                 let options = self.step.get_options();
                 if let Some(option) = options.get(self.selected_option) {
+                    // Only update port/user defaults if the type actually changed
+                    if self.config.target_type != option.value {
+                        self.config.target_port = match option.value {
+                            "mysql" => 3306,
+                            "mssql" => 1433,
+                            _ => 5432, // postgres
+                        };
+                        self.config.target_user = WizardConfig::default_user_for_type(option.value).to_string();
+                    }
                     self.config.target_type = option.value.to_string();
-                    // Update port default based on type selection
-                    self.config.target_port = match option.value {
-                        "mysql" => 3306,
-                        "mssql" => 1433,
-                        _ => 5432, // postgres
-                    };
                     self.transcript
                         .push(format!("Target Type: {} ({})", option.label, option.value));
                 }
