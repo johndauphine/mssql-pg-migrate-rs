@@ -11,7 +11,6 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 | Mode | Duration | Throughput |
 |------|----------|------------|
 | drop_recreate | 119s | 162,452 rows/sec |
-| truncate | ~100s | ~193,000 rows/sec |
 | upsert | ~180s | ~106,000 rows/sec |
 
 *Auto-tuned parallelism, localhost MSSQL → PostgreSQL, binary COPY protocol*
@@ -22,7 +21,7 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 - **Auto-tuning** - Memory-aware configuration based on system RAM and CPU cores
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
-- **Three target modes** - `drop_recreate`, `truncate`, `upsert`
+- **Two target modes** - `drop_recreate`, `upsert`
 - **Incremental sync** - Upsert mode with date-based watermarks for fast delta syncs
 - **Database state storage** - Migration state stored in PostgreSQL (no external files)
 - **Interactive TUI** - Terminal UI for guided migration with real-time progress
@@ -129,7 +128,7 @@ target:
   ssl_mode: disable
 
 migration:
-  target_mode: drop_recreate  # or truncate, upsert
+  target_mode: drop_recreate  # or upsert
   workers: 4                  # auto-tuned if not set
   chunk_size: 50000           # auto-tuned based on RAM
   parallel_readers: 8         # auto-tuned based on CPU cores
@@ -159,7 +158,6 @@ This allows optimal performance across different hardware without manual configu
 | Mode | Behavior |
 |------|----------|
 | `drop_recreate` | Drop target tables, create fresh, bulk insert (fastest for full refresh) |
-| `truncate` | Truncate existing tables, create if missing, bulk insert |
 | `upsert` | Stream to staging table, merge with `INSERT...ON CONFLICT DO UPDATE` (ideal for incremental sync) |
 
 ### Upsert Mode Details

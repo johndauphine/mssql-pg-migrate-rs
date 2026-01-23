@@ -1182,18 +1182,6 @@ impl TargetPool for MssqlTargetPool {
         Ok(())
     }
 
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        let mut conn = self.get_conn().await?;
-        let query = format!(
-            "TRUNCATE TABLE {}.{}",
-            Self::quote_ident(schema),
-            Self::quote_ident(table)
-        );
-        conn.execute(&query, &[]).await?;
-        debug!("Truncated table: {}.{}", schema, table);
-        Ok(())
-    }
-
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let mut conn = self.get_conn().await?;
         let query = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2";

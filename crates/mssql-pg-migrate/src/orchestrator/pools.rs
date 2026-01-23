@@ -589,16 +589,6 @@ impl TargetPoolImpl {
         }
     }
 
-    /// Truncate a table.
-    pub async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        match self {
-            Self::Mssql(p) => p.truncate_table(schema, table).await,
-            Self::Postgres(p) => p.truncate_table(schema, table).await,
-            #[cfg(feature = "mysql")]
-            Self::Mysql(p) => NewTargetWriter::truncate_table(p.as_ref(), schema, table).await,
-        }
-    }
-
     /// Check if a table exists.
     pub async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         match self {

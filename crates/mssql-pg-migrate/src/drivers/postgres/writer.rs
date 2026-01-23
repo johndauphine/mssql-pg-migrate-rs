@@ -237,20 +237,6 @@ impl TargetWriter for PostgresWriter {
         Ok(())
     }
 
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
-
-        let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
-        client.execute(&sql, &[]).await?;
-
-        debug!("Truncated table {}.{}", schema, table);
-        Ok(())
-    }
-
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let client = self
             .pool

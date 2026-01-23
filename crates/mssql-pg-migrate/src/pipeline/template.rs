@@ -561,7 +561,7 @@ mod tests {
         use super::super::job::TransferJob;
 
         let table = make_test_table();
-        let job = TransferJob::new(table, "public".to_string(), TargetMode::Truncate);
+        let job = TransferJob::new(table, "public".to_string(), TargetMode::DropRecreate);
 
         assert_eq!(job.table_name(), "dbo.TestTable");
         assert_eq!(job.target_schema, "public");

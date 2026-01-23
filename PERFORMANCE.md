@@ -96,7 +96,7 @@ migration:
 
 Chunk size recommendations differ by target mode:
 
-**Bulk Load (drop_recreate/truncate)**:
+**Bulk Load (drop_recreate)**:
 - **100K-120K**: Optimal for most workloads
 - **150K+**: Diminishing returns, higher memory usage
 - **50K or less**: Too much overhead from frequent commits

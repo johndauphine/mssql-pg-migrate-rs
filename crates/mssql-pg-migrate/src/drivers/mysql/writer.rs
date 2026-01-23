@@ -213,14 +213,6 @@ impl TargetWriter for MysqlWriter {
         Ok(())
     }
 
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
-        sqlx::query(&sql).execute(&self.pool).await?;
-
-        debug!("Truncated table {}.{}", schema, table);
-        Ok(())
-    }
-
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         let sql = r#"
             SELECT COUNT(*) as cnt FROM information_schema.TABLES

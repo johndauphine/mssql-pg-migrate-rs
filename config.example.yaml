@@ -39,7 +39,6 @@ migration:
 
   # Target mode for handling existing data:
   #   - drop_recreate: Drop and recreate tables (fastest, destructive)
-  #   - truncate: Truncate existing tables before insert
   #   - upsert: Insert or update based on primary key (incremental sync)
   target_mode: drop_recreate
 

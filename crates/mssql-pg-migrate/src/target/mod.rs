@@ -63,9 +63,6 @@ pub trait TargetPool: Send + Sync {
     /// Drop a table if it exists.
     async fn drop_table(&self, schema: &str, table: &str) -> Result<()>;
 
-    /// Truncate a table.
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()>;
-
     /// Check if a table exists.
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool>;
 
@@ -987,20 +984,6 @@ impl TargetPool for PgPool {
         client.execute(&sql, &[]).await?;
 
         debug!("Dropped table {}.{}", schema, table);
-        Ok(())
-    }
-
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
-
-        let sql = format!("TRUNCATE TABLE {}", Self::qualify_table(schema, table));
-        client.execute(&sql, &[]).await?;
-
-        debug!("Truncated table {}.{}", schema, table);
         Ok(())
     }
 

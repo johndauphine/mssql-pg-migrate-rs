@@ -169,9 +169,6 @@ pub trait TargetWriter: Send + Sync {
     /// Drop a table if it exists.
     async fn drop_table(&self, schema: &str, table: &str) -> Result<()>;
 
-    /// Truncate a table (delete all rows).
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()>;
-
     /// Check if a table exists.
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool>;
 

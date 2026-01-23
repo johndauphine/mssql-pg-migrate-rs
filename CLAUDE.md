@@ -115,7 +115,6 @@ Config → Auto-Tuning → Schema Extraction → Connection Pools
 ### Target Modes
 
 - **drop_recreate** - Drop and recreate tables (fastest, destructive)
-- **truncate** - Truncate before insert (schema preserving)
 - **upsert** - INSERT...ON CONFLICT DO UPDATE (incremental sync with date watermarks)
 
 ### Error Handling

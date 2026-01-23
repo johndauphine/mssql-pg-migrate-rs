@@ -714,7 +714,7 @@ impl Orchestrator {
     }
 
     /// Prepare target database based on mode.
-    async fn prepare_target(&self, tables: &[Table], state: &mut MigrationState) -> Result<()> {
+    async fn prepare_target(&self, tables: &[Table], _state: &mut MigrationState) -> Result<()> {
         let target_schema = &self.config.target.schema;
 
         // Create schema if needed
@@ -734,37 +734,6 @@ impl Orchestrator {
                             .await?;
                     } else {
                         self.target.create_table(table, target_schema).await?;
-                    }
-                }
-            }
-            TargetMode::Truncate => {
-                for (i, table) in tables.iter().enumerate() {
-                    let table_name = table.full_name();
-                    info!("Preparing table {}/{}: {}", i + 1, tables.len(), table_name);
-
-                    // Create if not exists, truncate if exists
-                    if self.target.table_exists(target_schema, &table.name).await? {
-                        self.target
-                            .truncate_table(target_schema, &table.name)
-                            .await?;
-                        // Set to UNLOGGED for faster writes if configured
-                        if self.config.migration.use_unlogged_tables {
-                            self.target
-                                .set_table_unlogged(target_schema, &table.name)
-                                .await?;
-                        }
-                    } else if self.config.migration.use_unlogged_tables {
-                        self.target
-                            .create_table_unlogged(table, target_schema)
-                            .await?;
-                    } else {
-                        self.target.create_table(table, target_schema).await?;
-                    }
-
-                    // Mark as pending for data transfer
-                    if let Some(ts) = state.tables.get_mut(&table_name) {
-                        ts.status = TaskStatus::Pending;
-                        ts.rows_transferred = 0;
                     }
                 }
             }

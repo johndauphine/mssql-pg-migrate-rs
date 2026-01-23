@@ -23,7 +23,7 @@ target:
   ssl_mode: disable
 
 migration:
-  # Target mode: drop_recreate, truncate, or upsert
+  # Target mode: drop_recreate or upsert
   target_mode: drop_recreate
 
   # Performance tuning (auto-tuned by default)

@@ -32,7 +32,6 @@ Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 | Mode | Duration | Throughput | Use Case |
 |------|----------|------------|----------|
 | `drop_recreate` | 119s | 162,452 rows/sec | Full refresh |
-| `truncate` | ~100s | ~193,000 rows/sec | Schema-preserving refresh |
 | `upsert` | ~180s | ~106,000 rows/sec | Incremental sync |
 
 ---
@@ -115,17 +114,17 @@ Each partition processed by parallel readers with keyset pagination
 
 ### Mode Comparison
 
-| Feature | `drop_recreate` | `truncate` | `upsert` |
-|---------|-----------------|------------|----------|
-| **Target State Required** | Empty or existing | Existing or new | Existing with data |
-| **Primary Key Required** | No | No | **Yes** |
-| **Schema Preserved** | No | Yes | Yes |
-| **Data Preservation** | None | None | Existing data kept |
-| **Transfer Type** | Full copy | Full copy | Streaming upsert |
-| **Change Detection** | N/A | N/A | `ON CONFLICT DO UPDATE` |
-| **Deletes Performed** | N/A | N/A | No (safety) |
-| **Speed** | Fastest | Fastest | Fast (~200K rows/sec) |
-| **Network Usage** | Full dataset | Full dataset | Full dataset (filtered at target) |
+| Feature | `drop_recreate` | `upsert` |
+|---------|-----------------|----------|
+| **Target State Required** | Empty or existing | Existing with data |
+| **Primary Key Required** | No | **Yes** |
+| **Schema Preserved** | No | Yes |
+| **Data Preservation** | None | Existing data kept |
+| **Transfer Type** | Full copy | Streaming upsert |
+| **Change Detection** | N/A | `ON CONFLICT DO UPDATE` |
+| **Deletes Performed** | N/A | No (safety) |
+| **Speed** | Fastest | Fast (~200K rows/sec) |
+| **Network Usage** | Full dataset | Full dataset (filtered at target) |
 
 ### DROP_RECREATE Mode
 
@@ -151,30 +150,6 @@ migration:
 - Destroys existing target data
 - Dependent objects (views, functions) may break
 - Sequences reset to source values
-
-### TRUNCATE Mode
-
-**Best for**: Periodic refreshes where table structure must be preserved
-
-```yaml
-migration:
-  target_mode: truncate
-```
-
-**Behavior**:
-1. Truncates existing tables (deletes all rows, preserves structure)
-2. Creates tables if they don't exist
-3. Optionally converts to UNLOGGED for faster writes
-4. Transfers all rows using binary COPY protocol
-
-**Advantages**:
-- Preserves table structure, permissions, dependencies
-- Faster than drop_recreate when structure matches
-- Can use UNLOGGED tables for speed boost
-
-**Considerations**:
-- Truncate requires exclusive lock (briefly)
-- Existing constraints remain (may cause conflicts)
 
 ### UPSERT Mode
 
@@ -256,7 +231,7 @@ target:
 # Migration settings
 migration:
   # Transfer mode
-  target_mode: upsert            # drop_recreate, truncate, or upsert
+  target_mode: upsert            # drop_recreate or upsert
 
   # Worker parallelism (auto-tuned if not set)
   workers: 4                     # Parallel table transfers
@@ -640,7 +615,7 @@ services:
 Error: Table 'orders' has no primary key, required for upsert mode
 ```
 
-**Solution**: Add primary key to source table or switch to `truncate` mode.
+**Solution**: Add primary key to source table or switch to `drop_recreate` mode.
 
 #### Memory Pressure / OOM
 

@@ -870,9 +870,6 @@ pub enum TargetMode {
     #[default]
     DropRecreate,
 
-    /// Truncate existing tables, create if missing.
-    Truncate,
-
     /// Upsert: INSERT new rows, UPDATE changed rows.
     Upsert,
 }

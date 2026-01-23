@@ -292,12 +292,11 @@ fn prompt_migration_config(
     println!("------------------");
 
     // Target mode selection
-    let target_modes = &["drop_recreate", "truncate", "upsert"];
+    let target_modes = &["drop_recreate", "upsert"];
     let default_idx = existing
         .map(|c| match c.target_mode {
             TargetMode::DropRecreate => 0,
-            TargetMode::Truncate => 1,
-            TargetMode::Upsert => 2,
+            TargetMode::Upsert => 1,
         })
         .unwrap_or(0);
 
@@ -309,7 +308,6 @@ fn prompt_migration_config(
 
     let target_mode = match mode_idx {
         0 => TargetMode::DropRecreate,
-        1 => TargetMode::Truncate,
         _ => TargetMode::Upsert,
     };
 

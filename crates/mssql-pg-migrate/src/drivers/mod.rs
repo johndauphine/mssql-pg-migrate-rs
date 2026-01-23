@@ -386,15 +386,6 @@ impl TargetWriter for TargetWriterImpl {
         }
     }
 
-    async fn truncate_table(&self, schema: &str, table: &str) -> Result<()> {
-        match self {
-            TargetWriterImpl::Mssql(w) => w.truncate_table(schema, table).await,
-            TargetWriterImpl::Postgres(w) => w.truncate_table(schema, table).await,
-            #[cfg(feature = "mysql")]
-            TargetWriterImpl::Mysql(w) => w.truncate_table(schema, table).await,
-        }
-    }
-
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
         match self {
             TargetWriterImpl::Mssql(w) => w.table_exists(schema, table).await,

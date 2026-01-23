@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_transfer_job_creation() {
         let table = make_test_table();
-        let job = TransferJob::new(table, "public".to_string(), TargetMode::Truncate);
+        let job = TransferJob::new(table, "public".to_string(), TargetMode::DropRecreate);
 
         assert_eq!(job.table_name(), "dbo.Users");
         assert_eq!(job.column_names(), vec!["Id", "Name"]);
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_transfer_job_with_partition() {
         let table = make_test_table();
-        let job = TransferJob::new(table, "public".to_string(), TargetMode::Truncate)
+        let job = TransferJob::new(table, "public".to_string(), TargetMode::DropRecreate)
             .with_partition(0, Some(1), Some(1000));
 
         assert_eq!(job.partition_id, Some(0));

@@ -40,7 +40,14 @@ pub struct EnumOption {
 impl WizardStep {
     /// Check if this step is an enum selection (not free text input).
     pub fn is_enum_selection(&self) -> bool {
-        matches!(self, Self::SourceType | Self::SourceTrustCert | Self::TargetType | Self::TargetMode | Self::Confirm)
+        matches!(
+            self,
+            Self::SourceType
+                | Self::SourceTrustCert
+                | Self::TargetType
+                | Self::TargetMode
+                | Self::Confirm
+        )
     }
 
     /// Get the available options for enum selection steps.
@@ -68,11 +75,6 @@ impl WizardStep {
                     value: "drop_recreate",
                     label: "Drop & Recreate",
                     description: "Drop target tables and recreate them (clean migration)",
-                },
-                EnumOption {
-                    value: "truncate",
-                    label: "Truncate",
-                    description: "Truncate existing tables before inserting data",
                 },
                 EnumOption {
                     value: "upsert",
@@ -265,7 +267,6 @@ impl WizardConfig {
         use mssql_pg_migrate::TargetMode;
         let target_mode = match config.migration.target_mode {
             TargetMode::DropRecreate => "drop_recreate",
-            TargetMode::Truncate => "truncate",
             TargetMode::Upsert => "upsert",
         };
         // Use existing values, falling back to smart defaults for empty fields
@@ -464,7 +465,11 @@ impl WizardState {
             return;
         }
         let options = self.step.get_options();
-        let trust_cert_str = if self.config.source_trust_cert { "true" } else { "false" };
+        let trust_cert_str = if self.config.source_trust_cert {
+            "true"
+        } else {
+            "false"
+        };
         let current_value = match self.step {
             WizardStep::SourceType => &self.config.source_type,
             WizardStep::SourceTrustCert => trust_cert_str,
@@ -487,10 +492,7 @@ impl WizardState {
             WizardStep::total_steps()
         );
         match self.step {
-            WizardStep::SourceType => format!(
-                "{}Select source database type:",
-                step_info
-            ),
+            WizardStep::SourceType => format!("{}Select source database type:", step_info),
             WizardStep::SourceHost => {
                 let db_name = match self.config.source_type.as_str() {
                     "mysql" => "MySQL",
@@ -529,10 +531,7 @@ impl WizardState {
                 "{}Trust server certificate (for self-signed certs)?",
                 step_info
             ),
-            WizardStep::TargetType => format!(
-                "{}Select target database type:",
-                step_info
-            ),
+            WizardStep::TargetType => format!("{}Select target database type:", step_info),
             WizardStep::TargetHost => {
                 let db_name = match self.config.target_type.as_str() {
                     "mysql" => "MySQL",
@@ -568,7 +567,7 @@ impl WizardState {
                 }
             }
             WizardStep::TargetMode => format!(
-                "{}Target Mode (drop_recreate/truncate/upsert) [{}]: ",
+                "{}Target Mode (drop_recreate/upsert) [{}]: ",
                 step_info, self.config.target_mode
             ),
             WizardStep::Workers => {
@@ -601,7 +600,8 @@ impl WizardState {
                             "postgres" => 5432,
                             _ => 1433, // mssql
                         };
-                        self.config.source_user = WizardConfig::default_user_for_type(option.value).to_string();
+                        self.config.source_user =
+                            WizardConfig::default_user_for_type(option.value).to_string();
                     }
                     self.config.source_type = option.value.to_string();
                     self.transcript
@@ -672,7 +672,8 @@ impl WizardState {
                             "mssql" => 1433,
                             _ => 5432, // postgres
                         };
-                        self.config.target_user = WizardConfig::default_user_for_type(option.value).to_string();
+                        self.config.target_user =
+                            WizardConfig::default_user_for_type(option.value).to_string();
                     }
                     self.config.target_type = option.value.to_string();
                     self.transcript
