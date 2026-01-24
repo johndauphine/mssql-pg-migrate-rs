@@ -84,8 +84,8 @@ impl From<deadpool_postgres::PoolError> for MigrateError {
 }
 
 #[cfg(feature = "mysql")]
-impl From<sqlx::Error> for MigrateError {
-    fn from(err: sqlx::Error) -> Self {
+impl From<mysql_async::Error> for MigrateError {
+    fn from(err: mysql_async::Error) -> Self {
         MigrateError::pool(err, "MySQL database")
     }
 }

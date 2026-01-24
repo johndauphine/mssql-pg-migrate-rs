@@ -159,6 +159,32 @@ impl ChunkData {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Compress text values in this chunk using LZ4.
+    ///
+    /// Only compresses `Rows` variant; `Direct` variant is already encoded.
+    fn compress_text_values(&mut self) {
+        use crate::core::value::COMPRESSION_THRESHOLD;
+
+        if let ChunkData::Rows(rows) = self {
+            for row in rows {
+                for value in row {
+                    if let SqlValue::String(ref text) = value {
+                        if text.len() >= COMPRESSION_THRESHOLD {
+                            let compressed = lz4_flex::compress_prepend_size(text.as_bytes());
+                            // Only use compression if it actually saves space
+                            if compressed.len() < text.len() {
+                                *value = SqlValue::CompressedText {
+                                    original_len: text.len(),
+                                    compressed,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A chunk of rows to be transferred.
@@ -267,6 +293,9 @@ pub struct TransferConfig {
     /// Use direct COPY encoding (bypass SqlValue for MSSQL->PG upsert).
     /// Encodes rows directly to PostgreSQL COPY binary format during reading.
     pub use_direct_copy: bool,
+    /// Compress text columns in transit using LZ4.
+    /// Reduces memory pressure for tables with large text columns.
+    pub compress_text: bool,
 }
 
 impl Default for TransferConfig {
@@ -278,6 +307,7 @@ impl Default for TransferConfig {
             parallel_writers: 4,
             use_copy_binary: true, // Default to COPY TO BINARY for PostgreSQL sources
             use_direct_copy: true, // Default to direct COPY encoding for MSSQL->PG upsert
+            compress_text: false,  // Disabled by default
         }
     }
 }
@@ -587,7 +617,7 @@ impl TransferEngine {
         // Use a separate receiver for the read channel
         let mut read_rx = read_rx;
 
-        while let Some(chunk) = read_rx.recv().await {
+        while let Some(mut chunk) = read_rx.recv().await {
             total_query_time += chunk.read_time;
             // Track completed ranges for safe resume point calculation.
             // Only contiguous ranges from start are considered safe.
@@ -597,6 +627,11 @@ impl TransferEngine {
             let chunk_row_count = chunk.data.len() as i64;
             if let Some(ref counter) = self.progress_counter {
                 counter.fetch_add(chunk_row_count, Ordering::Relaxed);
+            }
+
+            // Compress text values if enabled (reduces memory in write channel)
+            if self.config.compress_text {
+                chunk.data.compress_text_values();
             }
 
             // Send rows to writers

@@ -1,87 +1,122 @@
 //! MySQL/MariaDB target writer implementation.
 //!
 //! Implements the `TargetWriter` trait for writing data to MySQL/MariaDB databases.
-//! Uses SQLx for connection pooling and multi-row INSERT batching.
+//! Uses mysql_async for connection pooling and supports both LOAD DATA LOCAL INFILE
+//! (fast bulk loading) and batched INSERT (compatible fallback).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlSslMode};
-use sqlx::Row;
+use bytes::Bytes;
+use futures::stream::{self, BoxStream, StreamExt};
+use mysql_async::prelude::*;
+use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, TxOpts};
 use tracing::{debug, info, warn};
 
-use crate::config::TargetConfig;
+use crate::config::{MysqlLoadData, TargetConfig};
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlValue};
 use crate::error::{MigrateError, Result};
 
-/// Connection pool timeout.
-const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// MySQL maximum placeholders per prepared statement.
-/// MySQL has a hard limit of 65,535 placeholders.
-const MYSQL_MAX_PLACEHOLDERS: usize = 65535;
-
-/// MySQL target writer implementation.
+/// MySQL target writer implementation using mysql_async.
+///
+/// Supports both LOAD DATA LOCAL INFILE (fast) and batched INSERT (compatible).
 pub struct MysqlWriter {
-    pool: MySqlPool,
+    pool: Pool,
     type_mapper: Option<Arc<dyn TypeMapper>>,
+    /// MySQL bulk load strategy configuration.
+    mysql_load_data: MysqlLoadData,
 }
 
 impl MysqlWriter {
     /// Create a new MySQL writer from configuration.
-    pub async fn new(config: &TargetConfig, max_conns: usize) -> Result<Self> {
-        let ssl_mode = match config.ssl_mode.to_lowercase().as_str() {
+    pub async fn new(
+        config: &TargetConfig,
+        max_conns: usize,
+        mysql_load_data: MysqlLoadData,
+    ) -> Result<Self> {
+        let ssl_opts = match config.ssl_mode.to_lowercase().as_str() {
             "disable" => {
                 warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
-                MySqlSslMode::Disabled
+                None
             }
-            "prefer" => MySqlSslMode::Preferred,
-            "require" => MySqlSslMode::Required,
-            "verify-ca" | "verify_ca" => MySqlSslMode::VerifyCa,
-            "verify-full" | "verify_identity" => MySqlSslMode::VerifyIdentity,
+            "prefer" => {
+                // Prefer TLS but don't require certificate validation
+                Some(SslOpts::default().with_danger_accept_invalid_certs(true))
+            }
+            "require" => {
+                // Require TLS with certificate validation
+                Some(SslOpts::default())
+            }
+            "verify-ca" | "verify_ca" => {
+                // Verify server certificate against CA
+                Some(SslOpts::default())
+            }
+            "verify-full" | "verify_identity" => {
+                // Verify server certificate and hostname
+                Some(SslOpts::default())
+            }
             _ => {
                 warn!(
-                    "Unknown ssl_mode '{}', defaulting to Preferred",
+                    "Unknown ssl_mode '{}', defaulting to prefer (TLS without cert validation)",
                     config.ssl_mode
                 );
-                MySqlSslMode::Preferred
+                Some(SslOpts::default().with_danger_accept_invalid_certs(true))
             }
         };
 
-        let options = MySqlConnectOptions::new()
-            .host(&config.host)
-            .port(config.port)
-            .database(&config.database)
-            .username(&config.user)
-            .password(&config.password)
-            .ssl_mode(ssl_mode)
-            // Enforce utf8mb4 for full Unicode support
-            .charset("utf8mb4");
+        let mut builder = OptsBuilder::default()
+            .ip_or_hostname(&config.host)
+            .tcp_port(config.port)
+            .db_name(Some(&config.database))
+            .user(Some(&config.user))
+            .pass(Some(&config.password))
+            // Use utf8mb4 for full Unicode support
+            .init(vec!["SET NAMES utf8mb4"]);
 
-        let pool = MySqlPoolOptions::new()
-            .max_connections(max_conns as u32)
-            .acquire_timeout(POOL_CONNECTION_TIMEOUT)
-            .connect_with(options)
+        if let Some(ssl) = ssl_opts {
+            builder = builder.ssl_opts(ssl);
+        }
+
+        // Ensure at least one connection to avoid PoolConstraints failure
+        let max_conns = max_conns.max(1);
+        let constraints = PoolConstraints::new(1, max_conns).ok_or_else(|| {
+            MigrateError::Config(format!(
+                "Invalid MySQL pool constraints: min=1, max={}",
+                max_conns
+            ))
+        })?;
+        let pool_opts = PoolOpts::new().with_constraints(constraints);
+
+        let opts: Opts = builder.pool_opts(pool_opts).into();
+        let pool = Pool::new(opts);
+
+        // Test connection
+        let mut conn = pool
+            .get_conn()
             .await
             .map_err(|e| MigrateError::pool(e, "creating MySQL target pool"))?;
 
-        // Test connection
-        sqlx::query("SELECT 1")
-            .execute(&pool)
+        conn.query_drop("SELECT 1")
             .await
             .map_err(|e| MigrateError::pool(e, "testing MySQL target connection"))?;
+
+        drop(conn);
 
         info!(
             "Connected to MySQL target: {}:{}/{}",
             config.host, config.port, config.database
         );
 
+        if mysql_load_data == MysqlLoadData::Always {
+            info!("MySQL LOAD DATA LOCAL INFILE enabled for bulk loading");
+        }
+
         Ok(Self {
             pool,
             type_mapper: None,
+            mysql_load_data,
         })
     }
 
@@ -92,14 +127,18 @@ impl MysqlWriter {
     }
 
     /// Get a clone of the underlying connection pool.
-    pub fn pool(&self) -> MySqlPool {
+    pub fn pool(&self) -> Pool {
         self.pool.clone()
     }
 
     /// Test the database connection.
     pub async fn test_connection(&self) -> Result<()> {
-        sqlx::query("SELECT 1")
-            .execute(&self.pool)
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
+        conn.query_drop("SELECT 1")
             .await
             .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
         Ok(())
@@ -125,12 +164,10 @@ impl MysqlWriter {
             mapping.target_type
         } else {
             // No mapper provided - use default MSSQL to MySQL mapping
-            // This is a fallback for the common case of migrating from MSSQL
             use crate::dialect::mssql_to_mysql_basic;
             let target_type =
                 mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale);
             if target_type.is_empty() {
-                // Unknown type - pass through with warning
                 warn!(
                     "Unknown MSSQL type '{}' for column '{}', passing through",
                     col.data_type, col.name
@@ -165,35 +202,276 @@ impl MysqlWriter {
             col_defs.join(",\n    ")
         )
     }
+
+    /// Write batch using multi-row INSERT.
+    async fn write_batch_insert(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        batch: Batch,
+    ) -> Result<u64> {
+        let rows = batch.rows;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let row_count = rows.len() as u64;
+        let qualified_table = Self::qualify_table(schema, table);
+        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list_str = col_list.join(", ");
+
+        // MySQL max placeholders is 65535
+        const MYSQL_MAX_PLACEHOLDERS: usize = 65535;
+        let num_cols = cols.len();
+        let max_rows_per_batch = if num_cols > 0 {
+            MYSQL_MAX_PLACEHOLDERS / num_cols
+        } else {
+            return Ok(0);
+        };
+
+        // Process rows in sub-batches
+        for chunk in rows.chunks(max_rows_per_batch) {
+            let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
+            let all_placeholders: Vec<String> =
+                std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
+
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES {}",
+                qualified_table,
+                col_list_str,
+                all_placeholders.join(", ")
+            );
+
+            // Collect all values for binding
+            let params: Vec<mysql_async::Value> = chunk
+                .iter()
+                .flat_map(|row| row.iter().map(sql_value_to_mysql))
+                .collect();
+
+            conn.exec_drop(&sql, params).await.map_err(|e| {
+                MigrateError::transfer(&qualified_table, format!("INSERT batch: {}", e))
+            })?;
+        }
+
+        debug!(
+            "MySQL: wrote {} rows to {} using INSERT",
+            row_count, qualified_table
+        );
+        Ok(row_count)
+    }
+
+    /// Write batch using LOAD DATA LOCAL INFILE for maximum performance.
+    /// Returns Ok(Some(count)) on success, Ok(None) if LOAD DATA is not supported.
+    async fn write_batch_load_data(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        batch: Batch,
+    ) -> Result<Option<u64>> {
+        let rows = batch.rows;
+        if rows.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let row_count = rows.len() as u64;
+        let qualified_table = Self::qualify_table(schema, table);
+        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list_str = col_list.join(", ");
+
+        // Build TSV data for streaming to MySQL
+        // Use tab-separated format with NULL represented as \N
+        let csv_data: Vec<Bytes> = rows
+            .iter()
+            .map(|row| {
+                let line = row
+                    .iter()
+                    .map(|v| Self::escape_tsv_value(v))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+                    + "\n";
+                Bytes::from(line)
+            })
+            .collect();
+
+        // Set up one-time infile handler that streams our batch data
+        conn.set_infile_handler(async move {
+            let stream: BoxStream<'static, std::io::Result<Bytes>> =
+                stream::iter(csv_data.into_iter().map(Ok)).boxed();
+            Ok(stream)
+        });
+
+        // Execute LOAD DATA LOCAL INFILE
+        // The filename is arbitrary since our handler ignores it
+        let sql = format!(
+            r#"LOAD DATA LOCAL INFILE 'batch'
+               INTO TABLE {}
+               CHARACTER SET utf8mb4
+               FIELDS TERMINATED BY '\t'
+               LINES TERMINATED BY '\n'
+               ({})"#,
+            qualified_table, col_list_str
+        );
+
+        match conn.query_drop(&sql).await {
+            Ok(_) => {
+                debug!(
+                    "MySQL: wrote {} rows to {} using LOAD DATA LOCAL INFILE",
+                    row_count, qualified_table
+                );
+                Ok(Some(row_count))
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // Check for common LOAD DATA errors:
+                // - Error 1148: LOAD DATA LOCAL INFILE command is disabled
+                // - Error 3948: Loading local data is disabled
+                // - Error 2068: Local infile request rejected
+                if err_str.contains("1148")
+                    || err_str.contains("3948")
+                    || err_str.contains("2068")
+                    || err_str.contains("LOCAL INFILE")
+                    || err_str.contains("local data")
+                {
+                    warn!("MySQL: LOAD DATA LOCAL INFILE not supported, falling back to INSERT");
+                    Ok(None) // Indicate fallback needed
+                } else {
+                    Err(MigrateError::transfer(
+                        &qualified_table,
+                        format!("LOAD DATA: {}", e),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Escape a value for tab-separated format used by LOAD DATA.
+    fn escape_tsv_value(value: &SqlValue<'_>) -> String {
+        match value {
+            SqlValue::Null(_) => "\\N".to_string(),
+            SqlValue::Bool(b) => {
+                if *b {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            SqlValue::I16(i) => i.to_string(),
+            SqlValue::I32(i) => i.to_string(),
+            SqlValue::I64(i) => i.to_string(),
+            SqlValue::F32(f) => f.to_string(),
+            SqlValue::F64(f) => f.to_string(),
+            SqlValue::Text(s) => Self::escape_tsv_string(s),
+            SqlValue::CompressedText { .. } => {
+                // Decompress and escape
+                match value.decompress_text() {
+                    Some(s) => Self::escape_tsv_string(&s),
+                    None => "\\N".to_string(),
+                }
+            }
+            SqlValue::Bytes(b) => {
+                // Encode binary data with backslash escaping for LOAD DATA.
+                // MySQL LOAD DATA interprets \xNN as hex bytes, but we use
+                // backslash escaping for special chars and pass others as-is.
+                Self::escape_tsv_bytes(b.as_ref())
+            }
+            SqlValue::Uuid(u) => u.to_string(),
+            SqlValue::Decimal(d) => d.to_string(),
+            SqlValue::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+            SqlValue::DateTimeOffset(dto) => {
+                dto.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            SqlValue::Date(d) => d.format("%Y-%m-%d").to_string(),
+            SqlValue::Time(t) => t.format("%H:%M:%S%.6f").to_string(),
+        }
+    }
+
+    /// Escape a string value for TSV format.
+    /// MySQL LOAD DATA interprets backslash sequences, so we must escape them.
+    fn escape_tsv_string(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\t' => result.push_str("\\t"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\\' => result.push_str("\\\\"),
+                '\0' => result.push_str("\\0"),
+                _ => result.push(c),
+            }
+        }
+        result
+    }
+
+    /// Escape binary data for TSV format used by LOAD DATA.
+    /// Special characters are backslash-escaped, other bytes pass through.
+    fn escape_tsv_bytes(bytes: &[u8]) -> String {
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            match byte {
+                b'\t' => result.push_str("\\t"),
+                b'\n' => result.push_str("\\n"),
+                b'\r' => result.push_str("\\r"),
+                b'\\' => result.push_str("\\\\"),
+                b'\0' => result.push_str("\\0"),
+                // Printable ASCII and valid UTF-8 continuation bytes pass through
+                0x20..=0x7E => result.push(byte as char),
+                // Non-printable bytes use hex escape
+                _ => {
+                    result.push_str(&format!("\\x{:02X}", byte));
+                }
+            }
+        }
+        result
+    }
 }
 
 #[async_trait]
 impl TargetWriter for MysqlWriter {
     async fn create_schema(&self, schema: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = format!(
             "CREATE DATABASE IF NOT EXISTS {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
             Self::quote_ident(schema)
         );
-        sqlx::query(&sql).execute(&self.pool).await?;
+        conn.query_drop(&sql).await?;
 
         debug!("Created database '{}'", schema);
         Ok(())
     }
 
     async fn create_table(&self, table: &Table, target_schema: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let ddl = self.generate_ddl(table, target_schema);
-        sqlx::query(&ddl).execute(&self.pool).await?;
+        conn.query_drop(&ddl).await?;
 
         debug!("Created table {}.{}", target_schema, table.name);
         Ok(())
     }
 
     async fn create_table_unlogged(&self, table: &Table, target_schema: &str) -> Result<()> {
-        // MySQL doesn't have UNLOGGED tables like PostgreSQL.
-        // For faster initial loads, we could use MEMORY engine but it has limitations.
-        // Instead, we disable keys temporarily which achieves similar goals.
+        // MySQL doesn't have UNLOGGED tables
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let ddl = self.generate_ddl(table, target_schema);
-        sqlx::query(&ddl).execute(&self.pool).await?;
+        conn.query_drop(&ddl).await?;
 
         debug!(
             "Created table {}.{} (MySQL doesn't support UNLOGGED)",
@@ -203,36 +481,52 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn drop_table(&self, schema: &str, table: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = format!(
             "DROP TABLE IF EXISTS {}",
             Self::qualify_table(schema, table)
         );
-        sqlx::query(&sql).execute(&self.pool).await?;
+        conn.query_drop(&sql).await?;
 
         debug!("Dropped table {}.{}", schema, table);
         Ok(())
     }
 
     async fn table_exists(&self, schema: &str, table: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = r#"
             SELECT COUNT(*) as cnt FROM information_schema.TABLES
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
         "#;
 
-        let row = sqlx::query(sql)
-            .bind(schema)
-            .bind(table)
-            .fetch_one(&self.pool)
-            .await?;
+        let count: Option<i64> = conn
+            .exec_first(sql, (schema, table))
+            .await
+            .map_err(|e| MigrateError::pool(e, "checking table existence"))?;
 
-        let count: i64 = row.get("cnt");
-        Ok(count > 0)
+        Ok(count.unwrap_or(0) > 0)
     }
 
     async fn create_primary_key(&self, table: &Table, target_schema: &str) -> Result<()> {
         if table.primary_key.is_empty() {
             return Ok(());
         }
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
 
         let pk_cols: Vec<String> = table
             .primary_key
@@ -246,23 +540,26 @@ impl TargetWriter for MysqlWriter {
             pk_cols.join(", ")
         );
 
-        sqlx::query(&sql).execute(&self.pool).await?;
+        conn.query_drop(&sql).await?;
         debug!("Created primary key on {}.{}", target_schema, table.name);
         Ok(())
     }
 
     async fn create_index(&self, table: &Table, idx: &Index, target_schema: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         // Build column list with prefix lengths for TEXT/BLOB types
-        // MySQL requires a prefix length for these types in indexes
         let idx_cols: Vec<String> = idx
             .columns
             .iter()
             .map(|col_name| {
                 let quoted = Self::quote_ident(col_name);
-                // Look up column type to check if it needs a prefix length
                 if let Some(col) = table.columns.iter().find(|c| &c.name == col_name) {
                     let dtype = col.data_type.to_lowercase();
-                    // TEXT/BLOB types require prefix length for indexing
                     if dtype.contains("text") || dtype.contains("blob") {
                         return format!("{}(255)", quoted);
                     }
@@ -281,7 +578,7 @@ impl TargetWriter for MysqlWriter {
             idx_cols.join(", ")
         );
 
-        sqlx::query(&sql).execute(&self.pool).await?;
+        conn.query_drop(&sql).await?;
         debug!(
             "Created index {} on {}.{}",
             idx.name, target_schema, table.name
@@ -290,29 +587,29 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn drop_non_pk_indexes(&self, schema: &str, table: &str) -> Result<Vec<String>> {
-        // Query non-PK indexes
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = r#"
             SELECT DISTINCT INDEX_NAME
             FROM information_schema.STATISTICS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME != 'PRIMARY'
         "#;
 
-        let rows = sqlx::query(query)
-            .bind(schema)
-            .bind(table)
-            .fetch_all(&self.pool)
-            .await?;
+        let indexes: Vec<String> = conn.exec(query, (schema, table)).await?;
 
         let mut dropped_indexes = Vec::new();
 
-        for row in rows {
-            let name: String = row.get("INDEX_NAME");
+        for name in indexes {
             let drop_sql = format!(
                 "DROP INDEX {} ON {}",
                 Self::quote_ident(&name),
                 Self::qualify_table(schema, table)
             );
-            sqlx::query(&drop_sql).execute(&self.pool).await?;
+            conn.query_drop(&drop_sql).await?;
             dropped_indexes.push(name);
         }
 
@@ -331,6 +628,12 @@ impl TargetWriter for MysqlWriter {
         fk: &ForeignKey,
         target_schema: &str,
     ) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
         let ref_cols: Vec<String> = fk
             .ref_columns
@@ -350,7 +653,7 @@ impl TargetWriter for MysqlWriter {
             map_referential_action(&fk.on_update)
         );
 
-        sqlx::query(&sql).execute(&self.pool).await?;
+        conn.query_drop(&sql).await?;
         debug!(
             "Created foreign key {} on {}.{}",
             fk.name, target_schema, table.name
@@ -364,6 +667,12 @@ impl TargetWriter for MysqlWriter {
         chk: &CheckConstraint,
         target_schema: &str,
     ) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         // MySQL 8.0.16+ supports CHECK constraints
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} {}",
@@ -372,7 +681,7 @@ impl TargetWriter for MysqlWriter {
             convert_check_definition(&chk.definition)
         );
 
-        match sqlx::query(&sql).execute(&self.pool).await {
+        match conn.query_drop(&sql).await {
             Ok(_) => {
                 debug!(
                     "Created check constraint {} on {}.{}",
@@ -380,7 +689,6 @@ impl TargetWriter for MysqlWriter {
                 );
             }
             Err(e) => {
-                // CHECK constraints may not be supported on older MySQL versions
                 warn!(
                     "Failed to create check constraint {} on {}.{}: {}",
                     chk.name, target_schema, table.name, e
@@ -391,29 +699,35 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn has_primary_key(&self, schema: &str, table: &str) -> Result<bool> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = r#"
             SELECT COUNT(*) as cnt
             FROM information_schema.TABLE_CONSTRAINTS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_TYPE = 'PRIMARY KEY'
         "#;
 
-        let row = sqlx::query(sql)
-            .bind(schema)
-            .bind(table)
-            .fetch_one(&self.pool)
-            .await?;
-
-        let count: i64 = row.get("cnt");
-        Ok(count > 0)
+        let count: Option<i64> = conn.exec_first(sql, (schema, table)).await?;
+        Ok(count.unwrap_or(0) > 0)
     }
 
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = format!(
             "SELECT COUNT(*) as cnt FROM {}",
             Self::qualify_table(schema, table)
         );
-        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
-        Ok(row.get("cnt"))
+        let count: Option<i64> = conn.query_first(&sql).await?;
+        Ok(count.unwrap_or(0))
     }
 
     async fn reset_sequence(&self, schema: &str, table: &Table) -> Result<()> {
@@ -421,7 +735,12 @@ impl TargetWriter for MysqlWriter {
             return Ok(());
         }
 
-        // In MySQL, AUTO_INCREMENT is reset by setting the table's auto_increment value
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         for pk_col in &table.primary_key {
             // Check if this is an auto_increment column
             let check_sql = r#"
@@ -429,11 +748,8 @@ impl TargetWriter for MysqlWriter {
                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? AND EXTRA LIKE '%auto_increment%'
             "#;
 
-            let result = sqlx::query(check_sql)
-                .bind(schema)
-                .bind(&table.name)
-                .bind(pk_col)
-                .fetch_optional(&self.pool)
+            let result: Option<String> = conn
+                .exec_first(check_sql, (schema, &table.name, pk_col))
                 .await?;
 
             if result.is_some() {
@@ -444,21 +760,19 @@ impl TargetWriter for MysqlWriter {
                     Self::qualify_table(schema, &table.name)
                 );
 
-                let row = sqlx::query(&max_sql).fetch_one(&self.pool).await?;
-                let max_val: i64 = row.get("max_val");
+                let max_val: Option<i64> = conn.query_first(&max_sql).await?;
+                let next_val = max_val.unwrap_or(0) + 1;
 
                 let reset_sql = format!(
                     "ALTER TABLE {} AUTO_INCREMENT = {}",
                     Self::qualify_table(schema, &table.name),
-                    max_val + 1
+                    next_val
                 );
-                sqlx::query(&reset_sql).execute(&self.pool).await?;
+                conn.query_drop(&reset_sql).await?;
 
                 debug!(
                     "Reset AUTO_INCREMENT to {} for {}.{}",
-                    max_val + 1,
-                    schema,
-                    table.name
+                    next_val, schema, table.name
                 );
             }
         }
@@ -468,13 +782,11 @@ impl TargetWriter for MysqlWriter {
 
     async fn set_table_logged(&self, _schema: &str, _table: &str) -> Result<()> {
         // MySQL doesn't have UNLOGGED tables
-        // This is a no-op
         Ok(())
     }
 
     async fn set_table_unlogged(&self, _schema: &str, _table: &str) -> Result<()> {
         // MySQL doesn't have UNLOGGED tables
-        // This is a no-op
         Ok(())
     }
 
@@ -485,99 +797,35 @@ impl TargetWriter for MysqlWriter {
         cols: &[String],
         batch: Batch,
     ) -> Result<u64> {
-        let rows = batch.rows;
-        if rows.is_empty() {
+        if batch.rows.is_empty() {
             return Ok(0);
         }
 
-        let row_count = rows.len() as u64;
-        let qualified_table = Self::qualify_table(schema, table);
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
-        let col_list_str = col_list.join(", ");
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
 
-        // Calculate max rows per batch to stay under MySQL's placeholder limit
-        let num_cols = cols.len();
-        let max_rows_per_batch = if num_cols > 0 {
-            MYSQL_MAX_PLACEHOLDERS / num_cols
-        } else {
-            return Ok(0);
-        };
-
-        let num_sub_batches = rows.len().div_ceil(max_rows_per_batch);
-        info!(
-            "MySQL write_batch: {} rows, {} cols, {} sub-batches to {}",
-            row_count, num_cols, num_sub_batches, qualified_table
-        );
-
-        // Use explicit transaction for batch safety
-        debug!(
-            "MySQL write_batch: acquiring connection from pool for {}",
-            qualified_table
-        );
-        let mut tx = self.pool.begin().await?;
-        debug!(
-            "MySQL write_batch: transaction started for {}",
-            qualified_table
-        );
-
-        // Process rows in sub-batches to respect MySQL placeholder limit
-        for (sub_batch_idx, chunk) in rows.chunks(max_rows_per_batch).enumerate() {
-            debug!(
-                "MySQL write_batch: preparing sub-batch {}/{} ({} rows) for {}",
-                sub_batch_idx + 1,
-                num_sub_batches,
-                chunk.len(),
-                qualified_table
-            );
-
-            let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
-            let all_placeholders: Vec<String> =
-                std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
-
-            let sql = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                qualified_table,
-                col_list_str,
-                all_placeholders.join(", ")
-            );
-
-            let mut query = sqlx::query(&sql);
-
-            for row in chunk {
-                for value in row {
-                    query = bind_value(query, value);
+        // Use LOAD DATA if configured
+        if self.mysql_load_data == MysqlLoadData::Always {
+            // Try LOAD DATA first, fall back to INSERT if not supported
+            match self
+                .write_batch_load_data(&mut conn, schema, table, cols, batch)
+                .await?
+            {
+                Some(count) => return Ok(count),
+                None => {
+                    // LOAD DATA not supported, but we've consumed the batch
+                    // This should only happen once per connection - log and return
+                    warn!("LOAD DATA failed, batch was consumed. Consider using mysql_load_data: never");
+                    return Ok(0);
                 }
             }
-
-            debug!(
-                "MySQL write_batch: executing sub-batch {}/{} for {}",
-                sub_batch_idx + 1,
-                num_sub_batches,
-                qualified_table
-            );
-            query.execute(&mut *tx).await.map_err(|e| {
-                MigrateError::transfer(&qualified_table, format!("INSERT batch: {}", e))
-            })?;
-            debug!(
-                "MySQL write_batch: sub-batch {}/{} complete for {}",
-                sub_batch_idx + 1,
-                num_sub_batches,
-                qualified_table
-            );
         }
 
-        debug!(
-            "MySQL write_batch: committing transaction for {}",
-            qualified_table
-        );
-        tx.commit().await?;
-        debug!(
-            "MySQL write_batch: transaction committed for {}",
-            qualified_table
-        );
-
-        debug!("MySQL: wrote {} rows to {}", row_count, qualified_table);
-        Ok(row_count)
+        self.write_batch_insert(&mut conn, schema, table, cols, batch)
+            .await
     }
 
     async fn upsert_batch(
@@ -604,7 +852,34 @@ impl TargetWriter for MysqlWriter {
         let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
         let col_list_str = col_list.join(", ");
 
-        // Calculate max rows per batch to stay under MySQL's placeholder limit
+        // Create staging table name
+        let staging_name = match partition_id {
+            Some(pid) => format!("_staging_{}_p{}_{}", table, pid, writer_id),
+            None => format!("_staging_{}_{}", table, writer_id),
+        };
+        let staging_qualified = Self::qualify_table(schema, &staging_name);
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
+        // Start transaction
+        let mut tx = conn.start_transaction(TxOpts::default()).await?;
+
+        // Drop if exists, create staging as copy of target structure
+        let drop_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
+        tx.query_drop(&drop_sql).await?;
+
+        let create_sql = format!(
+            "CREATE TABLE {} LIKE {}",
+            staging_qualified, qualified_target
+        );
+        tx.query_drop(&create_sql).await?;
+
+        // Insert into staging table using batched INSERT
+        const MYSQL_MAX_PLACEHOLDERS: usize = 65535;
         let num_cols = cols.len();
         let max_rows_per_batch = if num_cols > 0 {
             MYSQL_MAX_PLACEHOLDERS / num_cols
@@ -612,83 +887,24 @@ impl TargetWriter for MysqlWriter {
             return Ok(0);
         };
 
-        let num_sub_batches = rows.len().div_ceil(max_rows_per_batch);
-        info!(
-            "MySQL upsert_batch: {} rows, {} cols, {} sub-batches to {} (writer {})",
-            row_count, num_cols, num_sub_batches, qualified_target, writer_id
-        );
-
-        // Create staging table
-        let staging_name = match partition_id {
-            Some(pid) => format!("_staging_{}_p{}_{}", table, pid, writer_id),
-            None => format!("_staging_{}_{}", table, writer_id),
-        };
-        let staging_qualified = Self::qualify_table(schema, &staging_name);
-
-        debug!(
-            "MySQL upsert_batch: acquiring connection for {} (writer {})",
-            qualified_target, writer_id
-        );
-        let mut tx = self.pool.begin().await?;
-        debug!(
-            "MySQL upsert_batch: transaction started for {} (writer {})",
-            qualified_target, writer_id
-        );
-
-        // Drop if exists, create staging as copy of target structure
-        debug!(
-            "MySQL upsert_batch: creating staging table {} (writer {})",
-            staging_qualified, writer_id
-        );
-        let drop_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
-        sqlx::query(&drop_sql).execute(&mut *tx).await?;
-
-        let create_sql = format!(
-            "CREATE TABLE {} LIKE {}",
-            staging_qualified, qualified_target
-        );
-        sqlx::query(&create_sql).execute(&mut *tx).await?;
-        debug!(
-            "MySQL upsert_batch: staging table created {} (writer {})",
-            staging_qualified, writer_id
-        );
-
-        // Insert into staging table in sub-batches to respect MySQL placeholder limit
-        for (sub_batch_idx, chunk) in rows.chunks(max_rows_per_batch).enumerate() {
-            debug!(
-                "MySQL upsert_batch: inserting sub-batch {}/{} ({} rows) into staging {} (writer {})",
-                sub_batch_idx + 1,
-                num_sub_batches,
-                chunk.len(),
-                staging_qualified,
-                writer_id
-            );
-
+        for chunk in rows.chunks(max_rows_per_batch) {
             let placeholders_per_row = format!("({})", vec!["?"; num_cols].join(", "));
             let all_placeholders: Vec<String> =
                 std::iter::repeat_n(placeholders_per_row, chunk.len()).collect();
 
-            let insert_sql = format!(
+            let sql = format!(
                 "INSERT INTO {} ({}) VALUES {}",
                 staging_qualified,
                 col_list_str,
                 all_placeholders.join(", ")
             );
 
-            let mut insert_query = sqlx::query(&insert_sql);
-            for row in chunk {
-                for value in row {
-                    insert_query = bind_value(insert_query, value);
-                }
-            }
+            let params: Vec<mysql_async::Value> = chunk
+                .iter()
+                .flat_map(|row| row.iter().map(sql_value_to_mysql))
+                .collect();
 
-            insert_query.execute(&mut *tx).await?;
-            debug!(
-                "MySQL upsert_batch: sub-batch {}/{} complete (writer {})",
-                sub_batch_idx + 1,
-                num_sub_batches,
-                writer_id
-            );
+            tx.exec_drop(&sql, params).await?;
         }
 
         // Build INSERT ... ON DUPLICATE KEY UPDATE from staging
@@ -701,13 +917,11 @@ impl TargetWriter for MysqlWriter {
         let non_pk_cols: Vec<_> = cols.iter().filter(|c| !pk_cols.contains(c)).collect();
 
         let upsert_sql = if non_pk_cols.is_empty() {
-            // Only PK columns - use INSERT IGNORE
             format!(
                 "INSERT IGNORE INTO {} ({}) SELECT {} FROM {} AS s",
                 qualified_target, col_list_str, select_cols, staging_qualified
             )
         } else {
-            // Has non-PK columns - use ON DUPLICATE KEY UPDATE
             let update_set = non_pk_cols
                 .iter()
                 .map(|c| {
@@ -726,37 +940,14 @@ impl TargetWriter for MysqlWriter {
             )
         };
 
-        debug!(
-            "MySQL upsert_batch: executing merge from staging to {} (writer {})",
-            qualified_target, writer_id
-        );
-        sqlx::query(&upsert_sql).execute(&mut *tx).await?;
-        debug!(
-            "MySQL upsert_batch: merge complete for {} (writer {})",
-            qualified_target, writer_id
-        );
+        tx.query_drop(&upsert_sql).await?;
 
         // Drop staging
-        debug!(
-            "MySQL upsert_batch: dropping staging table {} (writer {})",
-            staging_qualified, writer_id
-        );
         let drop_staging_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
-        sqlx::query(&drop_staging_sql).execute(&mut *tx).await?;
-        debug!(
-            "MySQL upsert_batch: staging table dropped {} (writer {})",
-            staging_qualified, writer_id
-        );
+        tx.query_drop(&drop_staging_sql).await?;
 
-        debug!(
-            "MySQL upsert_batch: committing transaction for {} (writer {})",
-            qualified_target, writer_id
-        );
+        // Commit transaction
         tx.commit().await?;
-        debug!(
-            "MySQL upsert_batch: transaction committed for {} (writer {})",
-            qualified_target, writer_id
-        );
 
         debug!("MySQL: upserted {} rows to {}", row_count, qualified_target);
         Ok(row_count)
@@ -767,7 +958,7 @@ impl TargetWriter for MysqlWriter {
     }
 
     async fn close(&self) {
-        self.pool.close().await;
+        self.pool.clone().disconnect().await.ok();
     }
 
     fn supports_direct_copy(&self) -> bool {
@@ -775,27 +966,31 @@ impl TargetWriter for MysqlWriter {
     }
 }
 
-/// Bind a SqlValue to a sqlx query.
-fn bind_value<'q>(
-    query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
-    value: &'q SqlValue<'_>,
-) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+/// Convert SqlValue to mysql_async::Value.
+fn sql_value_to_mysql(value: &SqlValue<'_>) -> mysql_async::Value {
     match value {
-        SqlValue::Null(_) => query.bind(None::<String>),
-        SqlValue::Bool(b) => query.bind(*b),
-        SqlValue::I16(i) => query.bind(*i),
-        SqlValue::I32(i) => query.bind(*i),
-        SqlValue::I64(i) => query.bind(*i),
-        SqlValue::F32(f) => query.bind(*f),
-        SqlValue::F64(f) => query.bind(*f),
-        SqlValue::Text(s) => query.bind(s.as_ref()),
-        SqlValue::Bytes(b) => query.bind(b.as_ref()),
-        SqlValue::Uuid(u) => query.bind(u.to_string()),
-        SqlValue::Decimal(d) => query.bind(d.to_string()),
-        SqlValue::DateTime(dt) => query.bind(*dt),
-        SqlValue::DateTimeOffset(dto) => query.bind(dto.naive_utc()),
-        SqlValue::Date(d) => query.bind(*d),
-        SqlValue::Time(t) => query.bind(*t),
+        SqlValue::Null(_) => mysql_async::Value::NULL,
+        SqlValue::Bool(b) => mysql_async::Value::from(*b),
+        SqlValue::I16(i) => mysql_async::Value::from(*i),
+        SqlValue::I32(i) => mysql_async::Value::from(*i),
+        SqlValue::I64(i) => mysql_async::Value::from(*i),
+        SqlValue::F32(f) => mysql_async::Value::from(*f),
+        SqlValue::F64(f) => mysql_async::Value::from(*f),
+        SqlValue::Text(s) => mysql_async::Value::from(s.as_ref()),
+        SqlValue::CompressedText { .. } => {
+            // Decompress and convert to MySQL value
+            match value.decompress_text() {
+                Some(s) => mysql_async::Value::from(s.into_owned()),
+                None => mysql_async::Value::NULL,
+            }
+        }
+        SqlValue::Bytes(b) => mysql_async::Value::from(b.as_ref()),
+        SqlValue::Uuid(u) => mysql_async::Value::from(u.to_string()),
+        SqlValue::Decimal(d) => mysql_async::Value::from(d.to_string()),
+        SqlValue::DateTime(dt) => mysql_async::Value::from(*dt),
+        SqlValue::DateTimeOffset(dto) => mysql_async::Value::from(dto.naive_utc()),
+        SqlValue::Date(d) => mysql_async::Value::from(*d),
+        SqlValue::Time(t) => mysql_async::Value::from(*t),
     }
 }
 

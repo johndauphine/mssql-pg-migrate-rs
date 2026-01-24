@@ -762,6 +762,18 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue<'_>) {
             buf.put_i32(bytes.len() as i32);
             buf.put_slice(bytes);
         }
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => {
+                    buf.put_i32(decompressed.len() as i32);
+                    buf.put_slice(&decompressed);
+                }
+                Err(_) => {
+                    buf.put_i32(0);
+                }
+            }
+        }
         SqlValue::Bytes(b) => {
             buf.put_i32(b.len() as i32);
             buf.put_slice(b);
@@ -824,6 +836,13 @@ fn value_to_text(value: &SqlValue<'_>) -> String {
         SqlValue::F32(f) => f.to_string(),
         SqlValue::F64(f) => f.to_string(),
         SqlValue::Text(s) => escape_copy_text(s),
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => escape_copy_text(&String::from_utf8_lossy(&decompressed)),
+                Err(_) => String::new(),
+            }
+        }
         SqlValue::Bytes(b) => format!("\\\\x{}", hex::encode(b.as_ref())),
         SqlValue::Uuid(u) => u.to_string(),
         SqlValue::Decimal(d) => d.to_string(),

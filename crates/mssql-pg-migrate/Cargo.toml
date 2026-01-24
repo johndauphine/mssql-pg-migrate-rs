@@ -15,8 +15,8 @@ default = []
 # Requires libgssapi-krb5-2 on Linux, GSS.framework on macOS, SSPI on Windows
 # Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
 kerberos = ["tiberius/integrated-auth-gssapi"]
-# MySQL/MariaDB support via SQLx
-mysql = ["dep:sqlx"]
+# MySQL/MariaDB support via mysql_async (with LOAD DATA LOCAL INFILE)
+mysql = ["dep:mysql_async"]
 
 [dependencies]
 # Async runtime
@@ -90,8 +90,11 @@ sysinfo = { workspace = true }
 # Glob pattern matching for table filters
 glob = "0.3"
 
-# MySQL/MariaDB driver (optional)
-sqlx = { workspace = true, optional = true }
+# LZ4 compression for text columns in transit
+lz4_flex = "0.11"
+
+# MySQL/MariaDB driver (optional) - uses mysql_async for LOAD DATA LOCAL INFILE
+mysql_async = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

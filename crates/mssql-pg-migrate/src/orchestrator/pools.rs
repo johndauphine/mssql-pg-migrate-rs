@@ -73,6 +73,13 @@ fn convert_sql_value(old: SqlValue) -> NewSqlValue<'static> {
         SqlValue::F32(v) => NewSqlValue::F32(v),
         SqlValue::F64(v) => NewSqlValue::F64(v),
         SqlValue::String(v) => NewSqlValue::Text(Cow::Owned(v)),
+        SqlValue::CompressedText {
+            original_len,
+            compressed,
+        } => NewSqlValue::CompressedText {
+            original_len,
+            compressed,
+        },
         SqlValue::Bytes(v) => NewSqlValue::Bytes(Cow::Owned(v)),
         SqlValue::Uuid(v) => NewSqlValue::Uuid(v),
         SqlValue::Decimal(v) => NewSqlValue::Decimal(v),
@@ -493,7 +500,9 @@ impl TargetPoolImpl {
             {
                 use crate::dialect::{MssqlToMysqlMapper, PostgresToMysqlMapper};
                 mysql_info!("Creating MySQL target connection pool");
-                let writer = MysqlWriter::new(&config.target, max_conns).await?;
+                let writer =
+                    MysqlWriter::new(&config.target, max_conns, config.migration.mysql_load_data)
+                        .await?;
                 // Add type mapper based on source database type
                 let source_type = config.source.r#type.to_lowercase();
                 let writer = if source_type == "postgres"
