@@ -2868,4 +2868,90 @@ mod tests {
         assert!(name2.len() <= PG_MAX_IDENTIFIER_LEN);
         assert!(name3.len() <= PG_MAX_IDENTIFIER_LEN);
     }
+
+    // ============== CompressedText handling tests ==============
+
+    #[test]
+    fn test_write_binary_value_compressed_text() {
+        // Create a compressed text value
+        let original = "a".repeat(200);
+        let compressed_data = lz4_flex::compress_prepend_size(original.as_bytes());
+        let value = SqlValue::CompressedText {
+            original_len: original.len(),
+            compressed: compressed_data,
+        };
+
+        let mut buf = BytesMut::new();
+        write_binary_value(&mut buf, &value);
+
+        // First 4 bytes should be the length of the decompressed data
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len as usize, original.len());
+
+        // Remaining bytes should be the decompressed string
+        let data = &buf[4..];
+        assert_eq!(String::from_utf8_lossy(data), original);
+    }
+
+    #[test]
+    fn test_sql_value_to_copy_text_compressed() {
+        // Create a compressed text value
+        let original = "hello\tworld\nnewline";
+        let compressed_data = lz4_flex::compress_prepend_size(original.as_bytes());
+        let value = SqlValue::CompressedText {
+            original_len: original.len(),
+            compressed: compressed_data,
+        };
+
+        let result = sql_value_to_copy_text(&value);
+
+        // Should escape special characters in the decompressed text
+        assert!(result.contains("\\t")); // Tab escaped
+        assert!(result.contains("\\n")); // Newline escaped
+    }
+
+    #[test]
+    fn test_compressed_text_round_trip() {
+        // Test that compression and decompression preserve the original string
+        let original = "Test string with various characters: αβγδ 日本語 🎉".to_string();
+        let original_len = original.len();
+        let compressed_data = lz4_flex::compress_prepend_size(original.as_bytes());
+
+        let value = SqlValue::CompressedText {
+            original_len,
+            compressed: compressed_data,
+        };
+
+        // Test via write_binary_value
+        let mut buf = BytesMut::new();
+        write_binary_value(&mut buf, &value);
+
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let data = &buf[4..4 + len];
+        let decompressed = String::from_utf8_lossy(data);
+
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_sql_value_string_unchanged() {
+        // Verify that regular String values still work correctly
+        let value = SqlValue::String("hello world".to_string());
+
+        let mut buf = BytesMut::new();
+        write_binary_value(&mut buf, &value);
+
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len, 11);
+
+        let data = &buf[4..];
+        assert_eq!(String::from_utf8_lossy(data), "hello world");
+    }
+
+    #[test]
+    fn test_sql_value_to_copy_text_string() {
+        let value = SqlValue::String("normal string".to_string());
+        let result = sql_value_to_copy_text(&value);
+        assert_eq!(result, "normal string");
+    }
 }

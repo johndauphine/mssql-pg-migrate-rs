@@ -433,4 +433,182 @@ migration:
         // Should include Users, Posts, PostTypes but exclude PostLinks and Comments
         assert_eq!(filtered, vec!["dbo.Users", "dbo.Posts", "dbo.PostTypes"]);
     }
+
+    // ============== compress_text config tests ==============
+
+    #[test]
+    fn test_compress_text_default_false() {
+        let config = Config::from_yaml(VALID_YAML).unwrap();
+        assert!(!config.migration.compress_text);
+    }
+
+    #[test]
+    fn test_compress_text_explicit_true() {
+        let yaml = r#"
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: source_db
+  user: sa
+  password: password
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: postgres
+  host: localhost
+  port: 5432
+  database: target_db
+  user: postgres
+  password: password
+  schema: public
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  compress_text: true
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(config.migration.compress_text);
+    }
+
+    #[test]
+    fn test_compress_text_explicit_false() {
+        let yaml = r#"
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: source_db
+  user: sa
+  password: password
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: postgres
+  host: localhost
+  port: 5432
+  database: target_db
+  user: postgres
+  password: password
+  schema: public
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  compress_text: false
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert!(!config.migration.compress_text);
+    }
+
+    // ============== MysqlLoadData config tests ==============
+
+    #[test]
+    fn test_mysql_load_data_default_never() {
+        let config = Config::from_yaml(VALID_YAML).unwrap();
+        assert_eq!(config.migration.mysql_load_data, types::MysqlLoadData::Never);
+    }
+
+    #[test]
+    fn test_mysql_load_data_always() {
+        let yaml = r#"
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: source_db
+  user: sa
+  password: password
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: mysql
+  host: localhost
+  port: 3306
+  database: target_db
+  user: root
+  password: password
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  mysql_load_data: always
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.migration.mysql_load_data, types::MysqlLoadData::Always);
+    }
+
+    #[test]
+    fn test_mysql_load_data_never_explicit() {
+        let yaml = r#"
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: source_db
+  user: sa
+  password: password
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: mysql
+  host: localhost
+  port: 3306
+  database: target_db
+  user: root
+  password: password
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  mysql_load_data: never
+"#;
+        let config = Config::from_yaml(yaml).unwrap();
+        assert_eq!(config.migration.mysql_load_data, types::MysqlLoadData::Never);
+    }
+
+    #[test]
+    fn test_mysql_load_data_invalid_value() {
+        let yaml = r#"
+source:
+  type: mssql
+  host: localhost
+  port: 1433
+  database: source_db
+  user: sa
+  password: password
+  schema: dbo
+  encrypt: false
+  trust_server_cert: true
+
+target:
+  type: mysql
+  host: localhost
+  port: 3306
+  database: target_db
+  user: root
+  password: password
+  ssl_mode: disable
+
+migration:
+  workers: 4
+  chunk_size: 100000
+  mysql_load_data: invalid_value
+"#;
+        let result = Config::from_yaml(yaml);
+        assert!(result.is_err());
+    }
 }
