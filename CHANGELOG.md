@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.41.0] - 2026-01-24
+
+### Features
+- **MySQL Target Support** - Full MySQL/MariaDB target support using mysql_async driver
+  - Batched INSERT statements for reliable bulk loading
+  - Optional LOAD DATA LOCAL INFILE for large text tables (`mysql_load_data: always`)
+  - SSL/TLS support with multiple modes (disable, prefer, require, verify-ca, verify-full)
+  - Migration state storage in MySQL target database
+  - Complete MSSQL → MySQL type mapping
+
+### Performance
+- **MySQL Performance Tuning** - Extensive benchmarking of MySQL bulk load strategies
+  - Batched INSERT: 33,387 rows/sec (optimal for parallel workloads)
+  - LOAD DATA: 34,231 rows/sec with 1 worker (2% faster for single-threaded)
+  - Added `mysql_load_data` config option (never/always)
+  - See [MySQL Performance Tuning Guide](docs/mysql-performance-tuning.md)
+
+### Bug Fixes
+- **drop_recreate State Handling** - Fixed bug where drop_recreate mode would skip tables marked as completed in state from previous runs. Now always processes all tables in drop_recreate mode.
+
+### Tests
+- Added unit tests for drop_recreate vs upsert state initialization behavior
+- Added tests for table filtering logic in different target modes
+
 ## [0.8.10] - 2025-12-29
 
 ### Performance

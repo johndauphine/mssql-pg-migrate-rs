@@ -1,6 +1,6 @@
 # mssql-pg-migrate-rs
 
-High-performance MSSQL to PostgreSQL migration tool written in Rust.
+High-performance database migration tool written in Rust. Supports MSSQL, PostgreSQL, and MySQL.
 
 Designed for headless operation in scripted environments, Kubernetes, and Airflow DAGs.
 
@@ -8,25 +8,28 @@ Designed for headless operation in scripted environments, Kubernetes, and Airflo
 
 Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 
-| Mode | Duration | Throughput |
-|------|----------|------------|
-| drop_recreate | 119s | 162,452 rows/sec |
-| upsert | ~180s | ~106,000 rows/sec |
+| Target | Mode | Duration | Throughput |
+|--------|------|----------|------------|
+| PostgreSQL | drop_recreate | 119s | 162,452 rows/sec |
+| PostgreSQL | upsert | ~180s | ~106,000 rows/sec |
+| MySQL | drop_recreate | 198s | 97,502 rows/sec |
 
-*Auto-tuned parallelism, localhost MSSQL → PostgreSQL, binary COPY protocol*
+*Auto-tuned parallelism, localhost transfers, binary COPY (PostgreSQL) / batched INSERT (MySQL)*
 
 ## Features
 
+- **Multi-database support** - MSSQL, PostgreSQL, and MySQL as sources or targets
 - **High throughput** - Parallel readers/writers with read-ahead pipeline
 - **Auto-tuning** - Memory-aware configuration based on system RAM and CPU cores
 - **Parallel transfers** - Multiple concurrent readers per large table using PK range splitting
 - **Binary COPY protocol** - Optimized PostgreSQL ingestion with adaptive buffering
+- **MySQL bulk loading** - Optional LOAD DATA LOCAL INFILE for large text tables
 - **Two target modes** - `drop_recreate`, `upsert`
 - **Incremental sync** - Upsert mode with date-based watermarks for fast delta syncs
-- **Database state storage** - Migration state stored in PostgreSQL (no external files)
+- **Database state storage** - Migration state stored in target database (no external files)
 - **Interactive TUI** - Terminal UI for guided migration with real-time progress
 - **Configuration wizard** - Interactive `init` command creates config files
-- **Automatic type mapping** - MSSQL to PostgreSQL type conversion
+- **Automatic type mapping** - Cross-database type conversion
 - **Keyset pagination** - Efficient chunked reads using `WHERE pk > last_pk`
 - **Resume capability** - Automatic crash recovery from database state
 - **Parallel finalization** - Concurrent index and constraint creation
@@ -56,7 +59,14 @@ chmod +x mssql-pg-migrate-*
 ### Build from source
 
 ```bash
+# Standard build (MSSQL + PostgreSQL)
 cargo build --release
+
+# With MySQL support
+cargo build --release --features mysql
+
+# All features (MySQL + TUI + Kerberos)
+cargo build --release --all-features
 ```
 
 ## Usage
@@ -118,7 +128,7 @@ source:
   trust_server_cert: true
 
 target:
-  type: postgres
+  type: postgres  # or mysql
   host: postgres.example.com
   port: 5432
   database: target_db
@@ -141,7 +151,29 @@ migration:
   #   - LastActivityDate
   #   - ModifiedDate
   #   - UpdatedAt
+  # mysql_load_data: never    # MySQL: never (default) or always (LOAD DATA LOCAL INFILE)
 ```
+
+### MySQL Target Configuration
+
+```yaml
+target:
+  type: mysql
+  host: mysql.example.com
+  port: 3306
+  database: target_db
+  user: root
+  password: "YourPassword"
+  ssl_mode: disable  # disable, prefer, require, verify-ca, verify-full
+
+migration:
+  target_mode: drop_recreate
+  workers: 4
+  chunk_size: 50000
+  # mysql_load_data: always  # Use LOAD DATA for large text tables (requires local_infile=ON)
+```
+
+See [MySQL Performance Tuning](docs/mysql-performance-tuning.md) for optimization guidance.
 
 ### Auto-Tuning
 
@@ -235,6 +267,8 @@ The state schema is automatically initialized on first run. No configuration or 
 
 ## Type Mapping
 
+### MSSQL → PostgreSQL
+
 | MSSQL | PostgreSQL |
 |-------|------------|
 | bit | boolean |
@@ -256,6 +290,30 @@ The state schema is automatically initialized on first run. No configuration or 
 | time | time |
 | uniqueidentifier | uuid |
 | binary/varbinary | bytea |
+
+### MSSQL → MySQL
+
+| MSSQL | MySQL |
+|-------|-------|
+| bit | TINYINT(1) |
+| tinyint | TINYINT UNSIGNED |
+| smallint | SMALLINT |
+| int | INT |
+| bigint | BIGINT |
+| decimal(p,s) | DECIMAL(p,s) |
+| float | DOUBLE |
+| real | FLOAT |
+| varchar(n) | VARCHAR(n) |
+| nvarchar(n) | VARCHAR(n) |
+| nvarchar(max) | LONGTEXT |
+| text/ntext | LONGTEXT |
+| datetime | DATETIME(3) |
+| datetime2 | DATETIME(6) |
+| datetimeoffset | DATETIME(6) |
+| date | DATE |
+| time | TIME(6) |
+| uniqueidentifier | CHAR(36) |
+| binary/varbinary | BLOB/LONGBLOB |
 
 ## Airflow Integration
 

@@ -1,6 +1,6 @@
 # mssql-pg-migrate: Data Engineer's Guide
 
-A comprehensive technical reference for data engineers using mssql-pg-migrate-rs, a high-performance MSSQL to PostgreSQL migration tool.
+A comprehensive technical reference for data engineers using mssql-pg-migrate-rs, a high-performance database migration tool supporting MSSQL, PostgreSQL, and MySQL.
 
 ## Table of Contents
 
@@ -29,10 +29,11 @@ mssql-pg-migrate-rs is a production-ready data migration tool designed for:
 
 Tested with Stack Overflow 2010 dataset (19.3M rows, 10 tables):
 
-| Mode | Duration | Throughput | Use Case |
-|------|----------|------------|----------|
-| `drop_recreate` | 119s | 162,452 rows/sec | Full refresh |
-| `upsert` | ~180s | ~106,000 rows/sec | Incremental sync |
+| Target | Mode | Duration | Throughput | Use Case |
+|--------|------|----------|------------|----------|
+| PostgreSQL | `drop_recreate` | 119s | 162,452 rows/sec | Full refresh |
+| PostgreSQL | `upsert` | ~180s | ~106,000 rows/sec | Incremental sync |
+| MySQL | `drop_recreate` | 198s | 97,502 rows/sec | Full refresh |
 
 ---
 
@@ -217,16 +218,26 @@ source:
   encrypt: true                  # Optional: default true
   trust_server_cert: false       # Optional: default false (set true for dev)
 
-# Target database connection
+# Target database connection (PostgreSQL)
 target:
-  type: postgres                 # Required: "postgres" or "postgresql"
+  type: postgres                 # Required: "postgres", "postgresql", or "mysql"
   host: postgres.example.com     # Required: hostname or IP
-  port: 5432                     # Optional: default 5432
+  port: 5432                     # Optional: default 5432 (PostgreSQL) or 3306 (MySQL)
   database: target_db            # Required: database name
   user: postgres                 # Required: username
   password: "YourPassword"       # Required: password
   schema: public                 # Optional: default "public"
   ssl_mode: require              # Optional: disable, allow, prefer, require
+
+# MySQL target example
+# target:
+#   type: mysql
+#   host: mysql.example.com
+#   port: 3306
+#   database: target_db
+#   user: root
+#   password: "YourPassword"
+#   ssl_mode: disable            # disable, prefer, require, verify-ca, verify-full
 
 # Migration settings
 migration:
@@ -260,6 +271,12 @@ migration:
   # Upsert mode settings
   upsert_batch_size: 2000        # Rows per upsert batch
   upsert_parallel_tasks: 4       # Parallel upsert operations
+
+  # MySQL-specific settings
+  mysql_load_data: never         # never (default) or always
+                                 # Use LOAD DATA LOCAL INFILE for bulk loading
+                                 # Faster for single-worker, large text tables
+                                 # Requires server: local_infile=ON
 
   # Table filtering (glob patterns)
   include_tables:                # Empty = all tables
@@ -672,6 +689,8 @@ mssql-pg-migrate -c config.yaml --progress run 2>&1 | \
 
 ## Type Mapping Reference
 
+### MSSQL → PostgreSQL
+
 | MSSQL Type | PostgreSQL Type | Notes |
 |------------|-----------------|-------|
 | `bit` | `boolean` | |
@@ -707,6 +726,41 @@ mssql-pg-migrate -c config.yaml --progress run 2>&1 | \
 | `xml` | `text` | |
 | `geometry` | `text` | WKT format |
 | `geography` | `text` | WKT format |
+
+### MSSQL → MySQL
+
+| MSSQL Type | MySQL Type | Notes |
+|------------|------------|-------|
+| `bit` | `TINYINT(1)` | Boolean representation |
+| `tinyint` | `TINYINT UNSIGNED` | |
+| `smallint` | `SMALLINT` | |
+| `int` | `INT` | |
+| `bigint` | `BIGINT` | |
+| `decimal(p,s)` | `DECIMAL(p,s)` | Precision preserved |
+| `numeric(p,s)` | `DECIMAL(p,s)` | |
+| `money` | `DECIMAL(19,4)` | |
+| `smallmoney` | `DECIMAL(10,4)` | |
+| `float` | `DOUBLE` | |
+| `real` | `FLOAT` | |
+| `char(n)` | `CHAR(n)` | |
+| `varchar(n)` | `VARCHAR(n)` | |
+| `varchar(max)` | `LONGTEXT` | |
+| `nchar(n)` | `CHAR(n)` | UTF-8 in MySQL |
+| `nvarchar(n)` | `VARCHAR(n)` | |
+| `nvarchar(max)` | `LONGTEXT` | |
+| `text` | `LONGTEXT` | |
+| `ntext` | `LONGTEXT` | |
+| `datetime` | `DATETIME(3)` | Millisecond precision |
+| `datetime2` | `DATETIME(6)` | Microsecond precision |
+| `smalldatetime` | `DATETIME` | |
+| `date` | `DATE` | |
+| `time` | `TIME(6)` | |
+| `datetimeoffset` | `DATETIME(6)` | Timezone info lost |
+| `uniqueidentifier` | `CHAR(36)` | UUID as string |
+| `binary(n)` | `BINARY(n)` | |
+| `varbinary(n)` | `VARBINARY(n)` | |
+| `varbinary(max)` | `LONGBLOB` | |
+| `image` | `LONGBLOB` | |
 
 ---
 
@@ -746,4 +800,4 @@ mssql-pg-migrate -c config.yaml --progress run 2>&1 | \
 
 ---
 
-*Documentation generated for mssql-pg-migrate-rs v0.8.5*
+*Documentation generated for mssql-pg-migrate-rs v1.41.0*
