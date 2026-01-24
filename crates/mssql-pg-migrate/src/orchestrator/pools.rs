@@ -493,7 +493,9 @@ impl TargetPoolImpl {
             {
                 use crate::dialect::{MssqlToMysqlMapper, PostgresToMysqlMapper};
                 mysql_info!("Creating MySQL target connection pool");
-                let writer = MysqlWriter::new(&config.target, max_conns).await?;
+                let writer =
+                    MysqlWriter::new(&config.target, max_conns, config.migration.mysql_load_data)
+                        .await?;
                 // Add type mapper based on source database type
                 let source_type = config.source.r#type.to_lowercase();
                 let writer = if source_type == "postgres"

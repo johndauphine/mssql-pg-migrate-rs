@@ -2,20 +2,20 @@
 source:
   type: postgres
   host: localhost
-  port: 5433
-  database: stackoverflow
+  port: 5432
+  database: stackoverflow_test
   schema: public
   user: postgres
-  password: PostgresPassword123
-  ssl_mode: disable
+  password: postgres
 
 target:
   type: mysql
   host: localhost
   port: 3307
-  database: stackoverflow_test3
+  database: stackoverflow_target
   user: root
   password: "rootpassword"
+  ssl_mode: disable
 
 migration:
   target_mode: drop_recreate

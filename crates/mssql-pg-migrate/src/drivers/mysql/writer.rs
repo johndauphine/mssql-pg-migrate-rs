@@ -11,16 +11,18 @@
 //! - Efficient connection pooling
 //! - Falls back to batched INSERT when LOAD DATA is not supported
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, TxOpts};
 use tracing::{debug, info, warn};
 
-use crate::config::TargetConfig;
+use crate::config::{MysqlLoadData, TargetConfig};
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlValue};
@@ -32,11 +34,20 @@ use crate::error::{MigrateError, Result};
 pub struct MysqlWriter {
     pool: Pool,
     type_mapper: Option<Arc<dyn TypeMapper>>,
+    /// Tables that have LOB columns (TEXT, BLOB, etc.) and should use INSERT instead of LOAD DATA.
+    /// LOAD DATA LOCAL INFILE is slower for LOB columns due to CSV escaping overhead.
+    tables_with_lob: Arc<RwLock<HashSet<String>>>,
+    /// MySQL bulk load strategy configuration.
+    mysql_load_data: MysqlLoadData,
 }
 
 impl MysqlWriter {
     /// Create a new MySQL writer from configuration.
-    pub async fn new(config: &TargetConfig, max_conns: usize) -> Result<Self> {
+    pub async fn new(
+        config: &TargetConfig,
+        max_conns: usize,
+        mysql_load_data: MysqlLoadData,
+    ) -> Result<Self> {
         let ssl_opts = match config.ssl_mode.to_lowercase().as_str() {
             "disable" => {
                 warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
@@ -94,7 +105,36 @@ impl MysqlWriter {
         Ok(Self {
             pool,
             type_mapper: None,
+            tables_with_lob: Arc::new(RwLock::new(HashSet::new())),
+            mysql_load_data,
         })
+    }
+
+    /// Check if a data type is a LOB (Large Object) type that performs poorly with LOAD DATA.
+    /// These types include TEXT, BLOB, and their variants.
+    fn is_lob_type(data_type: &str) -> bool {
+        let dt = data_type.to_lowercase();
+        matches!(
+            dt.as_str(),
+            "text"
+                | "tinytext"
+                | "mediumtext"
+                | "longtext"
+                | "blob"
+                | "tinyblob"
+                | "mediumblob"
+                | "longblob"
+                | "ntext"    // MSSQL
+                | "image"    // MSSQL
+                | "nvarchar(max)"
+                | "varchar(max)"
+                | "varbinary(max)"
+        ) || dt.contains("text") || dt.contains("blob")
+    }
+
+    /// Check if a table has any LOB columns.
+    fn table_has_lob_columns(table: &Table) -> bool {
+        table.columns.iter().any(|c| Self::is_lob_type(&c.data_type))
     }
 
     /// Set the type mapper for schema creation.
@@ -405,6 +445,16 @@ impl TargetWriter for MysqlWriter {
         let ddl = self.generate_ddl(table, target_schema);
         conn.query_drop(&ddl).await?;
 
+        // Track tables with LOB columns for write_batch optimization
+        if Self::table_has_lob_columns(table) {
+            let table_key = format!("{}.{}", target_schema, table.name);
+            self.tables_with_lob.write().insert(table_key.clone());
+            debug!(
+                "Table {} has LOB columns, will use INSERT instead of LOAD DATA",
+                table_key
+            );
+        }
+
         debug!("Created table {}.{}", target_schema, table.name);
         Ok(())
     }
@@ -419,6 +469,16 @@ impl TargetWriter for MysqlWriter {
 
         let ddl = self.generate_ddl(table, target_schema);
         conn.query_drop(&ddl).await?;
+
+        // Track tables with LOB columns for write_batch optimization
+        if Self::table_has_lob_columns(table) {
+            let table_key = format!("{}.{}", target_schema, table.name);
+            self.tables_with_lob.write().insert(table_key.clone());
+            debug!(
+                "Table {} has LOB columns, will use INSERT instead of LOAD DATA",
+                table_key
+            );
+        }
 
         debug!(
             "Created table {}.{} (MySQL doesn't support UNLOGGED)",
@@ -753,6 +813,31 @@ impl TargetWriter for MysqlWriter {
             .get_conn()
             .await
             .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
+        // Determine write strategy based on config
+        match self.mysql_load_data {
+            MysqlLoadData::Never => {
+                // Always use INSERT
+                return self
+                    .write_batch_insert(&mut conn, schema, table, cols, batch)
+                    .await;
+            }
+            MysqlLoadData::Always => {
+                // Always try LOAD DATA (with fallback to INSERT if not supported)
+            }
+            MysqlLoadData::Auto => {
+                // Check if table has LOB columns - if so, use INSERT directly
+                // LOAD DATA LOCAL INFILE is slower for TEXT/BLOB columns due to CSV escaping overhead
+                let table_key = format!("{}.{}", schema, table);
+                let has_lob = self.tables_with_lob.read().contains(&table_key);
+
+                if has_lob {
+                    return self
+                        .write_batch_insert(&mut conn, schema, table, cols, batch)
+                        .await;
+                }
+            }
+        }
 
         // Try LOAD DATA LOCAL INFILE first for better performance
         // Clone the batch for potential fallback

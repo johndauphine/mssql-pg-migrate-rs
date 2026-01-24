@@ -17,6 +17,7 @@ target:
   database: stackoverflow_target
   user: root
   password: "rootpassword"
+  ssl_mode: disable
 
 migration:
   target_mode: drop_recreate
