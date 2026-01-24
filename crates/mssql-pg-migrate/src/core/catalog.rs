@@ -66,8 +66,21 @@ impl DriverCatalog {
     /// This is a convenience method that registers MSSQL and PostgreSQL
     /// dialects and their type mappers. When the `mysql` feature is enabled,
     /// MySQL/MariaDB support is also registered.
+    ///
+    /// # Canonical Type System
+    ///
+    /// This method uses the hub-and-spoke canonical type system via
+    /// [`ComposedMapper`](crate::dialect::ComposedMapper). Each source→target
+    /// combination uses:
+    /// - A `ToCanonical` converter for the source dialect
+    /// - A `FromCanonical` converter for the target dialect
+    ///
+    /// This approach requires only 2n implementations instead of n*(n-1).
     pub fn with_builtins() -> Self {
-        use crate::dialect::{IdentityMapper, MssqlToPostgresMapper, PostgresToMssqlMapper};
+        use crate::dialect::{
+            ComposedMapper, IdentityMapper, MssqlFromCanonical, MssqlToCanonical,
+            PostgresFromCanonical, PostgresToCanonical,
+        };
         use crate::drivers::{MssqlDialect, PostgresDialect};
 
         let mut catalog = Self::new();
@@ -76,9 +89,32 @@ impl DriverCatalog {
         catalog.register_dialect("mssql", MssqlDialect::new());
         catalog.register_dialect("postgres", PostgresDialect::new());
 
-        // Register type mappers for all source→target combinations
-        catalog.register_mapper("mssql", "postgres", Arc::new(MssqlToPostgresMapper::new()));
-        catalog.register_mapper("postgres", "mssql", Arc::new(PostgresToMssqlMapper::new()));
+        // Create shared canonical converters
+        let mssql_to_canonical = Arc::new(MssqlToCanonical::new());
+        let mssql_from_canonical = Arc::new(MssqlFromCanonical::new());
+        let postgres_to_canonical = Arc::new(PostgresToCanonical::new());
+        let postgres_from_canonical = Arc::new(PostgresFromCanonical::new());
+
+        // Register type mappers using ComposedMapper (hub-and-spoke architecture)
+        // MSSQL → PostgreSQL
+        catalog.register_mapper(
+            "mssql",
+            "postgres",
+            Arc::new(ComposedMapper::new(
+                mssql_to_canonical.clone(),
+                postgres_from_canonical.clone(),
+            )),
+        );
+
+        // PostgreSQL → MSSQL
+        catalog.register_mapper(
+            "postgres",
+            "mssql",
+            Arc::new(ComposedMapper::new(
+                postgres_to_canonical.clone(),
+                mssql_from_canonical.clone(),
+            )),
+        );
 
         // Identity mappers for same-dialect transfers
         catalog.register_mapper("mssql", "mssql", Arc::new(IdentityMapper::new("mssql")));
@@ -91,21 +127,53 @@ impl DriverCatalog {
         // Register MySQL support if the feature is enabled
         #[cfg(feature = "mysql")]
         {
-            use crate::dialect::{
-                MssqlToMysqlMapper, MysqlToMssqlMapper, MysqlToPostgresMapper,
-                PostgresToMysqlMapper,
-            };
+            use crate::dialect::{MysqlFromCanonical, MysqlToCanonical};
             use crate::drivers::MysqlDialect;
 
             catalog.register_dialect("mysql", MysqlDialect::new());
 
-            // MySQL ↔ PostgreSQL
-            catalog.register_mapper("mysql", "postgres", Arc::new(MysqlToPostgresMapper::new()));
-            catalog.register_mapper("postgres", "mysql", Arc::new(PostgresToMysqlMapper::new()));
+            let mysql_to_canonical = Arc::new(MysqlToCanonical::new());
+            let mysql_from_canonical = Arc::new(MysqlFromCanonical::new());
 
-            // MySQL ↔ MSSQL
-            catalog.register_mapper("mysql", "mssql", Arc::new(MysqlToMssqlMapper::new()));
-            catalog.register_mapper("mssql", "mysql", Arc::new(MssqlToMysqlMapper::new()));
+            // MySQL → PostgreSQL
+            catalog.register_mapper(
+                "mysql",
+                "postgres",
+                Arc::new(ComposedMapper::new(
+                    mysql_to_canonical.clone(),
+                    postgres_from_canonical.clone(),
+                )),
+            );
+
+            // PostgreSQL → MySQL
+            catalog.register_mapper(
+                "postgres",
+                "mysql",
+                Arc::new(ComposedMapper::new(
+                    postgres_to_canonical.clone(),
+                    mysql_from_canonical.clone(),
+                )),
+            );
+
+            // MySQL → MSSQL
+            catalog.register_mapper(
+                "mysql",
+                "mssql",
+                Arc::new(ComposedMapper::new(
+                    mysql_to_canonical.clone(),
+                    mssql_from_canonical.clone(),
+                )),
+            );
+
+            // MSSQL → MySQL
+            catalog.register_mapper(
+                "mssql",
+                "mysql",
+                Arc::new(ComposedMapper::new(
+                    mssql_to_canonical.clone(),
+                    mysql_from_canonical.clone(),
+                )),
+            );
 
             // MySQL identity mapper
             catalog.register_mapper("mysql", "mysql", Arc::new(IdentityMapper::new("mysql")));
