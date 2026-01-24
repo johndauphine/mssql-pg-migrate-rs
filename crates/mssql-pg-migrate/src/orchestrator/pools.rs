@@ -491,8 +491,24 @@ impl TargetPoolImpl {
             // MySQL/MariaDB target - uses SQLx
             #[cfg(feature = "mysql")]
             {
+                use crate::dialect::{MssqlToMysqlMapper, PostgresToMysqlMapper};
                 mysql_info!("Creating MySQL target connection pool");
                 let writer = MysqlWriter::new(&config.target, max_conns).await?;
+                // Add type mapper based on source database type
+                let source_type = config.source.r#type.to_lowercase();
+                let writer = if source_type == "postgres"
+                    || source_type == "postgresql"
+                    || source_type == "pg"
+                {
+                    // PostgreSQL → MySQL
+                    writer.with_type_mapper(Arc::new(PostgresToMysqlMapper::new()))
+                } else if source_type == "mysql" || source_type == "mariadb" {
+                    // MySQL/MariaDB → MySQL: no type mapper needed (identity mapping)
+                    writer
+                } else {
+                    // Default: MSSQL/SQL Server → MySQL
+                    writer.with_type_mapper(Arc::new(MssqlToMysqlMapper::new()))
+                };
                 Ok(Self::Mysql(Arc::new(writer)))
             }
             #[cfg(not(feature = "mysql"))]
