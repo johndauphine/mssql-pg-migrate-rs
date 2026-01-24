@@ -343,7 +343,7 @@ fn mssql_to_postgres(mssql_type: &str, max_length: i32, precision: i32, scale: i
         // Integer types
         "tinyint" => "smallint".to_string(),
         "smallint" => "smallint".to_string(),
-        "int" => "integer".to_string(),
+        "int" | "integer" => "integer".to_string(),
         "bigint" => "bigint".to_string(),
 
         // Decimal/numeric
@@ -825,18 +825,6 @@ fn postgres_to_mysql(pg_type: &str, max_length: i32, precision: i32, scale: i32)
     }
 }
 
-/// Map PostgreSQL type to MySQL type (returns just the target type string).
-///
-/// Convenience function that returns just the target type without the full TypeMapping.
-pub fn postgres_to_mysql_basic(
-    pg_type: &str,
-    max_length: i32,
-    precision: i32,
-    scale: i32,
-) -> String {
-    postgres_to_mysql(pg_type, max_length, precision, scale).target_type
-}
-
 /// Map a MySQL data type to MSSQL.
 fn mysql_to_mssql(mysql_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
     let mysql_lower = mysql_type.to_lowercase();
@@ -971,7 +959,7 @@ pub fn mssql_to_mysql(
         // Integer types
         "tinyint" => TypeMapping::lossless("TINYINT UNSIGNED"),
         "smallint" => TypeMapping::lossless("SMALLINT"),
-        "int" => TypeMapping::lossless("INT"),
+        "int" | "integer" => TypeMapping::lossless("INT"),
         "bigint" => TypeMapping::lossless("BIGINT"),
 
         // Decimal/numeric
@@ -1110,7 +1098,7 @@ impl ToCanonical for MssqlToCanonical {
             // Integer types
             "tinyint" => CanonicalTypeInfo::lossless(CanonicalType::UInt8),
             "smallint" => CanonicalTypeInfo::lossless(CanonicalType::Int16),
-            "int" => CanonicalTypeInfo::lossless(CanonicalType::Int32),
+            "int" | "integer" => CanonicalTypeInfo::lossless(CanonicalType::Int32),
             "bigint" => CanonicalTypeInfo::lossless(CanonicalType::Int64),
 
             // Decimal/numeric

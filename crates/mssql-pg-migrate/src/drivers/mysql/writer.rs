@@ -163,28 +163,13 @@ impl MysqlWriter {
             }
             mapping.target_type
         } else {
-            // No mapper provided - try to detect source type and use appropriate mapping
-            use crate::dialect::{mssql_to_mysql_basic, postgres_to_mysql_basic};
-            let dt_lower = col.data_type.to_lowercase();
-
-            // Detect if this looks like a PostgreSQL type (udt_name format)
-            let is_postgres_type = matches!(
-                dt_lower.as_str(),
-                "int2" | "int4" | "int8" | "float4" | "float8" | "bool"
-                    | "bpchar" | "timestamptz" | "timetz" | "jsonb"
-                    | "bytea" | "uuid" | "serial" | "bigserial" | "smallserial"
-            ) || dt_lower.ends_with("[]")
-                || dt_lower.starts_with('_');
-
-            let target_type = if is_postgres_type {
-                postgres_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale)
-            } else {
-                mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale)
-            };
-
+            // No mapper provided - use default MSSQL to MySQL mapping
+            use crate::dialect::mssql_to_mysql_basic;
+            let target_type =
+                mssql_to_mysql_basic(&col.data_type, col.max_length, col.precision, col.scale);
             if target_type.is_empty() {
                 warn!(
-                    "Unknown type '{}' for column '{}', passing through",
+                    "Unknown MSSQL type '{}' for column '{}', passing through",
                     col.data_type, col.name
                 );
                 col.data_type.to_uppercase()

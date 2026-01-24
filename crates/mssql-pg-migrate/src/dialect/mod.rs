@@ -69,7 +69,6 @@ pub use typemap::{
 
 // Legacy direct mappers (for backwards compatibility)
 pub use typemap::{
-    mssql_to_mysql_basic, postgres_to_mysql_basic, IdentityMapper, MssqlToMysqlMapper,
-    MssqlToPostgresMapper, MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMssqlMapper,
-    PostgresToMysqlMapper,
+    mssql_to_mysql_basic, IdentityMapper, MssqlToMysqlMapper, MssqlToPostgresMapper,
+    MysqlToMssqlMapper, MysqlToPostgresMapper, PostgresToMssqlMapper, PostgresToMysqlMapper,
 };
