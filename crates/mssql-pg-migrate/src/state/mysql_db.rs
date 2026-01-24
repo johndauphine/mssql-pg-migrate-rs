@@ -180,22 +180,35 @@ impl MysqlStateBackend {
 
         // Extract run-level fields from first row (all rows have same values)
         let first_row = &rows[0];
-        let run_id: String = first_row.get("run_id").unwrap_or_default();
-        let config_hash: String = first_row.get("config_hash").unwrap_or_default();
+
+        // Critical fields - if NULL, indicates database corruption
+        let run_id: String = first_row.get("run_id").ok_or_else(|| {
+            MigrateError::State("run_id is NULL in MySQL migration state".to_string())
+        })?;
+        let config_hash: String = first_row.get("config_hash").ok_or_else(|| {
+            MigrateError::State("config_hash is NULL in MySQL migration state".to_string())
+        })?;
         let started_at: DateTime<Utc> = first_row
             .get::<chrono::NaiveDateTime, _>("run_started_at")
-            .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
-            .unwrap_or_else(Utc::now);
+            .map(|dt| dt.and_utc())
+            .ok_or_else(|| {
+                MigrateError::State("run_started_at is NULL in MySQL migration state".to_string())
+            })?;
         let completed_at: Option<DateTime<Utc>> = first_row
             .get::<Option<chrono::NaiveDateTime>, _>("run_completed_at")
             .flatten()
-            .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
-        let status_str: String = first_row.get("run_status").unwrap_or_default();
+            .map(|dt| dt.and_utc());
+        let status_str: String = first_row.get("run_status").ok_or_else(|| {
+            MigrateError::State("run_status is NULL in MySQL migration state".to_string())
+        })?;
 
         // Extract table states
         let mut tables = HashMap::new();
         for row in rows {
-            let table_name: String = row.get("table_name").unwrap_or_default();
+            // table_name is required - if NULL, indicates data corruption
+            let table_name: String = row.get("table_name").ok_or_else(|| {
+                MigrateError::State("table_name is NULL in MySQL table_state".to_string())
+            })?;
             let table_status_str: String = row.get("table_status").unwrap_or_default();
             let rows_total: i64 = row.get::<Option<i64>, _>("rows_total").flatten().unwrap_or(0);
             let rows_transferred: i64 = row.get::<Option<i64>, _>("rows_transferred").flatten().unwrap_or(0);
@@ -204,11 +217,11 @@ impl MysqlStateBackend {
             let last_sync_timestamp: Option<DateTime<Utc>> = row
                 .get::<Option<chrono::NaiveDateTime>, _>("last_sync_timestamp")
                 .flatten()
-                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
+                .map(|dt| dt.and_utc());
             let table_completed_at: Option<DateTime<Utc>> = row
                 .get::<Option<chrono::NaiveDateTime>, _>("table_completed_at")
                 .flatten()
-                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
+                .map(|dt| dt.and_utc());
             let error: Option<String> = row.get::<Option<String>, _>("error").flatten();
 
             tables.insert(
@@ -266,7 +279,7 @@ impl MysqlStateBackend {
         Ok(row.and_then(|r| {
             r.get::<Option<chrono::NaiveDateTime>, _>("last_sync_timestamp")
                 .flatten()
-                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+                .map(|dt| dt.and_utc())
         }))
     }
 

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use mysql_async::prelude::*;
 use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Row as MySqlRow, SslOpts};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::SourceConfig;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition, Table};
@@ -30,8 +30,19 @@ pub struct MysqlReader {
 impl MysqlReader {
     /// Create a new MySQL reader from configuration.
     pub async fn new(config: &SourceConfig, max_conns: usize) -> Result<Self> {
-        // Default to Preferred SSL mode for source connections
-        let ssl_opts = Some(SslOpts::default().with_danger_accept_invalid_certs(true));
+        // Determine SSL options based on encrypt and trust_server_cert fields
+        let ssl_opts = if config.encrypt {
+            if config.trust_server_cert {
+                // Encrypt but don't validate certificate
+                Some(SslOpts::default().with_danger_accept_invalid_certs(true))
+            } else {
+                // Encrypt with certificate validation
+                Some(SslOpts::default())
+            }
+        } else {
+            warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
+            None
+        };
 
         let mut builder = OptsBuilder::default()
             .ip_or_hostname(&config.host)
@@ -45,8 +56,15 @@ impl MysqlReader {
             builder = builder.ssl_opts(ssl);
         }
 
-        let pool_opts =
-            PoolOpts::new().with_constraints(PoolConstraints::new(1, max_conns).unwrap());
+        // Ensure at least one connection to avoid PoolConstraints failure
+        let max_conns = max_conns.max(1);
+        let constraints = PoolConstraints::new(1, max_conns).ok_or_else(|| {
+            MigrateError::Config(format!(
+                "Invalid MySQL pool constraints: min=1, max={}",
+                max_conns
+            ))
+        })?;
+        let pool_opts = PoolOpts::new().with_constraints(constraints);
 
         let opts: Opts = builder.pool_opts(pool_opts).into();
         let pool = Pool::new(opts);
@@ -105,9 +123,24 @@ impl MysqlReader {
         let rows: Vec<MySqlRow> = conn.exec(query, (&table.schema, &table.name)).await?;
 
         for row in rows {
+            // COLUMN_NAME and DATA_TYPE are required - if NULL, indicates DB corruption
+            let name: String = row.get("COLUMN_NAME").ok_or_else(|| {
+                MigrateError::transfer(
+                    &format!("{}.{}", table.schema, table.name),
+                    "COLUMN_NAME is NULL in INFORMATION_SCHEMA.COLUMNS",
+                )
+            })?;
+            let data_type: String = row.get("DATA_TYPE").ok_or_else(|| {
+                MigrateError::transfer(
+                    &format!("{}.{}", table.schema, table.name),
+                    format!("DATA_TYPE is NULL for column '{}'", name),
+                )
+            })?;
+
             let col = Column {
-                name: row.get::<String, _>("COLUMN_NAME").unwrap_or_default(),
-                data_type: row.get::<String, _>("DATA_TYPE").unwrap_or_default(),
+                name,
+                data_type,
+                // Numeric fields can safely default to 0
                 max_length: row.get::<i32, _>("max_length").unwrap_or(0),
                 precision: row.get::<i32, _>("num_precision").unwrap_or(0),
                 scale: row.get::<i32, _>("num_scale").unwrap_or(0),

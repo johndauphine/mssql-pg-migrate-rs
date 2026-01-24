@@ -41,13 +41,25 @@ impl MysqlWriter {
                 warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
                 None
             }
-            "prefer" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
-            "require" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
-            "verify-ca" | "verify_ca" => Some(SslOpts::default()),
-            "verify-full" | "verify_identity" => Some(SslOpts::default()),
+            "prefer" => {
+                // Prefer TLS but don't require certificate validation
+                Some(SslOpts::default().with_danger_accept_invalid_certs(true))
+            }
+            "require" => {
+                // Require TLS with certificate validation
+                Some(SslOpts::default())
+            }
+            "verify-ca" | "verify_ca" => {
+                // Verify server certificate against CA
+                Some(SslOpts::default())
+            }
+            "verify-full" | "verify_identity" => {
+                // Verify server certificate and hostname
+                Some(SslOpts::default())
+            }
             _ => {
                 warn!(
-                    "Unknown ssl_mode '{}', defaulting to Preferred",
+                    "Unknown ssl_mode '{}', defaulting to prefer (TLS without cert validation)",
                     config.ssl_mode
                 );
                 Some(SslOpts::default().with_danger_accept_invalid_certs(true))
@@ -67,8 +79,15 @@ impl MysqlWriter {
             builder = builder.ssl_opts(ssl);
         }
 
-        let pool_opts =
-            PoolOpts::new().with_constraints(PoolConstraints::new(1, max_conns).unwrap());
+        // Ensure at least one connection to avoid PoolConstraints failure
+        let max_conns = max_conns.max(1);
+        let constraints = PoolConstraints::new(1, max_conns).ok_or_else(|| {
+            MigrateError::Config(format!(
+                "Invalid MySQL pool constraints: min=1, max={}",
+                max_conns
+            ))
+        })?;
+        let pool_opts = PoolOpts::new().with_constraints(constraints);
 
         let opts: Opts = builder.pool_opts(pool_opts).into();
         let pool = Pool::new(opts);
@@ -354,8 +373,10 @@ impl MysqlWriter {
                 }
             }
             SqlValue::Bytes(b) => {
-                // Encode binary data as hex for MySQL
-                format!("0x{}", hex::encode(b.as_ref()))
+                // Encode binary data with backslash escaping for LOAD DATA.
+                // MySQL LOAD DATA interprets \xNN as hex bytes, but we use
+                // backslash escaping for special chars and pass others as-is.
+                Self::escape_tsv_bytes(b.as_ref())
             }
             SqlValue::Uuid(u) => u.to_string(),
             SqlValue::Decimal(d) => d.to_string(),
@@ -380,6 +401,28 @@ impl MysqlWriter {
                 '\\' => result.push_str("\\\\"),
                 '\0' => result.push_str("\\0"),
                 _ => result.push(c),
+            }
+        }
+        result
+    }
+
+    /// Escape binary data for TSV format used by LOAD DATA.
+    /// Special characters are backslash-escaped, other bytes pass through.
+    fn escape_tsv_bytes(bytes: &[u8]) -> String {
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            match byte {
+                b'\t' => result.push_str("\\t"),
+                b'\n' => result.push_str("\\n"),
+                b'\r' => result.push_str("\\r"),
+                b'\\' => result.push_str("\\\\"),
+                b'\0' => result.push_str("\\0"),
+                // Printable ASCII and valid UTF-8 continuation bytes pass through
+                0x20..=0x7E => result.push(byte as char),
+                // Non-printable bytes use hex escape
+                _ => {
+                    result.push_str(&format!("\\x{:02X}", byte));
+                }
             }
         }
         result
