@@ -433,12 +433,7 @@ impl Orchestrator {
     pub async fn create_target_writer(&self, max_conns: usize) -> Result<TargetWriterImpl> {
         let source_db_type = DriverCatalog::normalize_db_type(&self.config.source.r#type)?;
         self.catalog
-            .create_writer(
-                &self.config.target,
-                max_conns,
-                source_db_type,
-                self.config.migration.mysql_load_data,
-            )
+            .create_writer(&self.config.target, max_conns, source_db_type)
             .await
     }
 

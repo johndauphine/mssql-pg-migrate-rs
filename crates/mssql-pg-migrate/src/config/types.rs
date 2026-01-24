@@ -430,13 +430,6 @@ pub struct MigrationConfig {
     #[serde(default = "default_true")]
     pub use_binary_copy: bool,
 
-    /// MySQL bulk load strategy (default: auto).
-    /// - `auto`: Use LOAD DATA for tables without LOB columns, INSERT for LOB tables
-    /// - `always`: Always use LOAD DATA LOCAL INFILE
-    /// - `never`: Always use INSERT statements
-    #[serde(default)]
-    pub mysql_load_data: MysqlLoadData,
-
     /// Use UNLOGGED tables during transfer (default: false).
     /// UNLOGGED tables are faster for writes but not crash-safe.
     /// If true, tables are created as UNLOGGED and remain UNLOGGED.
@@ -488,7 +481,6 @@ impl Default for MigrationConfig {
             finalizer_concurrency: None,
             copy_buffer_rows: None,
             use_binary_copy: default_true(),
-            mysql_load_data: MysqlLoadData::default(),
             use_unlogged_tables: false,
             upsert_batch_size: None,
             upsert_parallel_tasks: None,
@@ -880,23 +872,6 @@ pub enum TargetMode {
 
     /// Upsert: INSERT new rows, UPDATE changed rows.
     Upsert,
-}
-
-/// MySQL bulk load strategy using LOAD DATA LOCAL INFILE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MysqlLoadData {
-    /// Auto-detect: use LOAD DATA for tables without LOB columns (TEXT, BLOB),
-    /// fall back to INSERT for tables with LOB columns.
-    Auto,
-
-    /// Always use LOAD DATA LOCAL INFILE for all tables.
-    Always,
-
-    /// Never use LOAD DATA, always use INSERT statements.
-    /// This is the default as INSERT often outperforms LOAD DATA in many environments.
-    #[default]
-    Never,
 }
 
 // Default value functions for serde

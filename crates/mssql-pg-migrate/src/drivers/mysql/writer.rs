@@ -1,28 +1,16 @@
 //! MySQL/MariaDB target writer implementation.
 //!
 //! Implements the `TargetWriter` trait for writing data to MySQL/MariaDB databases.
-//! Uses mysql_async for connection pooling and LOAD DATA LOCAL INFILE for bulk loading.
-//!
-//! # Performance
-//!
-//! mysql_async provides significantly better performance through:
-//! - LOAD DATA LOCAL INFILE for bulk data loading (5-10x faster than INSERT)
-//! - Native MySQL protocol implementation
-//! - Efficient connection pooling
-//! - Falls back to batched INSERT when LOAD DATA is not supported
+//! Uses mysql_async for connection pooling and batched INSERT for optimal performance.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
-use bytes::Bytes;
-use futures::stream::{self, BoxStream, StreamExt};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, TxOpts};
 use tracing::{debug, info, warn};
 
-use crate::config::{MysqlLoadData, TargetConfig};
+use crate::config::TargetConfig;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlValue};
@@ -34,20 +22,11 @@ use crate::error::{MigrateError, Result};
 pub struct MysqlWriter {
     pool: Pool,
     type_mapper: Option<Arc<dyn TypeMapper>>,
-    /// Tables that have LOB columns (TEXT, BLOB, etc.) and should use INSERT instead of LOAD DATA.
-    /// LOAD DATA LOCAL INFILE is slower for LOB columns due to CSV escaping overhead.
-    tables_with_lob: Arc<RwLock<HashSet<String>>>,
-    /// MySQL bulk load strategy configuration.
-    mysql_load_data: MysqlLoadData,
 }
 
 impl MysqlWriter {
     /// Create a new MySQL writer from configuration.
-    pub async fn new(
-        config: &TargetConfig,
-        max_conns: usize,
-        mysql_load_data: MysqlLoadData,
-    ) -> Result<Self> {
+    pub async fn new(config: &TargetConfig, max_conns: usize) -> Result<Self> {
         let ssl_opts = match config.ssl_mode.to_lowercase().as_str() {
             "disable" => {
                 warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
@@ -105,36 +84,7 @@ impl MysqlWriter {
         Ok(Self {
             pool,
             type_mapper: None,
-            tables_with_lob: Arc::new(RwLock::new(HashSet::new())),
-            mysql_load_data,
         })
-    }
-
-    /// Check if a data type is a LOB (Large Object) type that performs poorly with LOAD DATA.
-    /// These types include TEXT, BLOB, and their variants.
-    fn is_lob_type(data_type: &str) -> bool {
-        let dt = data_type.to_lowercase();
-        matches!(
-            dt.as_str(),
-            "text"
-                | "tinytext"
-                | "mediumtext"
-                | "longtext"
-                | "blob"
-                | "tinyblob"
-                | "mediumblob"
-                | "longblob"
-                | "ntext"    // MSSQL
-                | "image"    // MSSQL
-                | "nvarchar(max)"
-                | "varchar(max)"
-                | "varbinary(max)"
-        ) || dt.contains("text") || dt.contains("blob")
-    }
-
-    /// Check if a table has any LOB columns.
-    fn table_has_lob_columns(table: &Table) -> bool {
-        table.columns.iter().any(|c| Self::is_lob_type(&c.data_type))
     }
 
     /// Set the type mapper for schema creation.
@@ -278,142 +228,6 @@ impl MysqlWriter {
         );
         Ok(row_count)
     }
-
-    /// Write batch using LOAD DATA LOCAL INFILE for maximum performance.
-    /// Returns Ok(Some(count)) on success, Ok(None) if LOAD DATA is not supported.
-    async fn write_batch_load_data(
-        &self,
-        conn: &mut Conn,
-        schema: &str,
-        table: &str,
-        cols: &[String],
-        batch: Batch,
-    ) -> Result<Option<u64>> {
-        let rows = batch.rows;
-        if rows.is_empty() {
-            return Ok(Some(0));
-        }
-
-        let row_count = rows.len() as u64;
-        let qualified_table = Self::qualify_table(schema, table);
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
-        let col_list_str = col_list.join(", ");
-
-        // Build CSV data for streaming to MySQL
-        // Use tab-separated format with NULL represented as \N
-        let csv_data: Vec<Bytes> = rows
-            .iter()
-            .map(|row| {
-                let line = row
-                    .iter()
-                    .map(|v| Self::escape_csv_value(v))
-                    .collect::<Vec<_>>()
-                    .join("\t")
-                    + "\n";
-                Bytes::from(line)
-            })
-            .collect();
-
-        // Set up one-time infile handler that streams our batch data
-        // The handler must be Sync, so capture the Vec<Bytes> (which is Sync) and create the stream inside
-        conn.set_infile_handler(async move {
-            let stream: BoxStream<'static, std::io::Result<Bytes>> =
-                stream::iter(csv_data.into_iter().map(Ok)).boxed();
-            Ok(stream)
-        });
-
-        // Execute LOAD DATA LOCAL INFILE
-        // The filename is arbitrary since our handler ignores it
-        let sql = format!(
-            r#"LOAD DATA LOCAL INFILE 'batch'
-               INTO TABLE {}
-               CHARACTER SET utf8mb4
-               FIELDS TERMINATED BY '\t'
-               LINES TERMINATED BY '\n'
-               ({})"#,
-            qualified_table, col_list_str
-        );
-
-        match conn.query_drop(&sql).await {
-            Ok(_) => {
-                debug!(
-                    "MySQL: wrote {} rows to {} using LOAD DATA LOCAL INFILE",
-                    row_count, qualified_table
-                );
-                Ok(Some(row_count))
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                // Check for common LOAD DATA errors:
-                // - Error 1148: LOAD DATA LOCAL INFILE command is disabled
-                // - Error 3948: Loading local data is disabled
-                // - Error 2068: Local infile request rejected
-                if err_str.contains("1148")
-                    || err_str.contains("3948")
-                    || err_str.contains("2068")
-                    || err_str.contains("LOCAL INFILE")
-                    || err_str.contains("local data")
-                {
-                    debug!("MySQL: LOAD DATA LOCAL INFILE not supported, will fall back to INSERT");
-                    Ok(None) // Indicate fallback needed
-                } else {
-                    Err(MigrateError::transfer(
-                        &qualified_table,
-                        format!("LOAD DATA: {}", e),
-                    ))
-                }
-            }
-        }
-    }
-
-    /// Escape a value for tab-separated CSV format used by LOAD DATA.
-    fn escape_csv_value(value: &SqlValue<'_>) -> String {
-        match value {
-            SqlValue::Null(_) => "\\N".to_string(),
-            SqlValue::Bool(b) => {
-                if *b {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            SqlValue::I16(i) => i.to_string(),
-            SqlValue::I32(i) => i.to_string(),
-            SqlValue::I64(i) => i.to_string(),
-            SqlValue::F32(f) => f.to_string(),
-            SqlValue::F64(f) => f.to_string(),
-            SqlValue::Text(s) => Self::escape_csv_string(s),
-            SqlValue::Bytes(b) => {
-                // Encode binary data as hex for MySQL
-                format!("0x{}", hex::encode(b.as_ref()))
-            }
-            SqlValue::Uuid(u) => u.to_string(),
-            SqlValue::Decimal(d) => d.to_string(),
-            SqlValue::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-            SqlValue::DateTimeOffset(dto) => {
-                dto.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-            }
-            SqlValue::Date(d) => d.format("%Y-%m-%d").to_string(),
-            SqlValue::Time(t) => t.format("%H:%M:%S%.6f").to_string(),
-        }
-    }
-
-    /// Escape a string for tab-separated CSV format.
-    /// MySQL LOAD DATA expects: \t for tab, \n for newline, \\ for backslash, \N for NULL
-    fn escape_csv_string(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '\t' => result.push_str("\\t"),
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\\' => result.push_str("\\\\"),
-                '\0' => result.push_str("\\0"),
-                _ => result.push(c),
-            }
-        }
-        result
-    }
 }
 
 #[async_trait]
@@ -445,16 +259,6 @@ impl TargetWriter for MysqlWriter {
         let ddl = self.generate_ddl(table, target_schema);
         conn.query_drop(&ddl).await?;
 
-        // Track tables with LOB columns for write_batch optimization
-        if Self::table_has_lob_columns(table) {
-            let table_key = format!("{}.{}", target_schema, table.name);
-            self.tables_with_lob.write().insert(table_key.clone());
-            debug!(
-                "Table {} has LOB columns, will use INSERT instead of LOAD DATA",
-                table_key
-            );
-        }
-
         debug!("Created table {}.{}", target_schema, table.name);
         Ok(())
     }
@@ -469,16 +273,6 @@ impl TargetWriter for MysqlWriter {
 
         let ddl = self.generate_ddl(table, target_schema);
         conn.query_drop(&ddl).await?;
-
-        // Track tables with LOB columns for write_batch optimization
-        if Self::table_has_lob_columns(table) {
-            let table_key = format!("{}.{}", target_schema, table.name);
-            self.tables_with_lob.write().insert(table_key.clone());
-            debug!(
-                "Table {} has LOB columns, will use INSERT instead of LOAD DATA",
-                table_key
-            );
-        }
 
         debug!(
             "Created table {}.{} (MySQL doesn't support UNLOGGED)",
@@ -814,56 +608,8 @@ impl TargetWriter for MysqlWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
 
-        // Determine write strategy based on config
-        match self.mysql_load_data {
-            MysqlLoadData::Never => {
-                // Always use INSERT
-                return self
-                    .write_batch_insert(&mut conn, schema, table, cols, batch)
-                    .await;
-            }
-            MysqlLoadData::Always => {
-                // Always try LOAD DATA (with fallback to INSERT if not supported)
-            }
-            MysqlLoadData::Auto => {
-                // Check if table has LOB columns - if so, use INSERT directly
-                // LOAD DATA LOCAL INFILE is slower for TEXT/BLOB columns due to CSV escaping overhead
-                let table_key = format!("{}.{}", schema, table);
-                let has_lob = self.tables_with_lob.read().contains(&table_key);
-
-                if has_lob {
-                    return self
-                        .write_batch_insert(&mut conn, schema, table, cols, batch)
-                        .await;
-                }
-            }
-        }
-
-        // Try LOAD DATA LOCAL INFILE first for better performance
-        // Clone the batch for potential fallback
-        let batch_clone = Batch {
-            rows: batch.rows.clone(),
-            last_key: batch.last_key.clone(),
-            is_last: batch.is_last,
-        };
-
-        match self
-            .write_batch_load_data(&mut conn, schema, table, cols, batch)
-            .await?
-        {
-            Some(count) => Ok(count),
-            None => {
-                // LOAD DATA not supported, fall back to INSERT
-                // Need to get a fresh connection since the previous one might be in a bad state
-                drop(conn);
-                let mut conn =
-                    self.pool.get_conn().await.map_err(|e| {
-                        MigrateError::pool(e, "getting MySQL connection for fallback")
-                    })?;
-                self.write_batch_insert(&mut conn, schema, table, cols, batch_clone)
-                    .await
-            }
-        }
+        self.write_batch_insert(&mut conn, schema, table, cols, batch)
+            .await
     }
 
     async fn upsert_batch(
