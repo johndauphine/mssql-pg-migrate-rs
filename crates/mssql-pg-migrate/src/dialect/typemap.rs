@@ -825,6 +825,18 @@ fn postgres_to_mysql(pg_type: &str, max_length: i32, precision: i32, scale: i32)
     }
 }
 
+/// Map PostgreSQL type to MySQL type (returns just the target type string).
+///
+/// Convenience function that returns just the target type without the full TypeMapping.
+pub fn postgres_to_mysql_basic(
+    pg_type: &str,
+    max_length: i32,
+    precision: i32,
+    scale: i32,
+) -> String {
+    postgres_to_mysql(pg_type, max_length, precision, scale).target_type
+}
+
 /// Map a MySQL data type to MSSQL.
 fn mysql_to_mssql(mysql_type: &str, max_length: i32, precision: i32, scale: i32) -> TypeMapping {
     let mysql_lower = mysql_type.to_lowercase();
