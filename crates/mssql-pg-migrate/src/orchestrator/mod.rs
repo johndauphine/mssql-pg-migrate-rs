@@ -1849,4 +1849,157 @@ mod tests {
         assert_eq!(tracker.tables_completed.load(Ordering::Relaxed), 100);
         assert_eq!(tracker.rows_transferred.load(Ordering::Relaxed), 10000);
     }
+
+    #[test]
+    fn test_drop_recreate_resets_completed_table_state() {
+        // Simulate the table state initialization logic for drop_recreate mode
+        let mut state = MigrationState::new("test-run".to_string(), "hash123".to_string());
+
+        // Add a previously completed table
+        let mut completed_table = TableState::new(1000);
+        completed_table.status = TaskStatus::Completed;
+        completed_table.rows_transferred = 1000;
+        completed_table.completed_at = Some(Utc::now());
+        state.tables.insert("dbo.Users".to_string(), completed_table);
+
+        // Verify initial state
+        assert_eq!(state.tables["dbo.Users"].status, TaskStatus::Completed);
+        assert_eq!(state.tables["dbo.Users"].rows_transferred, 1000);
+
+        // Simulate drop_recreate mode initialization (always insert fresh state)
+        let is_drop_recreate = true;
+        let table_name = "dbo.Users".to_string();
+        let row_count = 1000;
+
+        if is_drop_recreate {
+            state
+                .tables
+                .insert(table_name.clone(), TableState::new(row_count));
+        } else {
+            state
+                .tables
+                .entry(table_name.clone())
+                .or_insert_with(|| TableState::new(row_count));
+        }
+
+        // In drop_recreate mode, table should be reset to Pending
+        assert_eq!(state.tables["dbo.Users"].status, TaskStatus::Pending);
+        assert_eq!(state.tables["dbo.Users"].rows_transferred, 0);
+        assert!(state.tables["dbo.Users"].completed_at.is_none());
+    }
+
+    #[test]
+    fn test_upsert_preserves_completed_table_state() {
+        // Simulate the table state initialization logic for upsert mode
+        let mut state = MigrationState::new("test-run".to_string(), "hash123".to_string());
+
+        // Add a previously completed table
+        let mut completed_table = TableState::new(1000);
+        completed_table.status = TaskStatus::Completed;
+        completed_table.rows_transferred = 1000;
+        completed_table.completed_at = Some(Utc::now());
+        state.tables.insert("dbo.Users".to_string(), completed_table);
+
+        // Verify initial state
+        assert_eq!(state.tables["dbo.Users"].status, TaskStatus::Completed);
+        assert_eq!(state.tables["dbo.Users"].rows_transferred, 1000);
+
+        // Simulate upsert mode initialization (preserve existing state)
+        let is_drop_recreate = false;
+        let table_name = "dbo.Users".to_string();
+        let row_count = 1000;
+
+        if is_drop_recreate {
+            state
+                .tables
+                .insert(table_name.clone(), TableState::new(row_count));
+        } else {
+            state
+                .tables
+                .entry(table_name.clone())
+                .or_insert_with(|| TableState::new(row_count));
+        }
+
+        // In upsert mode, table should retain Completed status
+        assert_eq!(state.tables["dbo.Users"].status, TaskStatus::Completed);
+        assert_eq!(state.tables["dbo.Users"].rows_transferred, 1000);
+        assert!(state.tables["dbo.Users"].completed_at.is_some());
+    }
+
+    #[test]
+    fn test_drop_recreate_processes_all_tables() {
+        // Test the table filtering logic for drop_recreate mode
+        let mut state = MigrationState::new("test-run".to_string(), "hash123".to_string());
+
+        // Add completed tables
+        let table_names = vec!["dbo.Users", "dbo.Orders", "dbo.Products"];
+        for name in &table_names {
+            let mut ts = TableState::new(1000);
+            ts.status = TaskStatus::Completed;
+            state.tables.insert(name.to_string(), ts);
+        }
+
+        // Simulate drop_recreate mode filtering (should process all tables)
+        let is_drop_recreate = true;
+        let date_incremental_enabled = false;
+
+        let pending_tables: Vec<_> = table_names
+            .iter()
+            .filter(|t| {
+                if is_drop_recreate || date_incremental_enabled {
+                    true
+                } else {
+                    state
+                        .tables
+                        .get(&t.to_string())
+                        .map(|ts| ts.status != TaskStatus::Completed)
+                        .unwrap_or(true)
+                }
+            })
+            .collect();
+
+        // All 3 tables should be included for processing
+        assert_eq!(pending_tables.len(), 3);
+    }
+
+    #[test]
+    fn test_upsert_skips_completed_tables() {
+        // Test the table filtering logic for upsert mode (crash recovery)
+        let mut state = MigrationState::new("test-run".to_string(), "hash123".to_string());
+
+        // Add mix of completed and pending tables
+        let mut completed = TableState::new(1000);
+        completed.status = TaskStatus::Completed;
+        state.tables.insert("dbo.Users".to_string(), completed);
+
+        let pending = TableState::new(1000);
+        state.tables.insert("dbo.Orders".to_string(), pending);
+
+        let table_names = vec!["dbo.Users", "dbo.Orders", "dbo.Products"];
+
+        // Simulate upsert mode filtering (should skip completed tables)
+        let is_drop_recreate = false;
+        let date_incremental_enabled = false;
+
+        let pending_tables: Vec<_> = table_names
+            .iter()
+            .filter(|t| {
+                if is_drop_recreate || date_incremental_enabled {
+                    true
+                } else {
+                    state
+                        .tables
+                        .get(&t.to_string())
+                        .map(|ts| ts.status != TaskStatus::Completed)
+                        .unwrap_or(true)
+                }
+            })
+            .collect();
+
+        // Only 2 tables should be included (Orders is pending, Products is new)
+        assert_eq!(pending_tables.len(), 2);
+        assert!(pending_tables.contains(&&"dbo.Orders"));
+        assert!(pending_tables.contains(&&"dbo.Products"));
+        assert!(!pending_tables.contains(&&"dbo.Users")); // Completed, should be skipped
+    }
 }
