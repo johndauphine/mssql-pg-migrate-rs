@@ -915,6 +915,13 @@ fn convert_old_sql_value(old: crate::target::SqlValue) -> SqlValue<'static> {
         OldSqlValue::F32(f) => SqlValue::F32(f),
         OldSqlValue::F64(f) => SqlValue::F64(f),
         OldSqlValue::String(s) => SqlValue::Text(Cow::Owned(s)),
+        OldSqlValue::CompressedText {
+            original_len,
+            compressed,
+        } => SqlValue::CompressedText {
+            original_len,
+            compressed,
+        },
         OldSqlValue::Bytes(b) => SqlValue::Bytes(Cow::Owned(b)),
         OldSqlValue::Uuid(u) => SqlValue::Uuid(u),
         OldSqlValue::Decimal(d) => SqlValue::Decimal(d),

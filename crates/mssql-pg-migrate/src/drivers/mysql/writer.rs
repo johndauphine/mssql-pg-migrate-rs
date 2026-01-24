@@ -1,16 +1,19 @@
 //! MySQL/MariaDB target writer implementation.
 //!
 //! Implements the `TargetWriter` trait for writing data to MySQL/MariaDB databases.
-//! Uses mysql_async for connection pooling and batched INSERT for optimal performance.
+//! Uses mysql_async for connection pooling and supports both LOAD DATA LOCAL INFILE
+//! (fast bulk loading) and batched INSERT (compatible fallback).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::{self, BoxStream, StreamExt};
 use mysql_async::prelude::*;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, TxOpts};
 use tracing::{debug, info, warn};
 
-use crate::config::TargetConfig;
+use crate::config::{MysqlLoadData, TargetConfig};
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlValue};
@@ -18,15 +21,21 @@ use crate::error::{MigrateError, Result};
 
 /// MySQL target writer implementation using mysql_async.
 ///
-/// Uses efficient batched INSERT operations for data writing.
+/// Supports both LOAD DATA LOCAL INFILE (fast) and batched INSERT (compatible).
 pub struct MysqlWriter {
     pool: Pool,
     type_mapper: Option<Arc<dyn TypeMapper>>,
+    /// MySQL bulk load strategy configuration.
+    mysql_load_data: MysqlLoadData,
 }
 
 impl MysqlWriter {
     /// Create a new MySQL writer from configuration.
-    pub async fn new(config: &TargetConfig, max_conns: usize) -> Result<Self> {
+    pub async fn new(
+        config: &TargetConfig,
+        max_conns: usize,
+        mysql_load_data: MysqlLoadData,
+    ) -> Result<Self> {
         let ssl_opts = match config.ssl_mode.to_lowercase().as_str() {
             "disable" => {
                 warn!("MySQL TLS is disabled. Credentials will be transmitted in plaintext.");
@@ -81,9 +90,14 @@ impl MysqlWriter {
             config.host, config.port, config.database
         );
 
+        if mysql_load_data == MysqlLoadData::Always {
+            info!("MySQL LOAD DATA LOCAL INFILE enabled for bulk loading");
+        }
+
         Ok(Self {
             pool,
             type_mapper: None,
+            mysql_load_data,
         })
     }
 
@@ -227,6 +241,148 @@ impl MysqlWriter {
             row_count, qualified_table
         );
         Ok(row_count)
+    }
+
+    /// Write batch using LOAD DATA LOCAL INFILE for maximum performance.
+    /// Returns Ok(Some(count)) on success, Ok(None) if LOAD DATA is not supported.
+    async fn write_batch_load_data(
+        &self,
+        conn: &mut Conn,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        batch: Batch,
+    ) -> Result<Option<u64>> {
+        let rows = batch.rows;
+        if rows.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let row_count = rows.len() as u64;
+        let qualified_table = Self::qualify_table(schema, table);
+        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list_str = col_list.join(", ");
+
+        // Build TSV data for streaming to MySQL
+        // Use tab-separated format with NULL represented as \N
+        let csv_data: Vec<Bytes> = rows
+            .iter()
+            .map(|row| {
+                let line = row
+                    .iter()
+                    .map(|v| Self::escape_tsv_value(v))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+                    + "\n";
+                Bytes::from(line)
+            })
+            .collect();
+
+        // Set up one-time infile handler that streams our batch data
+        conn.set_infile_handler(async move {
+            let stream: BoxStream<'static, std::io::Result<Bytes>> =
+                stream::iter(csv_data.into_iter().map(Ok)).boxed();
+            Ok(stream)
+        });
+
+        // Execute LOAD DATA LOCAL INFILE
+        // The filename is arbitrary since our handler ignores it
+        let sql = format!(
+            r#"LOAD DATA LOCAL INFILE 'batch'
+               INTO TABLE {}
+               CHARACTER SET utf8mb4
+               FIELDS TERMINATED BY '\t'
+               LINES TERMINATED BY '\n'
+               ({})"#,
+            qualified_table, col_list_str
+        );
+
+        match conn.query_drop(&sql).await {
+            Ok(_) => {
+                debug!(
+                    "MySQL: wrote {} rows to {} using LOAD DATA LOCAL INFILE",
+                    row_count, qualified_table
+                );
+                Ok(Some(row_count))
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // Check for common LOAD DATA errors:
+                // - Error 1148: LOAD DATA LOCAL INFILE command is disabled
+                // - Error 3948: Loading local data is disabled
+                // - Error 2068: Local infile request rejected
+                if err_str.contains("1148")
+                    || err_str.contains("3948")
+                    || err_str.contains("2068")
+                    || err_str.contains("LOCAL INFILE")
+                    || err_str.contains("local data")
+                {
+                    warn!("MySQL: LOAD DATA LOCAL INFILE not supported, falling back to INSERT");
+                    Ok(None) // Indicate fallback needed
+                } else {
+                    Err(MigrateError::transfer(
+                        &qualified_table,
+                        format!("LOAD DATA: {}", e),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Escape a value for tab-separated format used by LOAD DATA.
+    fn escape_tsv_value(value: &SqlValue<'_>) -> String {
+        match value {
+            SqlValue::Null(_) => "\\N".to_string(),
+            SqlValue::Bool(b) => {
+                if *b {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            SqlValue::I16(i) => i.to_string(),
+            SqlValue::I32(i) => i.to_string(),
+            SqlValue::I64(i) => i.to_string(),
+            SqlValue::F32(f) => f.to_string(),
+            SqlValue::F64(f) => f.to_string(),
+            SqlValue::Text(s) => Self::escape_tsv_string(s),
+            SqlValue::CompressedText { .. } => {
+                // Decompress and escape
+                match value.decompress_text() {
+                    Some(s) => Self::escape_tsv_string(&s),
+                    None => "\\N".to_string(),
+                }
+            }
+            SqlValue::Bytes(b) => {
+                // Encode binary data as hex for MySQL
+                format!("0x{}", hex::encode(b.as_ref()))
+            }
+            SqlValue::Uuid(u) => u.to_string(),
+            SqlValue::Decimal(d) => d.to_string(),
+            SqlValue::DateTime(dt) => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+            SqlValue::DateTimeOffset(dto) => {
+                dto.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            SqlValue::Date(d) => d.format("%Y-%m-%d").to_string(),
+            SqlValue::Time(t) => t.format("%H:%M:%S%.6f").to_string(),
+        }
+    }
+
+    /// Escape a string value for TSV format.
+    /// MySQL LOAD DATA interprets backslash sequences, so we must escape them.
+    fn escape_tsv_string(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\t' => result.push_str("\\t"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\\' => result.push_str("\\\\"),
+                '\0' => result.push_str("\\0"),
+                _ => result.push(c),
+            }
+        }
+        result
     }
 }
 
@@ -608,6 +764,23 @@ impl TargetWriter for MysqlWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
 
+        // Use LOAD DATA if configured
+        if self.mysql_load_data == MysqlLoadData::Always {
+            // Try LOAD DATA first, fall back to INSERT if not supported
+            match self
+                .write_batch_load_data(&mut conn, schema, table, cols, batch)
+                .await?
+            {
+                Some(count) => return Ok(count),
+                None => {
+                    // LOAD DATA not supported, but we've consumed the batch
+                    // This should only happen once per connection - log and return
+                    warn!("LOAD DATA failed, batch was consumed. Consider using mysql_load_data: never");
+                    return Ok(0);
+                }
+            }
+        }
+
         self.write_batch_insert(&mut conn, schema, table, cols, batch)
             .await
     }
@@ -761,6 +934,13 @@ fn sql_value_to_mysql(value: &SqlValue<'_>) -> mysql_async::Value {
         SqlValue::F32(f) => mysql_async::Value::from(*f),
         SqlValue::F64(f) => mysql_async::Value::from(*f),
         SqlValue::Text(s) => mysql_async::Value::from(s.as_ref()),
+        SqlValue::CompressedText { .. } => {
+            // Decompress and convert to MySQL value
+            match value.decompress_text() {
+                Some(s) => mysql_async::Value::from(s.into_owned()),
+                None => mysql_async::Value::NULL,
+            }
+        }
         SqlValue::Bytes(b) => mysql_async::Value::from(b.as_ref()),
         SqlValue::Uuid(u) => mysql_async::Value::from(u.to_string()),
         SqlValue::Decimal(d) => mysql_async::Value::from(d.to_string()),

@@ -433,7 +433,13 @@ impl Orchestrator {
     pub async fn create_target_writer(&self, max_conns: usize) -> Result<TargetWriterImpl> {
         let source_db_type = DriverCatalog::normalize_db_type(&self.config.source.r#type)?;
         self.catalog
-            .create_writer(&self.config.target, max_conns, source_db_type)
+            .create_writer(
+                &self.config.target,
+                max_conns,
+                source_db_type,
+                #[cfg(feature = "mysql")]
+                self.config.migration.mysql_load_data,
+            )
             .await
     }
 
@@ -907,6 +913,7 @@ impl Orchestrator {
             parallel_writers: self.config.migration.get_write_ahead_writers(),
             use_copy_binary: true, // Enable COPY TO BINARY for PostgreSQL sources
             use_direct_copy: true, // Enable direct COPY encoding for MSSQL->PG upsert
+            compress_text: self.config.migration.compress_text,
         };
 
         let engine = Arc::new(

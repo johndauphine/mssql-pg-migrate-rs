@@ -90,6 +90,9 @@ sysinfo = { workspace = true }
 # Glob pattern matching for table filters
 glob = "0.3"
 
+# LZ4 compression for text columns in transit
+lz4_flex = "0.11"
+
 # MySQL/MariaDB driver (optional) - uses mysql_async for LOAD DATA LOCAL INFILE
 mysql_async = { workspace = true, optional = true }
 

@@ -1723,6 +1723,13 @@ fn sql_value_to_sql_param(value: &SqlValue) -> Box<dyn ToSql> {
         SqlValue::F32(f) => Box::new(*f),
         SqlValue::F64(f) => Box::new(*f),
         SqlValue::String(s) => Box::new(s.clone()),
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => Box::new(String::from_utf8_lossy(&decompressed).into_owned()),
+                Err(_) => Box::new(String::new()),
+            }
+        }
         SqlValue::Bytes(b) => Box::new(b.clone()),
         SqlValue::Uuid(u) => Box::new(*u),
         SqlValue::Decimal(d) => Box::new(*d),
@@ -1782,6 +1789,15 @@ fn sql_value_to_column_data(value: &SqlValue) -> ColumnData<'static> {
             }
         }
         SqlValue::String(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => {
+                    ColumnData::String(Some(Cow::Owned(String::from_utf8_lossy(&decompressed).into_owned())))
+                }
+                Err(_) => ColumnData::String(Some(Cow::Owned(String::new()))),
+            }
+        }
         SqlValue::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.clone()))),
         SqlValue::Uuid(u) => ColumnData::Guid(Some(*u)),
         SqlValue::Decimal(d) => {

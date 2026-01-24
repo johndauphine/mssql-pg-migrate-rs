@@ -457,6 +457,21 @@ pub struct MigrationConfig {
     /// Auto-tuning will constrain buffer sizes to stay within this limit.
     #[serde(default = "default_memory_budget_percent")]
     pub memory_budget_percent: u8,
+
+    /// MySQL bulk load strategy (default: never).
+    /// - `never`: Always use batched INSERT (safest, works everywhere)
+    /// - `always`: Always use LOAD DATA LOCAL INFILE (faster for text/blob columns)
+    ///
+    /// LOAD DATA requires `SET GLOBAL local_infile = 1` on the MySQL server.
+    #[serde(default)]
+    pub mysql_load_data: MysqlLoadData,
+
+    /// Compress text columns in transit using LZ4 (default: false).
+    /// When enabled, text values are compressed in the read-ahead buffer
+    /// and decompressed just before writing to the target database.
+    /// This reduces memory pressure for tables with large text columns.
+    #[serde(default)]
+    pub compress_text: bool,
 }
 
 impl Default for MigrationConfig {
@@ -486,6 +501,8 @@ impl Default for MigrationConfig {
             upsert_parallel_tasks: None,
             date_updated_columns: Vec::new(),
             memory_budget_percent: default_memory_budget_percent(),
+            mysql_load_data: MysqlLoadData::default(),
+            compress_text: false,
         }
     }
 }
@@ -872,6 +889,24 @@ pub enum TargetMode {
 
     /// Upsert: INSERT new rows, UPDATE changed rows.
     Upsert,
+}
+
+/// MySQL bulk load strategy.
+///
+/// Controls whether to use LOAD DATA LOCAL INFILE or batched INSERT for bulk loading.
+/// LOAD DATA is significantly faster for large text/blob columns but requires server support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MysqlLoadData {
+    /// Never use LOAD DATA, always use batched INSERT statements.
+    /// This is the safest option and works with all MySQL configurations.
+    #[default]
+    Never,
+
+    /// Always use LOAD DATA LOCAL INFILE for bulk loading.
+    /// Faster for tables with large text/blob columns.
+    /// Requires `local_infile=ON` on MySQL server.
+    Always,
 }
 
 // Default value functions for serde

@@ -197,6 +197,13 @@ pub enum SqlValue {
     F32(f32),
     F64(f64),
     String(String),
+    /// LZ4-compressed text data for large strings.
+    CompressedText {
+        /// Original uncompressed length in bytes.
+        original_len: usize,
+        /// LZ4-compressed data.
+        compressed: Vec<u8>,
+    },
     Bytes(Vec<u8>),
     Uuid(uuid::Uuid),
     Decimal(rust_decimal::Decimal),
@@ -2327,6 +2334,18 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue) {
             buf.put_i32(bytes.len() as i32);
             buf.extend_from_slice(bytes);
         }
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => {
+                    buf.put_i32(decompressed.len() as i32);
+                    buf.extend_from_slice(&decompressed);
+                }
+                Err(_) => {
+                    buf.put_i32(0);
+                }
+            }
+        }
         SqlValue::Bytes(b) => {
             buf.put_i32(b.len() as i32);
             buf.extend_from_slice(b);
@@ -2552,6 +2571,13 @@ fn sql_value_to_copy_text(value: &SqlValue) -> String {
         SqlValue::F32(n) => n.to_string(),
         SqlValue::F64(n) => n.to_string(),
         SqlValue::String(s) => escape_copy_text(s),
+        SqlValue::CompressedText { compressed, .. } => {
+            // Decompress LZ4 data
+            match lz4_flex::decompress_size_prepended(compressed) {
+                Ok(decompressed) => escape_copy_text(&String::from_utf8_lossy(&decompressed)),
+                Err(_) => String::new(),
+            }
+        }
         SqlValue::Bytes(b) => format!("\\\\x{}", hex::encode(b)),
         SqlValue::Uuid(u) => u.to_string(),
         SqlValue::Decimal(d) => d.to_string(),

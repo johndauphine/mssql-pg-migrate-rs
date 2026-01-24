@@ -9,6 +9,10 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+/// Minimum text length to consider for compression (64 bytes).
+/// Smaller strings have too much overhead from compression headers.
+pub const COMPRESSION_THRESHOLD: usize = 64;
+
 /// Type hint for NULL values to ensure correct target database encoding.
 ///
 /// When encoding NULL values in binary protocols (like PostgreSQL COPY),
@@ -81,6 +85,17 @@ pub enum SqlValue<'a> {
     /// Uses `Cow` to avoid allocation when borrowing from source buffers.
     Text(Cow<'a, str>),
 
+    /// LZ4-compressed text data for large strings.
+    ///
+    /// Stores the original length and compressed bytes to reduce memory
+    /// usage in the transfer pipeline for tables with large text columns.
+    CompressedText {
+        /// Original uncompressed length in bytes.
+        original_len: usize,
+        /// LZ4-compressed data.
+        compressed: Vec<u8>,
+    },
+
     /// Binary data with zero-copy support.
     ///
     /// Uses `Cow` to avoid allocation when borrowing from source buffers.
@@ -121,6 +136,13 @@ impl<'a> SqlValue<'a> {
             SqlValue::F32(v) => SqlValue::F32(v),
             SqlValue::F64(v) => SqlValue::F64(v),
             SqlValue::Text(v) => SqlValue::Text(Cow::Owned(v.into_owned())),
+            SqlValue::CompressedText {
+                original_len,
+                compressed,
+            } => SqlValue::CompressedText {
+                original_len,
+                compressed,
+            },
             SqlValue::Bytes(v) => SqlValue::Bytes(Cow::Owned(v.into_owned())),
             SqlValue::Uuid(v) => SqlValue::Uuid(v),
             SqlValue::Decimal(v) => SqlValue::Decimal(v),
@@ -149,6 +171,7 @@ impl<'a> SqlValue<'a> {
             SqlValue::F32(_) => SqlNullType::F32,
             SqlValue::F64(_) => SqlNullType::F64,
             SqlValue::Text(_) => SqlNullType::String,
+            SqlValue::CompressedText { .. } => SqlNullType::String,
             SqlValue::Bytes(_) => SqlNullType::Bytes,
             SqlValue::Uuid(_) => SqlNullType::Uuid,
             SqlValue::Decimal(_) => SqlNullType::Decimal,
@@ -184,6 +207,63 @@ impl<'a> SqlValue<'a> {
     #[must_use]
     pub fn bytes_owned(b: Vec<u8>) -> SqlValue<'static> {
         SqlValue::Bytes(Cow::Owned(b))
+    }
+
+    /// Compress a text value if it exceeds the threshold.
+    ///
+    /// Returns a `CompressedText` variant for large strings, or the original
+    /// `Text` variant for small strings (below `COMPRESSION_THRESHOLD`).
+    #[must_use]
+    pub fn compress_text(s: String) -> SqlValue<'static> {
+        if s.len() < COMPRESSION_THRESHOLD {
+            return SqlValue::Text(Cow::Owned(s));
+        }
+
+        let compressed = lz4_flex::compress_prepend_size(s.as_bytes());
+
+        // Only use compression if it actually saves space
+        if compressed.len() < s.len() {
+            SqlValue::CompressedText {
+                original_len: s.len(),
+                compressed,
+            }
+        } else {
+            SqlValue::Text(Cow::Owned(s))
+        }
+    }
+
+    /// Decompress a text value, returning the string.
+    ///
+    /// For `Text` variants, returns the string directly.
+    /// For `CompressedText` variants, decompresses and returns the string.
+    /// Returns `None` for non-text variants.
+    #[must_use]
+    pub fn decompress_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            SqlValue::Text(s) => Some(Cow::Borrowed(s.as_ref())),
+            SqlValue::CompressedText {
+                original_len: _,
+                compressed,
+            } => {
+                // Decompress - lz4_flex stores the size in the first 4 bytes
+                match lz4_flex::decompress_size_prepended(compressed) {
+                    Ok(decompressed) => {
+                        // Convert bytes to string
+                        String::from_utf8(decompressed)
+                            .ok()
+                            .map(|s| Cow::Owned(s))
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Check if this is a text or compressed text value.
+    #[must_use]
+    pub fn is_text(&self) -> bool {
+        matches!(self, SqlValue::Text(_) | SqlValue::CompressedText { .. })
     }
 }
 
@@ -341,6 +421,23 @@ impl Batch {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// Compress all text values in the batch using LZ4.
+    ///
+    /// This reduces memory usage for batches containing large text columns.
+    /// Text values smaller than `COMPRESSION_THRESHOLD` are left uncompressed.
+    pub fn compress_text_values(&mut self) {
+        for row in &mut self.rows {
+            for value in row {
+                if let SqlValue::Text(text) = value {
+                    if text.len() >= COMPRESSION_THRESHOLD {
+                        let s = std::mem::take(text);
+                        *value = SqlValue::compress_text(s.into_owned());
+                    }
+                }
+            }
+        }
     }
 }
 
