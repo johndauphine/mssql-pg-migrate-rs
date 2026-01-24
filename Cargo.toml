@@ -31,7 +31,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "0.26"
 
 # MySQL/MariaDB driver (optional, feature-gated)
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "chrono", "uuid", "rust_decimal"] }
+# Uses mysql_async for LOAD DATA LOCAL INFILE support (5-10x faster than INSERT)
+mysql_async = { version = "0.34", default-features = false, features = ["minimal", "chrono"] }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }

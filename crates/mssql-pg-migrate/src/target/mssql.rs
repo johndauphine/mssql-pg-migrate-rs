@@ -673,9 +673,10 @@ impl MssqlTargetPool {
         match lower.as_str() {
             // Fixed-length types
             "bigint" | "int" | "smallint" | "tinyint" | "bit" | "money" | "smallmoney" | "real"
-            | "date" | "text" | "ntext" | "image"
-            | "uniqueidentifier" | "xml" | "sql_variant" | "timestamp" | "rowversion"
-            | "geography" | "geometry" | "hierarchyid" => data_type.to_string(),
+            | "date" | "text" | "ntext" | "image" | "uniqueidentifier" | "xml" | "sql_variant"
+            | "timestamp" | "rowversion" | "geography" | "geometry" | "hierarchyid" => {
+                data_type.to_string()
+            }
 
             // Convert datetime/smalldatetime to datetime2 for bulk insert compatibility
             // (sql_value_to_column_data always sends DateTime2 data)

@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::mysql::MySqlPool;
-use sqlx::Row;
+use mysql_async::prelude::*;
+use mysql_async::{params, Pool, Row as MySqlRow};
 use std::collections::HashMap;
 
 use crate::error::{MigrateError, Result};
@@ -17,13 +17,13 @@ use crate::state::{MigrationState, TableState};
 
 /// MySQL database state backend for migration runs.
 pub struct MysqlStateBackend {
-    pool: MySqlPool,
+    pool: Pool,
     schema: String,
 }
 
 impl MysqlStateBackend {
     /// Create a new MySQL database state backend.
-    pub fn new(pool: MySqlPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             pool,
             schema: "_mssql_pg_migrate".to_string(),
@@ -32,10 +32,15 @@ impl MysqlStateBackend {
 
     /// Initialize the state schema and tables.
     pub async fn init_schema(&self) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL state connection"))?;
+
         // Create database/schema if not exists
         let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", self.schema);
-        sqlx::query(&sql)
-            .execute(&self.pool)
+        conn.query_drop(&sql)
             .await
             .map_err(|e| MigrateError::pool(e, "creating MySQL state schema"))?;
 
@@ -63,8 +68,7 @@ impl MysqlStateBackend {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
             self.schema
         );
-        sqlx::query(&sql)
-            .execute(&self.pool)
+        conn.query_drop(&sql)
             .await
             .map_err(|e| MigrateError::pool(e, "creating MySQL table_state table"))?;
 
@@ -73,10 +77,15 @@ impl MysqlStateBackend {
 
     /// Save a migration state to the database.
     pub async fn save(&self, state: &MigrationState) -> Result<()> {
-        // Start transaction
-        let mut tx = self
+        let mut conn = self
             .pool
-            .begin()
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection for save"))?;
+
+        // Start transaction
+        let mut tx = conn
+            .start_transaction(mysql_async::TxOpts::default())
             .await
             .map_err(|e| MigrateError::pool(e, "starting MySQL transaction"))?;
 
@@ -87,7 +96,9 @@ impl MysqlStateBackend {
                  (run_id, config_hash, run_started_at, run_completed_at, run_status,
                   table_name, table_status, rows_total, rows_transferred, rows_skipped,
                   last_pk, last_sync_timestamp, table_completed_at, error)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 VALUES (:run_id, :config_hash, :started_at, :completed_at, :run_status,
+                         :table_name, :table_status, :rows_total, :rows_transferred, :rows_skipped,
+                         :last_pk, :last_sync_timestamp, :table_completed_at, :error)
                  ON DUPLICATE KEY UPDATE
                     config_hash = VALUES(config_hash),
                     run_started_at = VALUES(run_started_at),
@@ -104,22 +115,25 @@ impl MysqlStateBackend {
                 self.schema
             );
 
-            sqlx::query(&sql)
-                .bind(&state.run_id)
-                .bind(&state.config_hash)
-                .bind(state.started_at)
-                .bind(state.completed_at)
-                .bind(run_status_to_str(state.status))
-                .bind(table_name)
-                .bind(task_status_to_str(table_state.status))
-                .bind(table_state.rows_total)
-                .bind(table_state.rows_transferred)
-                .bind(table_state.rows_skipped)
-                .bind(table_state.last_pk)
-                .bind(table_state.last_sync_timestamp)
-                .bind(table_state.completed_at)
-                .bind(&table_state.error)
-                .execute(&mut *tx)
+            // Use params! macro to handle >12 parameters
+            let params = params! {
+                "run_id" => &state.run_id,
+                "config_hash" => &state.config_hash,
+                "started_at" => state.started_at.naive_utc(),
+                "completed_at" => state.completed_at.map(|dt| dt.naive_utc()),
+                "run_status" => run_status_to_str(state.status),
+                "table_name" => table_name,
+                "table_status" => task_status_to_str(table_state.status),
+                "rows_total" => table_state.rows_total,
+                "rows_transferred" => table_state.rows_transferred,
+                "rows_skipped" => table_state.rows_skipped,
+                "last_pk" => table_state.last_pk,
+                "last_sync_timestamp" => table_state.last_sync_timestamp.map(|dt| dt.naive_utc()),
+                "table_completed_at" => table_state.completed_at.map(|dt| dt.naive_utc()),
+                "error" => &table_state.error,
+            };
+
+            tx.exec_drop(&sql, params)
                 .await
                 .map_err(|e| MigrateError::pool(e, "saving MySQL table state"))?;
         }
@@ -133,6 +147,12 @@ impl MysqlStateBackend {
 
     /// Load the latest migration state for a given config hash.
     pub async fn load_latest(&self, config_hash: &str) -> Result<Option<MigrationState>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection for load"))?;
+
         // Load all table states for the latest run with matching config hash
         let sql = format!(
             "SELECT run_id, config_hash, run_started_at, run_completed_at, run_status,
@@ -149,10 +169,8 @@ impl MysqlStateBackend {
             self.schema, self.schema
         );
 
-        let rows = sqlx::query(&sql)
-            .bind(config_hash)
-            .bind(config_hash)
-            .fetch_all(&self.pool)
+        let rows: Vec<MySqlRow> = conn
+            .exec(&sql, (config_hash, config_hash))
             .await
             .map_err(|e| MigrateError::pool(e, "loading MySQL state"))?;
 
@@ -162,23 +180,35 @@ impl MysqlStateBackend {
 
         // Extract run-level fields from first row (all rows have same values)
         let first_row = &rows[0];
-        let run_id: String = first_row.get("run_id");
-        let config_hash: String = first_row.get("config_hash");
-        let started_at: DateTime<Utc> = first_row.get("run_started_at");
-        let completed_at: Option<DateTime<Utc>> = first_row.get("run_completed_at");
-        let status_str: String = first_row.get("run_status");
+        let run_id: String = first_row.get("run_id").unwrap_or_default();
+        let config_hash: String = first_row.get("config_hash").unwrap_or_default();
+        let started_at: DateTime<Utc> = first_row
+            .get::<chrono::NaiveDateTime, _>("run_started_at")
+            .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+            .unwrap_or_else(Utc::now);
+        let completed_at: Option<DateTime<Utc>> = first_row
+            .get::<Option<chrono::NaiveDateTime>, _>("run_completed_at")
+            .flatten()
+            .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
+        let status_str: String = first_row.get("run_status").unwrap_or_default();
 
         // Extract table states
         let mut tables = HashMap::new();
         for row in rows {
-            let table_name: String = row.get("table_name");
-            let table_status_str: String = row.get("table_status");
-            let rows_total: i64 = row.get("rows_total");
-            let rows_transferred: i64 = row.get("rows_transferred");
-            let rows_skipped: i64 = row.get("rows_skipped");
+            let table_name: String = row.get("table_name").unwrap_or_default();
+            let table_status_str: String = row.get("table_status").unwrap_or_default();
+            let rows_total: i64 = row.get("rows_total").unwrap_or(0);
+            let rows_transferred: i64 = row.get("rows_transferred").unwrap_or(0);
+            let rows_skipped: i64 = row.get("rows_skipped").unwrap_or(0);
             let last_pk: Option<i64> = row.get("last_pk");
-            let last_sync_timestamp: Option<DateTime<Utc>> = row.get("last_sync_timestamp");
-            let table_completed_at: Option<DateTime<Utc>> = row.get("table_completed_at");
+            let last_sync_timestamp: Option<DateTime<Utc>> = row
+                .get::<Option<chrono::NaiveDateTime>, _>("last_sync_timestamp")
+                .flatten()
+                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
+            let table_completed_at: Option<DateTime<Utc>> = row
+                .get::<Option<chrono::NaiveDateTime>, _>("table_completed_at")
+                .flatten()
+                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
             let error: Option<String> = row.get("error");
 
             tables.insert(
@@ -211,6 +241,12 @@ impl MysqlStateBackend {
     /// Get the last sync timestamp for a specific table (for incremental sync).
     /// Returns the most recent completed run's timestamp for this table.
     pub async fn get_last_sync_timestamp(&self, table_name: &str) -> Result<Option<DateTime<Utc>>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let sql = format!(
             "SELECT last_sync_timestamp
              FROM `{}`.`table_state`
@@ -222,13 +258,16 @@ impl MysqlStateBackend {
             self.schema
         );
 
-        let row = sqlx::query(&sql)
-            .bind(table_name)
-            .fetch_optional(&self.pool)
+        let row: Option<MySqlRow> = conn
+            .exec_first(&sql, (table_name,))
             .await
             .map_err(|e| MigrateError::pool(e, "getting MySQL last sync timestamp"))?;
 
-        Ok(row.and_then(|r| r.get("last_sync_timestamp")))
+        Ok(row.and_then(|r| {
+            r.get::<Option<chrono::NaiveDateTime>, _>("last_sync_timestamp")
+                .flatten()
+                .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+        }))
     }
 
     /// Get the backend type name.

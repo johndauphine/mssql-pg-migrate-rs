@@ -139,10 +139,10 @@ impl Dialect for MysqlDialect {
         sql
     }
 
-    fn param_placeholder(&self, index: usize) -> String {
-        // SQLx MySQL uses positional placeholders with $N (1-based)
-        // But native MySQL uses ?, so we support both styles
-        format!("${}", index)
+    fn param_placeholder(&self, _index: usize) -> String {
+        // mysql_async uses native MySQL placeholders (?)
+        // The index is ignored since MySQL uses positional ? placeholders
+        "?".to_string()
     }
 
     fn build_keyset_where(&self, pk_col: &str, last_pk: i64) -> String {
@@ -188,8 +188,9 @@ mod tests {
     #[test]
     fn test_param_placeholder() {
         let dialect = MysqlDialect::new();
-        assert_eq!(dialect.param_placeholder(1), "$1");
-        assert_eq!(dialect.param_placeholder(10), "$10");
+        // mysql_async uses native MySQL ? placeholders
+        assert_eq!(dialect.param_placeholder(1), "?");
+        assert_eq!(dialect.param_placeholder(10), "?");
     }
 
     #[test]

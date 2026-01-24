@@ -1,14 +1,14 @@
 //! MySQL/MariaDB source reader implementation.
 //!
 //! Implements the `SourceReader` trait for reading data from MySQL/MariaDB databases.
-//! Uses SQLx for connection pooling and async query execution.
+//! Uses mysql_async for connection pooling and async query execution.
 
 use std::borrow::Cow;
-use std::time::Duration;
+use std::collections::HashMap;
 
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
-use sqlx::{Row, ValueRef};
+use mysql_async::prelude::*;
+use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Row as MySqlRow, SslOpts};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -20,12 +20,9 @@ use crate::error::{MigrateError, Result};
 // Import target::SqlValue for legacy transfer engine compatibility
 use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
-/// Connection pool timeout.
-const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// MySQL/MariaDB source reader implementation.
 pub struct MysqlReader {
-    pool: MySqlPool,
+    pool: Pool,
     #[allow(dead_code)]
     database: String,
 }
@@ -34,28 +31,37 @@ impl MysqlReader {
     /// Create a new MySQL reader from configuration.
     pub async fn new(config: &SourceConfig, max_conns: usize) -> Result<Self> {
         // Default to Preferred SSL mode for source connections
-        let ssl_mode = MySqlSslMode::Preferred;
+        let ssl_opts = Some(SslOpts::default().with_danger_accept_invalid_certs(true));
 
-        let options = MySqlConnectOptions::new()
-            .host(&config.host)
-            .port(config.port)
-            .database(&config.database)
-            .username(&config.user)
-            .password(&config.password)
-            .ssl_mode(ssl_mode);
+        let mut builder = OptsBuilder::default()
+            .ip_or_hostname(&config.host)
+            .tcp_port(config.port)
+            .db_name(Some(&config.database))
+            .user(Some(&config.user))
+            .pass(Some(&config.password))
+            .init(vec!["SET NAMES utf8mb4"]);
 
-        let pool = MySqlPoolOptions::new()
-            .max_connections(max_conns as u32)
-            .acquire_timeout(POOL_CONNECTION_TIMEOUT)
-            .connect_with(options)
+        if let Some(ssl) = ssl_opts {
+            builder = builder.ssl_opts(ssl);
+        }
+
+        let pool_opts =
+            PoolOpts::new().with_constraints(PoolConstraints::new(1, max_conns).unwrap());
+
+        let opts: Opts = builder.pool_opts(pool_opts).into();
+        let pool = Pool::new(opts);
+
+        // Test connection
+        let mut conn = pool
+            .get_conn()
             .await
             .map_err(|e| MigrateError::pool(e, "creating MySQL source pool"))?;
 
-        // Test connection
-        sqlx::query("SELECT 1")
-            .fetch_one(&pool)
+        conn.query_drop("SELECT 1")
             .await
             .map_err(|e| MigrateError::pool(e, "testing MySQL source connection"))?;
+
+        drop(conn);
 
         info!(
             "Connected to MySQL source: {}:{}/{}",
@@ -70,44 +76,44 @@ impl MysqlReader {
 
     /// Load columns for a table.
     async fn load_columns(&self, table: &mut Table) -> Result<()> {
-        // CAST string columns to CHAR and numeric to SIGNED to handle type differences
-        // Cap max_length at 2147483647 (i32 max) or -1 for very large values (LONGTEXT etc)
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
+        // Query column metadata
         let query = r#"
             SELECT
-                CAST(COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME,
-                CAST(DATA_TYPE AS CHAR(255)) AS DATA_TYPE,
-                CAST(CASE
+                COLUMN_NAME,
+                DATA_TYPE,
+                CASE
                     WHEN CHARACTER_MAXIMUM_LENGTH IS NULL THEN 0
                     WHEN CHARACTER_MAXIMUM_LENGTH > 2147483647 THEN -1
                     ELSE CHARACTER_MAXIMUM_LENGTH
-                END AS SIGNED) AS max_length,
-                CAST(COALESCE(NUMERIC_PRECISION, 0) AS SIGNED) AS num_precision,
-                CAST(COALESCE(NUMERIC_SCALE, 0) AS SIGNED) AS num_scale,
+                END AS max_length,
+                COALESCE(NUMERIC_PRECISION, 0) AS num_precision,
+                COALESCE(NUMERIC_SCALE, 0) AS num_scale,
                 IF(IS_NULLABLE = 'YES', 1, 0) AS is_nullable,
                 IF(EXTRA LIKE '%auto_increment%', 1, 0) AS is_identity,
-                CAST(ORDINAL_POSITION AS SIGNED) AS ORDINAL_POSITION
+                ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
         "#;
 
-        let rows: Vec<MySqlRow> = sqlx::query(query)
-            .bind(&table.schema)
-            .bind(&table.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "loading MySQL columns"))?;
+        let rows: Vec<MySqlRow> = conn.exec(query, (&table.schema, &table.name)).await?;
 
         for row in rows {
             let col = Column {
-                name: row.get::<String, _>("COLUMN_NAME"),
-                data_type: row.get::<String, _>("DATA_TYPE"),
-                max_length: row.get::<i32, _>("max_length"),
-                precision: row.get::<i32, _>("num_precision"),
-                scale: row.get::<i32, _>("num_scale"),
-                is_nullable: row.get::<i32, _>("is_nullable") == 1,
-                is_identity: row.get::<i32, _>("is_identity") == 1,
-                ordinal_pos: row.get::<i32, _>("ORDINAL_POSITION"),
+                name: row.get::<String, _>("COLUMN_NAME").unwrap_or_default(),
+                data_type: row.get::<String, _>("DATA_TYPE").unwrap_or_default(),
+                max_length: row.get::<i32, _>("max_length").unwrap_or(0),
+                precision: row.get::<i32, _>("num_precision").unwrap_or(0),
+                scale: row.get::<i32, _>("num_scale").unwrap_or(0),
+                is_nullable: row.get::<i32, _>("is_nullable").unwrap_or(0) == 1,
+                is_identity: row.get::<i32, _>("is_identity").unwrap_or(0) == 1,
+                ordinal_pos: row.get::<i32, _>("ORDINAL_POSITION").unwrap_or(0),
             };
             table.columns.push(col);
         }
@@ -117,23 +123,23 @@ impl MysqlReader {
 
     /// Load primary key columns for a table.
     async fn load_primary_key(&self, table: &mut Table) -> Result<()> {
-        // CAST to CHAR to handle collation differences
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = r#"
-            SELECT CAST(COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME
+            SELECT COLUMN_NAME
             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
             ORDER BY ORDINAL_POSITION
         "#;
 
-        let rows: Vec<MySqlRow> = sqlx::query(query)
-            .bind(&table.schema)
-            .bind(&table.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "loading MySQL primary key"))?;
+        let rows: Vec<MySqlRow> = conn.exec(query, (&table.schema, &table.name)).await?;
 
         for row in rows {
-            let col_name: String = row.get("COLUMN_NAME");
+            let col_name: String = row.get("COLUMN_NAME").unwrap_or_default();
             table.primary_key.push(col_name.clone());
 
             // Add to pk_columns
@@ -158,96 +164,105 @@ impl MysqlReader {
             .map(|(i, col)| {
                 let data_type = col.data_type.to_lowercase();
 
-                // Handle NULL values
-                let is_null: bool = row.try_get_raw(i).map(|r| r.is_null()).unwrap_or(true);
-                if is_null {
-                    return SqlValue::Null(Self::null_type_for(&data_type));
-                }
-
-                // Convert based on data type
-                match data_type.as_str() {
-                    // Integer types
-                    "tinyint" => row
-                        .try_get::<i8, _>(i)
-                        .map(|v| SqlValue::I16(v as i16))
-                        .unwrap_or(SqlValue::Null(SqlNullType::I16)),
-                    "smallint" => row
-                        .try_get::<i16, _>(i)
-                        .map(SqlValue::I16)
-                        .unwrap_or(SqlValue::Null(SqlNullType::I16)),
-                    "mediumint" | "int" | "integer" => row
-                        .try_get::<i32, _>(i)
-                        .map(SqlValue::I32)
-                        .unwrap_or(SqlValue::Null(SqlNullType::I32)),
-                    "bigint" => row
-                        .try_get::<i64, _>(i)
-                        .map(SqlValue::I64)
-                        .unwrap_or(SqlValue::Null(SqlNullType::I64)),
-
-                    // Floating point
-                    "float" => row
-                        .try_get::<f32, _>(i)
-                        .map(SqlValue::F32)
-                        .unwrap_or(SqlValue::Null(SqlNullType::F32)),
-                    "double" | "real" => row
-                        .try_get::<f64, _>(i)
-                        .map(SqlValue::F64)
-                        .unwrap_or(SqlValue::Null(SqlNullType::F64)),
-
-                    // Decimal
-                    "decimal" | "numeric" => row
-                        .try_get::<rust_decimal::Decimal, _>(i)
-                        .map(SqlValue::Decimal)
-                        .unwrap_or(SqlValue::Null(SqlNullType::Decimal)),
-
-                    // Boolean
-                    "bit" | "boolean" | "bool" => row
-                        .try_get::<bool, _>(i)
-                        .map(SqlValue::Bool)
-                        .unwrap_or(SqlValue::Null(SqlNullType::Bool)),
-
-                    // String types
-                    "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext"
-                    | "enum" | "set" => row
-                        .try_get::<String, _>(i)
-                        .map(|s| SqlValue::Text(Cow::Owned(s)))
-                        .unwrap_or(SqlValue::Null(SqlNullType::String)),
-
-                    // Binary types
-                    "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => row
-                        .try_get::<Vec<u8>, _>(i)
-                        .map(|b| SqlValue::Bytes(Cow::Owned(b)))
-                        .unwrap_or(SqlValue::Null(SqlNullType::Bytes)),
-
-                    // Date/Time types
-                    "date" => row
-                        .try_get::<chrono::NaiveDate, _>(i)
-                        .map(SqlValue::Date)
-                        .unwrap_or(SqlValue::Null(SqlNullType::Date)),
-                    "time" => row
-                        .try_get::<chrono::NaiveTime, _>(i)
-                        .map(SqlValue::Time)
-                        .unwrap_or(SqlValue::Null(SqlNullType::Time)),
-                    "datetime" | "timestamp" => row
-                        .try_get::<chrono::NaiveDateTime, _>(i)
-                        .map(SqlValue::DateTime)
-                        .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
-
-                    // JSON - store as text since SqlValue doesn't have a Json variant
-                    "json" => row
-                        .try_get::<String, _>(i)
-                        .map(|s| SqlValue::Text(Cow::Owned(s)))
-                        .unwrap_or(SqlValue::Null(SqlNullType::String)),
-
-                    // UUID (not native in MySQL, stored as char(36) or binary(16))
-                    // Fall back to string
-                    _ => row
-                        .try_get::<String, _>(i)
-                        .map(|s| SqlValue::Text(Cow::Owned(s)))
-                        .unwrap_or(SqlValue::Null(SqlNullType::String)),
-                }
+                // Try to get the value, return NULL if column doesn't exist or is null
+                Self::convert_column_value(row, i, &data_type)
             })
             .collect()
+    }
+
+    /// Convert a single column value from MySQL row to SqlValue.
+    fn convert_column_value(row: &MySqlRow, idx: usize, data_type: &str) -> SqlValue<'static> {
+        // Check for NULL first
+        let is_null = row
+            .get_opt::<mysql_async::Value, _>(idx)
+            .is_none_or(|opt| opt.map_or(true, |v| matches!(v, mysql_async::Value::NULL)));
+
+        if is_null {
+            return SqlValue::Null(Self::null_type_for(data_type));
+        }
+
+        // Convert based on data type
+        match data_type {
+            // Integer types
+            "tinyint" => row
+                .get::<i8, _>(idx)
+                .map(|v| SqlValue::I16(v as i16))
+                .unwrap_or(SqlValue::Null(SqlNullType::I16)),
+            "smallint" => row
+                .get::<i16, _>(idx)
+                .map(SqlValue::I16)
+                .unwrap_or(SqlValue::Null(SqlNullType::I16)),
+            "mediumint" | "int" | "integer" => row
+                .get::<i32, _>(idx)
+                .map(SqlValue::I32)
+                .unwrap_or(SqlValue::Null(SqlNullType::I32)),
+            "bigint" => row
+                .get::<i64, _>(idx)
+                .map(SqlValue::I64)
+                .unwrap_or(SqlValue::Null(SqlNullType::I64)),
+
+            // Floating point
+            "float" => row
+                .get::<f32, _>(idx)
+                .map(SqlValue::F32)
+                .unwrap_or(SqlValue::Null(SqlNullType::F32)),
+            "double" | "real" => row
+                .get::<f64, _>(idx)
+                .map(SqlValue::F64)
+                .unwrap_or(SqlValue::Null(SqlNullType::F64)),
+
+            // Decimal - mysql_async doesn't have rust_decimal FromValue, read as String and parse
+            "decimal" | "numeric" => row
+                .get::<String, _>(idx)
+                .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                .map(SqlValue::Decimal)
+                .unwrap_or(SqlValue::Null(SqlNullType::Decimal)),
+
+            // Boolean
+            "bit" | "boolean" | "bool" => row
+                .get::<bool, _>(idx)
+                .map(SqlValue::Bool)
+                .unwrap_or(SqlValue::Null(SqlNullType::Bool)),
+
+            // String types
+            "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum"
+            | "set" => row
+                .get::<String, _>(idx)
+                .map(|s| SqlValue::Text(Cow::Owned(s)))
+                .unwrap_or(SqlValue::Null(SqlNullType::String)),
+
+            // Binary types
+            "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => row
+                .get::<Vec<u8>, _>(idx)
+                .map(|b| SqlValue::Bytes(Cow::Owned(b)))
+                .unwrap_or(SqlValue::Null(SqlNullType::Bytes)),
+
+            // Date/Time types
+            "date" => row
+                .get::<chrono::NaiveDate, _>(idx)
+                .map(SqlValue::Date)
+                .unwrap_or(SqlValue::Null(SqlNullType::Date)),
+            "time" => row
+                .get::<chrono::NaiveTime, _>(idx)
+                .map(SqlValue::Time)
+                .unwrap_or(SqlValue::Null(SqlNullType::Time)),
+            "datetime" | "timestamp" => row
+                .get::<chrono::NaiveDateTime, _>(idx)
+                .map(SqlValue::DateTime)
+                .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
+
+            // JSON - store as text since SqlValue doesn't have a Json variant
+            "json" => row
+                .get::<String, _>(idx)
+                .map(|s| SqlValue::Text(Cow::Owned(s)))
+                .unwrap_or(SqlValue::Null(SqlNullType::String)),
+
+            // Default to string
+            _ => row
+                .get::<String, _>(idx)
+                .map(|s| SqlValue::Text(Cow::Owned(s)))
+                .unwrap_or(SqlValue::Null(SqlNullType::String)),
+        }
     }
 
     /// Get the appropriate null type for a MySQL data type.
@@ -272,8 +287,12 @@ impl MysqlReader {
 
     /// Test the database connection.
     pub async fn test_connection(&self) -> Result<()> {
-        sqlx::query("SELECT 1")
-            .fetch_one(&self.pool)
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
+        conn.query_drop("SELECT 1")
             .await
             .map_err(|e| MigrateError::pool(e, "testing MySQL connection"))?;
         Ok(())
@@ -288,8 +307,14 @@ impl MysqlReader {
         _columns: &[String],
         col_types: &[String],
     ) -> Result<Vec<Vec<TargetSqlValue>>> {
-        let rows: Vec<MySqlRow> = sqlx::query(sql)
-            .fetch_all(&self.pool)
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "query_rows_fast"))?;
+
+        let rows: Vec<MySqlRow> = conn
+            .query(sql)
             .await
             .map_err(|e| MigrateError::pool(e, "query_rows_fast"))?;
 
@@ -313,8 +338,11 @@ impl MysqlReader {
     fn convert_value_for_target(row: &MySqlRow, idx: usize, data_type: &str) -> TargetSqlValue {
         let data_type = data_type.to_lowercase();
 
-        // Handle NULL values
-        let is_null: bool = row.try_get_raw(idx).map(|r| r.is_null()).unwrap_or(true);
+        // Check for NULL first
+        let is_null = row
+            .get_opt::<mysql_async::Value, _>(idx)
+            .is_none_or(|opt| opt.map_or(true, |v| matches!(v, mysql_async::Value::NULL)));
+
         if is_null {
             return TargetSqlValue::Null(Self::target_null_type_for(&data_type));
         }
@@ -323,82 +351,82 @@ impl MysqlReader {
         match data_type.as_str() {
             // Integer types
             "tinyint" => row
-                .try_get::<i8, _>(idx)
+                .get::<i8, _>(idx)
                 .map(|v| TargetSqlValue::I16(v as i16))
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
             "smallint" => row
-                .try_get::<i16, _>(idx)
+                .get::<i16, _>(idx)
                 .map(TargetSqlValue::I16)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
             "mediumint" | "int" | "integer" => row
-                .try_get::<i32, _>(idx)
+                .get::<i32, _>(idx)
                 .map(TargetSqlValue::I32)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I32)),
             "bigint" => row
-                .try_get::<i64, _>(idx)
+                .get::<i64, _>(idx)
                 .map(TargetSqlValue::I64)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I64)),
 
             // Floating point
             "float" => row
-                .try_get::<f32, _>(idx)
+                .get::<f32, _>(idx)
                 .map(TargetSqlValue::F32)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F32)),
             "double" | "real" => row
-                .try_get::<f64, _>(idx)
+                .get::<f64, _>(idx)
                 .map(TargetSqlValue::F64)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F64)),
 
-            // Decimal
+            // Decimal - mysql_async doesn't have rust_decimal FromValue, read as String and parse
             "decimal" | "numeric" => row
-                .try_get::<rust_decimal::Decimal, _>(idx)
+                .get::<String, _>(idx)
+                .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
                 .map(TargetSqlValue::Decimal)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Decimal)),
 
             // Boolean
             "bit" | "boolean" | "bool" => row
-                .try_get::<bool, _>(idx)
+                .get::<bool, _>(idx)
                 .map(TargetSqlValue::Bool)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bool)),
 
             // String types
             "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum"
             | "set" => row
-                .try_get::<String, _>(idx)
+                .get::<String, _>(idx)
                 .map(TargetSqlValue::String)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
 
             // Binary types
             "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" => row
-                .try_get::<Vec<u8>, _>(idx)
+                .get::<Vec<u8>, _>(idx)
                 .map(TargetSqlValue::Bytes)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bytes)),
 
             // Date/Time types
             "date" => row
-                .try_get::<chrono::NaiveDate, _>(idx)
+                .get::<chrono::NaiveDate, _>(idx)
                 .map(TargetSqlValue::Date)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
             "time" => row
-                .try_get::<chrono::NaiveTime, _>(idx)
+                .get::<chrono::NaiveTime, _>(idx)
                 .map(TargetSqlValue::Time)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
             "datetime" | "timestamp" => row
-                .try_get::<chrono::NaiveDateTime, _>(idx)
+                .get::<chrono::NaiveDateTime, _>(idx)
                 .map(TargetSqlValue::DateTime)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
 
             // UUID (MySQL stores as CHAR(36))
             "uuid" => row
-                .try_get::<String, _>(idx)
-                .ok()
+                .get::<String, _>(idx)
                 .and_then(|s| uuid::Uuid::parse_str(&s).ok())
                 .map(TargetSqlValue::Uuid)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Uuid)),
 
             // Default to string
             _ => row
-                .try_get::<String, _>(idx)
+                .get::<String, _>(idx)
                 .map(TargetSqlValue::String)
                 .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
         }
@@ -428,25 +456,25 @@ impl MysqlReader {
 #[async_trait]
 impl SourceReader for MysqlReader {
     async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
-        // CAST to CHAR to handle collation differences where information_schema
-        // may return VARBINARY instead of VARCHAR
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = r#"
-            SELECT CAST(TABLE_NAME AS CHAR(255)) AS TABLE_NAME
+            SELECT TABLE_NAME
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
             ORDER BY TABLE_NAME
         "#;
 
-        let rows: Vec<MySqlRow> = sqlx::query(query)
-            .bind(schema)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "extracting MySQL schema"))?;
+        let rows: Vec<MySqlRow> = conn.exec(query, (schema,)).await?;
 
         let mut tables = Vec::new();
 
         for row in rows {
-            let table_name: String = row.get("TABLE_NAME");
+            let table_name: String = row.get("TABLE_NAME").unwrap_or_default();
 
             let mut table = Table {
                 schema: schema.to_string(),
@@ -476,11 +504,16 @@ impl SourceReader for MysqlReader {
     }
 
     async fn load_indexes(&self, table: &mut Table) -> Result<()> {
-        // CAST to CHAR to handle collation differences
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = r#"
             SELECT
-                CAST(INDEX_NAME AS CHAR(255)) AS INDEX_NAME,
-                GROUP_CONCAT(CAST(COLUMN_NAME AS CHAR(255)) ORDER BY SEQ_IN_INDEX) AS columns,
+                INDEX_NAME,
+                GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns,
                 IF(NON_UNIQUE = 0, 1, 0) AS is_unique
             FROM INFORMATION_SCHEMA.STATISTICS
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -488,17 +521,12 @@ impl SourceReader for MysqlReader {
             GROUP BY INDEX_NAME, NON_UNIQUE
         "#;
 
-        let rows: Vec<MySqlRow> = sqlx::query(query)
-            .bind(&table.schema)
-            .bind(&table.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "loading MySQL indexes"))?;
+        let rows: Vec<MySqlRow> = conn.exec(query, (&table.schema, &table.name)).await?;
 
         for row in rows {
-            let name: String = row.get("INDEX_NAME");
-            let columns_str: String = row.get("columns");
-            let is_unique: i32 = row.get("is_unique");
+            let name: String = row.get("INDEX_NAME").unwrap_or_default();
+            let columns_str: String = row.get("columns").unwrap_or_default();
+            let is_unique: i32 = row.get("is_unique").unwrap_or(0);
 
             let columns: Vec<String> = columns_str.split(',').map(|s| s.to_string()).collect();
 
@@ -521,14 +549,19 @@ impl SourceReader for MysqlReader {
     }
 
     async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
-        // CAST to CHAR to handle collation differences
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = r#"
             SELECT
-                CAST(rc.CONSTRAINT_NAME AS CHAR(255)) AS CONSTRAINT_NAME,
-                CAST(kcu.COLUMN_NAME AS CHAR(255)) AS COLUMN_NAME,
-                CAST(kcu.REFERENCED_TABLE_SCHEMA AS CHAR(255)) AS REFERENCED_TABLE_SCHEMA,
-                CAST(kcu.REFERENCED_TABLE_NAME AS CHAR(255)) AS REFERENCED_TABLE_NAME,
-                CAST(kcu.REFERENCED_COLUMN_NAME AS CHAR(255)) AS REFERENCED_COLUMN_NAME
+                rc.CONSTRAINT_NAME,
+                kcu.COLUMN_NAME,
+                kcu.REFERENCED_TABLE_SCHEMA,
+                kcu.REFERENCED_TABLE_NAME,
+                kcu.REFERENCED_COLUMN_NAME
             FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
                 ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
@@ -538,23 +571,17 @@ impl SourceReader for MysqlReader {
             ORDER BY rc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
         "#;
 
-        let rows: Vec<MySqlRow> = sqlx::query(query)
-            .bind(&table.schema)
-            .bind(&table.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "loading MySQL foreign keys"))?;
+        let rows: Vec<MySqlRow> = conn.exec(query, (&table.schema, &table.name)).await?;
 
         // Group by constraint name
-        let mut fk_map: std::collections::HashMap<String, ForeignKey> =
-            std::collections::HashMap::new();
+        let mut fk_map: HashMap<String, ForeignKey> = HashMap::new();
 
         for row in rows {
-            let name: String = row.get("CONSTRAINT_NAME");
-            let column: String = row.get("COLUMN_NAME");
-            let ref_schema: String = row.get("REFERENCED_TABLE_SCHEMA");
-            let ref_table: String = row.get("REFERENCED_TABLE_NAME");
-            let ref_column: String = row.get("REFERENCED_COLUMN_NAME");
+            let name: String = row.get("CONSTRAINT_NAME").unwrap_or_default();
+            let column: String = row.get("COLUMN_NAME").unwrap_or_default();
+            let ref_schema: String = row.get("REFERENCED_TABLE_SCHEMA").unwrap_or_default();
+            let ref_table: String = row.get("REFERENCED_TABLE_NAME").unwrap_or_default();
+            let ref_column: String = row.get("REFERENCED_COLUMN_NAME").unwrap_or_default();
 
             let fk = fk_map.entry(name.clone()).or_insert_with(|| ForeignKey {
                 name,
@@ -582,13 +609,17 @@ impl SourceReader for MysqlReader {
     }
 
     async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         // MySQL 8.0+ supports check constraints via INFORMATION_SCHEMA.CHECK_CONSTRAINTS
-        // For older versions, this returns empty
-        // CAST to CHAR to handle collation differences
         let query = r#"
             SELECT
-                CAST(cc.CONSTRAINT_NAME AS CHAR(255)) AS CONSTRAINT_NAME,
-                CAST(cc.CHECK_CLAUSE AS CHAR(4000)) AS CHECK_CLAUSE
+                cc.CONSTRAINT_NAME,
+                cc.CHECK_CLAUSE
             FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc
             JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
                 ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
@@ -597,17 +628,14 @@ impl SourceReader for MysqlReader {
               AND tc.CONSTRAINT_TYPE = 'CHECK'
         "#;
 
-        let result: std::result::Result<Vec<MySqlRow>, _> = sqlx::query(query)
-            .bind(&table.schema)
-            .bind(&table.name)
-            .fetch_all(&self.pool)
-            .await;
-
         // Silently ignore if CHECK_CONSTRAINTS table doesn't exist (MySQL < 8.0)
-        if let Ok(rows) = result {
+        if let Ok(rows) = conn
+            .exec::<MySqlRow, _, _>(query, (&table.schema, &table.name))
+            .await
+        {
             for row in rows {
-                let name: String = row.get("CONSTRAINT_NAME");
-                let expression: String = row.get("CHECK_CLAUSE");
+                let name: String = row.get("CONSTRAINT_NAME").unwrap_or_default();
+                let expression: String = row.get("CHECK_CLAUSE").unwrap_or_default();
 
                 table.check_constraints.push(CheckConstraint {
                     name,
@@ -658,6 +686,12 @@ impl SourceReader for MysqlReader {
             }]);
         }
 
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let pk_col = &table.primary_key[0];
         let query = format!(
             "SELECT MIN({}) AS min_pk, MAX({}) AS max_pk FROM {}.{}",
@@ -667,51 +701,61 @@ impl SourceReader for MysqlReader {
             Self::quote_ident(&table.name)
         );
 
-        let row: MySqlRow = sqlx::query(&query)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting partition boundaries"))?;
+        let row: Option<MySqlRow> = conn.query_first(&query).await?;
 
-        let min_pk: Option<i64> = row.try_get("min_pk").ok();
-        let max_pk: Option<i64> = row.try_get("max_pk").ok();
+        match row {
+            Some(row) => {
+                let min_pk: Option<i64> = row.get("min_pk");
+                let max_pk: Option<i64> = row.get("max_pk");
 
-        match (min_pk, max_pk) {
-            (Some(min), Some(max)) if max > min => {
-                let range = max - min;
-                let partition_size = range / num_partitions as i64;
-                let rows_per_partition = table.row_count / num_partitions as i64;
+                match (min_pk, max_pk) {
+                    (Some(min), Some(max)) if max > min => {
+                        let range = max - min;
+                        let partition_size = range / num_partitions as i64;
+                        let rows_per_partition = table.row_count / num_partitions as i64;
 
-                let partitions: Vec<Partition> = (0..num_partitions)
-                    .map(|i| {
-                        let start = if i == 0 {
-                            None
-                        } else {
-                            Some(min + (i as i64 * partition_size))
-                        };
-                        let end = if i == num_partitions - 1 {
-                            None
-                        } else {
-                            Some(min + ((i + 1) as i64 * partition_size))
-                        };
-                        Partition {
-                            table_name: table.full_name(),
-                            partition_id: i as i32,
-                            min_pk: start,
-                            max_pk: end,
-                            start_row: i as i64 * rows_per_partition,
-                            end_row: if i == num_partitions - 1 {
-                                table.row_count
-                            } else {
-                                (i + 1) as i64 * rows_per_partition
-                            },
-                            row_count: rows_per_partition,
-                        }
-                    })
-                    .collect();
+                        let partitions: Vec<Partition> = (0..num_partitions)
+                            .map(|i| {
+                                let start = if i == 0 {
+                                    None
+                                } else {
+                                    Some(min + (i as i64 * partition_size))
+                                };
+                                let end = if i == num_partitions - 1 {
+                                    None
+                                } else {
+                                    Some(min + ((i + 1) as i64 * partition_size))
+                                };
+                                Partition {
+                                    table_name: table.full_name(),
+                                    partition_id: i as i32,
+                                    min_pk: start,
+                                    max_pk: end,
+                                    start_row: i as i64 * rows_per_partition,
+                                    end_row: if i == num_partitions - 1 {
+                                        table.row_count
+                                    } else {
+                                        (i + 1) as i64 * rows_per_partition
+                                    },
+                                    row_count: rows_per_partition,
+                                }
+                            })
+                            .collect();
 
-                Ok(partitions)
+                        Ok(partitions)
+                    }
+                    _ => Ok(vec![Partition {
+                        table_name: table.full_name(),
+                        partition_id: 0,
+                        min_pk: None,
+                        max_pk: None,
+                        start_row: 0,
+                        end_row: table.row_count,
+                        row_count: table.row_count,
+                    }]),
+                }
             }
-            _ => Ok(vec![Partition {
+            None => Ok(vec![Partition {
                 table_name: table.full_name(),
                 partition_id: 0,
                 min_pk: None,
@@ -724,21 +768,29 @@ impl SourceReader for MysqlReader {
     }
 
     async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = format!(
             "SELECT COUNT(*) AS cnt FROM {}.{}",
             Self::quote_ident(schema),
             Self::quote_ident(table)
         );
 
-        let row: MySqlRow = sqlx::query(&query)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting row count"))?;
-
-        Ok(row.get::<i64, _>("cnt"))
+        let count: Option<i64> = conn.query_first(&query).await?;
+        Ok(count.unwrap_or(0))
     }
 
     async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection"))?;
+
         let query = format!(
             "SELECT MAX({}) AS max_pk FROM {}.{}",
             Self::quote_ident(pk_col),
@@ -746,16 +798,12 @@ impl SourceReader for MysqlReader {
             Self::quote_ident(table)
         );
 
-        let row: MySqlRow = sqlx::query(&query)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| MigrateError::pool(e, "getting max PK"))?;
+        let max_pk: Option<i64> = conn.query_first(&query).await?;
 
-        row.try_get::<i64, _>("max_pk")
-            .map_err(|_| MigrateError::Transfer {
-                table: format!("{}.{}", schema, table),
-                message: "Failed to get max PK value".to_string(),
-            })
+        max_pk.ok_or_else(|| MigrateError::Transfer {
+            table: format!("{}.{}", schema, table),
+            message: "Failed to get max PK value".to_string(),
+        })
     }
 
     fn db_type(&self) -> &str {
@@ -763,11 +811,10 @@ impl SourceReader for MysqlReader {
     }
 
     async fn close(&self) {
-        self.pool.close().await;
+        self.pool.clone().disconnect().await.ok();
     }
 
     fn supports_direct_copy(&self) -> bool {
-        // MySQL doesn't support the same direct copy optimization as MSSQL
         false
     }
 }
@@ -782,7 +829,7 @@ enum LastPkValue {
 
 impl MysqlReader {
     async fn read_table_impl(
-        pool: MySqlPool,
+        pool: Pool,
         opts: ReadOptions,
         batch_size: usize,
         tx: mpsc::Sender<Result<Batch>>,
@@ -800,11 +847,11 @@ impl MysqlReader {
             Self::quote_ident(&opts.table)
         );
 
-        // Track last PK value for keyset pagination (supports both int and text PKs)
+        // Track last PK value for keyset pagination
         let mut last_pk: Option<LastPkValue> = opts.min_pk.map(LastPkValue::Int);
-        // Track offset for fallback pagination when keyset isn't possible
+        // Track offset for fallback pagination
         let mut offset: usize = 0;
-        // Whether to use offset-based pagination (set after first batch if PK isn't usable)
+        // Whether to use offset-based pagination
         let mut use_offset_pagination = false;
 
         // Get PK column name from pk_idx
@@ -812,12 +859,17 @@ impl MysqlReader {
             .pk_idx
             .and_then(|idx| columns.get(idx).map(|s| s.as_str()));
 
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting MySQL connection for read"))?;
+
         loop {
             let mut query = format!("SELECT {} FROM {}", col_list, table_ref);
 
             let mut conditions = Vec::new();
 
-            // Build keyset pagination condition if we have a last PK value
+            // Build keyset pagination condition
             if !use_offset_pagination {
                 if let (Some(pk), Some(ref lpk)) = (pk_col, &last_pk) {
                     match lpk {
@@ -825,7 +877,6 @@ impl MysqlReader {
                             conditions.push(format!("{} > {}", Self::quote_ident(pk), v));
                         }
                         LastPkValue::Text(v) => {
-                            // Properly escape the string value for SQL
                             let escaped = v.replace('\'', "''");
                             conditions.push(format!("{} > '{}'", Self::quote_ident(pk), escaped));
                         }
@@ -857,10 +908,7 @@ impl MysqlReader {
                 query.push_str(&format!(" OFFSET {}", offset));
             }
 
-            let rows: Vec<MySqlRow> = sqlx::query(&query)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| MigrateError::pool(e, "reading MySQL rows"))?;
+            let rows: Vec<MySqlRow> = conn.query(&query).await?;
 
             if rows.is_empty() {
                 break;
@@ -887,7 +935,7 @@ impl MysqlReader {
                 .map(|row| Self::row_to_values(row, &col_meta))
                 .collect();
 
-            // Track last PK for keyset pagination (supports multiple types)
+            // Track last PK for keyset pagination
             let last_key = opts.pk_idx.and_then(|idx| {
                 batch_rows.last().and_then(|row| match &row[idx] {
                     SqlValue::I64(v) => Some(SqlValue::I64(*v)),
@@ -898,7 +946,7 @@ impl MysqlReader {
                 })
             });
 
-            // Update last_pk for next iteration - now supports text PKs
+            // Update last_pk for next iteration
             let new_last_pk: Option<LastPkValue> = opts.pk_idx.and_then(|idx| {
                 batch_rows.last().and_then(|row| match &row[idx] {
                     SqlValue::I64(v) => Some(LastPkValue::Int(*v)),
@@ -909,7 +957,7 @@ impl MysqlReader {
                 })
             });
 
-            // If we couldn't extract a PK value for keyset pagination, fall back to OFFSET
+            // Fall back to OFFSET if keyset pagination isn't possible
             if new_last_pk.is_none() && pk_col.is_some() && !use_offset_pagination {
                 debug!(
                     "Table {}.{}: PK type not suitable for keyset pagination, falling back to OFFSET",
@@ -956,7 +1004,6 @@ mod tests {
 
     #[test]
     fn test_null_type_for() {
-        // Basic test for null type mapping
         assert!(matches!(
             MysqlReader::null_type_for("int"),
             SqlNullType::I32
