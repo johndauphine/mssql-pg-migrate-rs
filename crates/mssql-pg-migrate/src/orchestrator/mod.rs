@@ -1373,8 +1373,14 @@ impl Orchestrator {
         if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
             for table in tables {
                 if !table.primary_key.is_empty() {
-                    debug!("Creating PK for: {}", table.full_name());
+                    info!(
+                        "Creating primary key on {}: {:?}",
+                        table.full_name(),
+                        table.primary_key
+                    );
                     self.target.create_primary_key(table, target_schema).await?;
+                } else {
+                    debug!("Skipping PK creation for {} (no primary key)", table.full_name());
                 }
             }
         }
