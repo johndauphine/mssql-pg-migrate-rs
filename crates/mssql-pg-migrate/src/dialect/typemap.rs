@@ -1103,8 +1103,8 @@ impl ToCanonical for MssqlToCanonical {
 
             // Decimal/numeric
             "decimal" | "numeric" => {
-                let p = if precision > 0 { precision as u8 } else { 18 };
-                let s = scale as u8;
+                let p = if precision > 0 { precision as u16 } else { 18 };
+                let s = scale as u16;
                 CanonicalTypeInfo::lossless(CanonicalType::Decimal {
                     precision: p,
                     scale: s,
@@ -1357,7 +1357,7 @@ impl FromCanonical for MssqlFromCanonical {
     }
 }
 
-/// PostgreSQL to canonical type converter.
+/// Canonical to PostgreSQL type converter.
 #[derive(Debug, Clone, Default)]
 pub struct PostgresFromCanonical;
 
@@ -1564,8 +1564,8 @@ impl ToCanonical for PostgresToCanonical {
 
             // Decimal/numeric
             "numeric" | "decimal" => {
-                let p = if precision > 0 { precision as u8 } else { 38 };
-                let s = scale as u8;
+                let p = if precision > 0 { precision as u16 } else { 38 };
+                let s = scale as u16;
                 CanonicalTypeInfo::lossless(CanonicalType::Decimal {
                     precision: p,
                     scale: s,
@@ -1683,10 +1683,27 @@ impl ToCanonical for MysqlToCanonical {
     ) -> CanonicalTypeInfo {
         let mysql_lower = data_type.to_lowercase();
 
+        // Detect MySQL boolean types.
+        //
+        // MySQL represents BOOLEAN as TINYINT(1). Depending on how columns are
+        // introspected, we may see either:
+        //   - DATA_TYPE = 'tinyint' with max_length coming from CHARACTER_MAXIMUM_LENGTH
+        //   - COLUMN_TYPE like 'tinyint(1)' (possibly with modifiers)
+        //
+        // We treat a column as boolean if:
+        //   * it is declared as BOOL/BOOLEAN, or
+        //   * it is a TINYINT whose display width is 1, as indicated either by
+        //     max_length == 1 or by '(1)' appearing in the type string.
+        let is_tinyint_bool = mysql_lower.starts_with("tinyint")
+            && (max_length == 1 || mysql_lower == "tinyint(1)" || mysql_lower.contains("(1)"));
+
         match mysql_lower.as_str() {
             // Boolean (MySQL uses TINYINT(1) for bool)
-            "tinyint" if max_length == 1 => CanonicalTypeInfo::lossless(CanonicalType::Boolean),
             "bool" | "boolean" => CanonicalTypeInfo::lossless(CanonicalType::Boolean),
+            "tinyint" if is_tinyint_bool => CanonicalTypeInfo::lossless(CanonicalType::Boolean),
+            t if t.starts_with("tinyint") && is_tinyint_bool => {
+                CanonicalTypeInfo::lossless(CanonicalType::Boolean)
+            }
 
             // Integer types
             "tinyint" => CanonicalTypeInfo::lossless(CanonicalType::UInt8),
@@ -1703,8 +1720,8 @@ impl ToCanonical for MysqlToCanonical {
 
             // Decimal/numeric
             "decimal" | "numeric" | "dec" | "fixed" => {
-                let p = if precision > 0 { precision as u8 } else { 10 };
-                let s = scale as u8;
+                let p = if precision > 0 { precision as u16 } else { 10 };
+                let s = scale as u16;
                 CanonicalTypeInfo::lossless(CanonicalType::Decimal {
                     precision: p,
                     scale: s,
@@ -1851,10 +1868,8 @@ impl FromCanonical for MysqlFromCanonical {
             CanonicalType::Varchar(len) => {
                 if *len == 0 || *len > 65535 {
                     TypeMapping::lossless("LONGTEXT")
-                } else if *len <= 65535 {
-                    TypeMapping::lossless(format!("VARCHAR({})", len))
                 } else {
-                    TypeMapping::lossless("LONGTEXT")
+                    TypeMapping::lossless(format!("VARCHAR({})", len))
                 }
             }
             CanonicalType::Text => TypeMapping::lossless("LONGTEXT"),

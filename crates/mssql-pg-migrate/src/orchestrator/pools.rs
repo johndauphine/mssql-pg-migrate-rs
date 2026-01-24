@@ -500,8 +500,13 @@ impl TargetPoolImpl {
                     || source_type == "postgresql"
                     || source_type == "pg"
                 {
+                    // PostgreSQL → MySQL
                     writer.with_type_mapper(Arc::new(PostgresToMysqlMapper::new()))
+                } else if source_type == "mysql" || source_type == "mariadb" {
+                    // MySQL/MariaDB → MySQL: no type mapper needed (identity mapping)
+                    writer
                 } else {
+                    // Default: MSSQL/SQL Server → MySQL
                     writer.with_type_mapper(Arc::new(MssqlToMysqlMapper::new()))
                 };
                 Ok(Self::Mysql(Arc::new(writer)))

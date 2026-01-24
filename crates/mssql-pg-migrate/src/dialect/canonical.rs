@@ -56,10 +56,10 @@ pub enum CanonicalType {
     /// Exact decimal with precision and scale.
     /// Precision is total digits, scale is digits after decimal point.
     Decimal {
-        /// Total number of digits (1-65 for MySQL, 1-38 for MSSQL, unlimited for PG).
-        precision: u8,
+        /// Total number of digits (1-65 for MySQL, 1-38 for MSSQL, larger/unlimited for PG).
+        precision: u16,
         /// Number of digits after decimal point.
-        scale: u8,
+        scale: u16,
     },
     /// Money type with fixed precision (19,4).
     Money,
