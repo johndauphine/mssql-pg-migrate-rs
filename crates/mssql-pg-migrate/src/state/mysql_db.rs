@@ -197,10 +197,10 @@ impl MysqlStateBackend {
         for row in rows {
             let table_name: String = row.get("table_name").unwrap_or_default();
             let table_status_str: String = row.get("table_status").unwrap_or_default();
-            let rows_total: i64 = row.get("rows_total").unwrap_or(0);
-            let rows_transferred: i64 = row.get("rows_transferred").unwrap_or(0);
-            let rows_skipped: i64 = row.get("rows_skipped").unwrap_or(0);
-            let last_pk: Option<i64> = row.get("last_pk");
+            let rows_total: i64 = row.get::<Option<i64>, _>("rows_total").flatten().unwrap_or(0);
+            let rows_transferred: i64 = row.get::<Option<i64>, _>("rows_transferred").flatten().unwrap_or(0);
+            let rows_skipped: i64 = row.get::<Option<i64>, _>("rows_skipped").flatten().unwrap_or(0);
+            let last_pk: Option<i64> = row.get::<Option<i64>, _>("last_pk").flatten();
             let last_sync_timestamp: Option<DateTime<Utc>> = row
                 .get::<Option<chrono::NaiveDateTime>, _>("last_sync_timestamp")
                 .flatten()
@@ -209,7 +209,7 @@ impl MysqlStateBackend {
                 .get::<Option<chrono::NaiveDateTime>, _>("table_completed_at")
                 .flatten()
                 .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc));
-            let error: Option<String> = row.get("error");
+            let error: Option<String> = row.get::<Option<String>, _>("error").flatten();
 
             tables.insert(
                 table_name,
