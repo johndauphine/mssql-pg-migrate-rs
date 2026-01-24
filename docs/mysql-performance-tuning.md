@@ -47,18 +47,28 @@ When enabled, the writer streams batch data as tab-separated values (TSV) direct
 | Batched INSERT | Baseline |
 | LOAD DATA | **26% faster** |
 
-#### Full Migration (Parallel, Multiple Tables)
+#### Full Migration Results by Worker Count
 
-| Method | Total Time | Throughput | Result |
-|--------|------------|------------|--------|
-| Batched INSERT | 120.7s | 33,387 rows/sec | **Winner** |
-| LOAD DATA | ~145s | ~28,000 rows/sec | 20% slower |
+| Workers | Method | Total Time | Throughput | Winner |
+|---------|--------|------------|------------|--------|
+| 1 | LOAD DATA | 117.7s | 34,231 rows/sec | **LOAD DATA +2%** |
+| 1 | INSERT | 120.1s | 33,543 rows/sec | |
+| 2 | LOAD DATA | 128.5s | 31,344 rows/sec | |
+| 2 | INSERT | 119.6s | 33,673 rows/sec | **INSERT +7%** |
+| 4 | LOAD DATA | ~145s | ~28,000 rows/sec | |
+| 4 | INSERT | 120.7s | 33,387 rows/sec | **INSERT +20%** |
 
-### Why LOAD DATA Loses in Parallel Mode
+### Analysis: Why Worker Count Matters
 
+**With 1 worker:** LOAD DATA wins because:
+- No CPU contention with other workers
+- TSV generation happens sequentially, allowing efficient streaming
+- MySQL can ingest data without lock contention
+
+**With 2+ workers:** INSERT wins because:
 1. **TSV escaping is CPU-intensive** - Converting values to TSV format with proper escaping consumes significant CPU
-2. **CPU contention** - TSV generation competes with reader threads for CPU cycles
-3. **Batched INSERT is already optimized** - Multi-row INSERT statements are highly efficient
+2. **CPU contention** - Multiple TSV generators compete for CPU cycles
+3. **Batched INSERT is already optimized** - Multi-row INSERT statements are highly efficient and parallelize well
 
 ### When to Use LOAD DATA
 
@@ -154,8 +164,8 @@ migration:
 
 | Feature | Performance Impact | Best Use Case |
 |---------|-------------------|---------------|
-| `mysql_load_data: always` | +26% single table, -20% parallel | Low parallelism, large text tables |
+| `mysql_load_data: always` | +2% with 1 worker, -7% to -20% with 2+ workers | Single worker, large text tables |
 | `compress_text: true` | -4% throughput, lower memory | Memory-constrained environments |
 | Default settings | Optimal for most cases | General workloads |
 
-The default configuration (batched INSERT, no compression) provides the best performance for most migration scenarios. Only enable LOAD DATA or compression when specific constraints require them.
+The default configuration (batched INSERT, no compression) provides the best performance for most migration scenarios. LOAD DATA is only faster when using a single worker, where it provides a modest 2% improvement. With multiple workers, INSERT significantly outperforms LOAD DATA due to CPU contention from TSV generation.
