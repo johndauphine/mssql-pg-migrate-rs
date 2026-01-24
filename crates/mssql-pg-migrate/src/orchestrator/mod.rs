@@ -559,12 +559,23 @@ impl Orchestrator {
             .unwrap_or_else(|| MigrationState::new(run_id.clone(), self.config.hash()));
 
         // Initialize table states
+        // In drop_recreate mode: always reset table state (tables are dropped, no resume)
+        // In upsert mode: preserve existing state (for crash recovery)
+        let is_drop_recreate = self.config.migration.target_mode == TargetMode::DropRecreate;
         for table in &tables {
             let table_name = table.full_name();
-            state
-                .tables
-                .entry(table_name.clone())
-                .or_insert_with(|| TableState::new(table.row_count));
+            if is_drop_recreate {
+                // Always reset state in drop_recreate mode
+                state
+                    .tables
+                    .insert(table_name.clone(), TableState::new(table.row_count));
+            } else {
+                // Preserve existing state in upsert mode
+                state
+                    .tables
+                    .entry(table_name.clone())
+                    .or_insert_with(|| TableState::new(table.row_count));
+            }
         }
 
         // Phase 2: Prepare target (skip in dry-run)
@@ -926,16 +937,18 @@ impl Orchestrator {
             && !self.config.migration.date_updated_columns.is_empty();
 
         // Filter tables that need processing
-        // For incremental sync: process all tables (using date filters for completed ones)
-        // For resume: skip completed tables (crash recovery)
+        // - drop_recreate mode: always process all tables (tables are dropped anyway)
+        // - incremental sync (upsert + date columns): process all tables (using date filters)
+        // - upsert without date columns: skip completed tables (crash recovery only)
+        let is_drop_recreate = self.config.migration.target_mode == TargetMode::DropRecreate;
         let pending_tables: Vec<_> = tables
             .iter()
             .filter(|t| {
-                if date_incremental_enabled {
-                    // Incremental sync: process all tables
+                if is_drop_recreate || date_incremental_enabled {
+                    // drop_recreate or incremental sync: process all tables
                     true
                 } else {
-                    // Resume: skip completed tables
+                    // Upsert crash recovery: skip completed tables
                     let table_name = t.full_name();
                     state
                         .tables
