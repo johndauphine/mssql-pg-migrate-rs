@@ -1387,6 +1387,7 @@ impl Orchestrator {
                 .collect();
 
             if !tables_with_pk.is_empty() {
+                let pk_start = Instant::now();
                 info!(
                     "Creating {} primary keys with up to {} concurrent tasks",
                     tables_with_pk.len(),
@@ -1401,13 +1402,18 @@ impl Orchestrator {
 
                     let handle = tokio::spawn(async move {
                         let _permit = permit;
-                        debug!(
-                            "Creating primary key on {}: {:?}",
-                            table.full_name(),
-                            table.primary_key
-                        );
+                        let start = Instant::now();
+                        let table_name = table.full_name();
+                        let row_count = table.row_count;
                         if let Err(e) = target.create_primary_key(&table, &schema).await {
-                            warn!("Failed to create PK on {}: {}", table.full_name(), e);
+                            warn!("Failed to create PK on {}: {}", table_name, e);
+                        } else {
+                            info!(
+                                "Created PK on {} ({} rows) in {:.2}s",
+                                table_name,
+                                row_count,
+                                start.elapsed().as_secs_f64()
+                            );
                         }
                     });
                     handles.push(handle);
@@ -1418,6 +1424,7 @@ impl Orchestrator {
                         warn!("PK creation task panicked: {}", e);
                     }
                 }
+                info!("Primary keys created in {:.2}s", pk_start.elapsed().as_secs_f64());
             }
         }
 
