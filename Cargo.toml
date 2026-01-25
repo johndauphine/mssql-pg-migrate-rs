@@ -58,8 +58,6 @@ futures = "0.3"
 async-trait = "0.1"
 async-channel = "2.3"
 
-# Concurrency
-parking_lot = "0.12"
 
 # Decimal handling
 rust_decimal = { version = "1.36", features = ["db-tokio-postgres"] }
@@ -76,7 +74,6 @@ hex = "0.4"
 
 # Connection pooling
 bb8 = "0.8"
-deadpool = "0.12"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
