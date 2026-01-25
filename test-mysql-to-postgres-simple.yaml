@@ -1,0 +1,26 @@
+# Test: MySQL → PostgreSQL (single table)
+source:
+  type: mysql
+  host: localhost
+  port: 3306
+  database: test_db
+  schema: test_db
+  user: root
+  password: "MySqlPassword123"
+  encrypt: false
+
+target:
+  type: postgres
+  host: localhost
+  port: 5433
+  database: stackoverflow_test
+  schema: mysql_test
+  user: postgres
+  password: PostgresPassword123
+
+migration:
+  target_mode: drop_recreate
+  workers: 2
+  chunk_size: 10000
+  include_tables:
+    - TestItems
