@@ -224,6 +224,9 @@ impl MssqlWriter {
         cols: &[String],
         rows: Vec<Vec<TargetSqlValue>>,
     ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
             .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
@@ -244,6 +247,9 @@ impl MssqlWriter {
         writer_id: usize,
         partition_id: Option<i32>,
     ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
             .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
