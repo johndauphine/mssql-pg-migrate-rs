@@ -923,7 +923,7 @@ impl Orchestrator {
             parallel_readers: self.config.migration.get_parallel_readers(),
             parallel_writers: self.config.migration.get_write_ahead_writers(),
             use_copy_binary: true, // Enable COPY TO BINARY for PostgreSQL sources
-            use_direct_copy: false, // Disabled - upsert writers don't support direct copy yet
+            use_direct_copy: true, // Enable direct COPY encoding for MSSQL->PG upsert
             compress_text: self.config.migration.compress_text,
         };
 
