@@ -15,7 +15,7 @@
 //! - Use [`crate::drivers::PostgresWriter`] instead of the old `PgPool`
 //! - Use [`crate::drivers::MssqlWriter`] instead of the old `MssqlTargetPool`
 
-use crate::error::{MigrateError, Result};
+use crate::error::Result;
 use async_trait::async_trait;
 
 /// Trait for a stateful upsert writer that holds a connection.
@@ -28,30 +28,6 @@ pub trait UpsertWriter: Send {
         pk_cols: &[String],
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<u64>;
-
-    /// Upsert pre-encoded COPY binary data directly.
-    ///
-    /// This is the high-performance path that bypasses SqlValue encoding.
-    /// The `copy_data` must be valid PostgreSQL COPY binary format.
-    /// Default implementation falls back to upsert_chunk (for MSSQL target).
-    async fn upsert_chunk_direct(
-        &mut self,
-        _cols: &[String],
-        _pk_cols: &[String],
-        _copy_data: bytes::Bytes,
-        _row_count: usize,
-    ) -> Result<u64> {
-        // Default: not supported, caller should use upsert_chunk
-        Err(MigrateError::Transfer {
-            table: "unknown".to_string(),
-            message: "Direct copy not supported for this target".to_string(),
-        })
-    }
-
-    /// Returns true if this writer supports direct copy.
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// SQL value enum for type-safe row handling.

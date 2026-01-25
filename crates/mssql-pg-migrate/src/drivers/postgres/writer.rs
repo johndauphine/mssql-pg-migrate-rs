@@ -1001,10 +1001,6 @@ impl TargetWriter for PostgresWriter {
     async fn close(&self) {
         // deadpool handles cleanup
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        true
-    }
 }
 
 /// Write a SqlValue as PostgreSQL binary format.

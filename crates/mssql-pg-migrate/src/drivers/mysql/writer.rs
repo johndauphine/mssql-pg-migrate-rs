@@ -960,10 +960,6 @@ impl TargetWriter for MysqlWriter {
     async fn close(&self) {
         self.pool.clone().disconnect().await.ok();
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// Convert SqlValue to mysql_async::Value.

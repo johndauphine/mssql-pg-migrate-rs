@@ -299,15 +299,6 @@ impl SourceReader for SourceReaderImpl {
             SourceReaderImpl::Mysql(r) => r.close().await,
         }
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        match self {
-            SourceReaderImpl::Mssql(r) => r.supports_direct_copy(),
-            SourceReaderImpl::Postgres(r) => r.supports_direct_copy(),
-            #[cfg(feature = "mysql")]
-            SourceReaderImpl::Mysql(r) => r.supports_direct_copy(),
-        }
-    }
 }
 
 impl SourceReaderImpl {
@@ -564,15 +555,6 @@ impl TargetWriter for TargetWriterImpl {
             TargetWriterImpl::Postgres(w) => w.close().await,
             #[cfg(feature = "mysql")]
             TargetWriterImpl::Mysql(w) => w.close().await,
-        }
-    }
-
-    fn supports_direct_copy(&self) -> bool {
-        match self {
-            TargetWriterImpl::Mssql(w) => w.supports_direct_copy(),
-            TargetWriterImpl::Postgres(w) => w.supports_direct_copy(),
-            #[cfg(feature = "mysql")]
-            TargetWriterImpl::Mysql(w) => w.supports_direct_copy(),
         }
     }
 }

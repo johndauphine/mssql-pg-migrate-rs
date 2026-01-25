@@ -139,14 +139,6 @@ pub trait SourceReader: Send + Sync {
 
     /// Close the connection pool.
     async fn close(&self);
-
-    /// Check if this reader supports direct binary copy encoding.
-    ///
-    /// When true, the reader can produce pre-encoded binary data that can
-    /// be written directly to the target without intermediate conversion.
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// Write schema and data to a target database.
@@ -251,11 +243,6 @@ pub trait TargetWriter: Send + Sync {
 
     /// Close the connection pool.
     async fn close(&self);
-
-    /// Check if this writer supports direct binary copy from pre-encoded data.
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// SQL syntax strategy for different database engines.

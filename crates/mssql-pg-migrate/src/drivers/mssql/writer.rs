@@ -842,10 +842,6 @@ impl TargetWriter for MssqlWriter {
     async fn close(&self) {
         // bb8 handles cleanup
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 // Helper functions
