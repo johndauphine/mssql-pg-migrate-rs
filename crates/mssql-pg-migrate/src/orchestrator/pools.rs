@@ -16,19 +16,18 @@ use crate::config::Config;
 #[cfg(not(feature = "kerberos"))]
 use crate::error::MigrateError;
 use crate::error::Result;
-use crate::source::{
-    CheckConstraint, ForeignKey, Index, MssqlPool, Partition, PgSourcePool, SourcePool, Table,
-};
+use crate::core::traits::SourceReader as NewSourceReader;
+use crate::core::traits::TargetWriter as NewTargetWriter;
+use crate::drivers::{MssqlReader, PostgresReader, PostgresWriter};
+use crate::source::{CheckConstraint, ForeignKey, Index, Partition, Table};
 #[cfg(feature = "mysql")]
 use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 #[cfg(not(feature = "mysql"))]
 use crate::state::{DbStateBackend, MssqlStateBackend, StateBackendEnum};
-use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
+use crate::target::{MssqlTargetPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "mysql")]
-use crate::core::traits::{SourceReader as NewSourceReader, TargetWriter as NewTargetWriter};
 #[cfg(feature = "mysql")]
 use crate::core::value::{Batch, SqlNullType as NewSqlNullType, SqlValue as NewSqlValue};
 #[cfg(feature = "mysql")]
@@ -161,8 +160,8 @@ impl UpsertWriter for MysqlUpsertWriter {
 
 /// Enum wrapper for source pool implementations.
 pub enum SourcePoolImpl {
-    Mssql(Arc<MssqlPool>),
-    Postgres(Arc<PgSourcePool>),
+    Mssql(Arc<MssqlReader>),
+    Postgres(Arc<PostgresReader>),
     #[cfg(feature = "mysql")]
     Mysql(Arc<MysqlReader>),
 }
@@ -174,10 +173,10 @@ impl SourcePoolImpl {
         let source_type = config.source.r#type.to_lowercase();
 
         if source_type == "postgres" || source_type == "postgresql" || source_type == "pg" {
-            // PostgreSQL source - native tokio-postgres only
+            // PostgreSQL source - native tokio-postgres only via PostgresReader
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
-            let pool = PgSourcePool::new(&config.source, pool_size as usize).await?;
-            Ok(Self::Postgres(Arc::new(pool)))
+            let reader = PostgresReader::new(&config.source, pool_size as usize).await?;
+            Ok(Self::Postgres(Arc::new(reader)))
         } else if source_type == "mysql" || source_type == "mariadb" {
             // MySQL/MariaDB source - uses SQLx
             #[cfg(feature = "mysql")]
@@ -195,7 +194,7 @@ impl SourcePoolImpl {
                 ))
             }
         } else {
-            // MSSQL source - uses native Tiberius driver
+            // MSSQL source - uses native Tiberius driver via MssqlReader
             if config.source.auth == AuthMethod::Kerberos {
                 #[cfg(feature = "kerberos")]
                 {
@@ -218,27 +217,27 @@ impl SourcePoolImpl {
                     ));
                 }
             }
-            // Use native Tiberius for all MSSQL connections
-            let pool = MssqlPool::with_max_connections(config.source.clone(), pool_size).await?;
-            Ok(Self::Mssql(Arc::new(pool)))
+            // Use new MssqlReader (Tiberius + bb8)
+            let reader = MssqlReader::with_pool_size(config.source.clone(), pool_size).await?;
+            Ok(Self::Mssql(Arc::new(reader)))
         }
     }
 
     /// Get the database type.
     pub fn db_type(&self) -> &str {
         match self {
-            Self::Mssql(p) => p.db_type(),
-            Self::Postgres(p) => p.db_type(),
+            Self::Mssql(p) => NewSourceReader::db_type(p.as_ref()),
+            Self::Postgres(p) => NewSourceReader::db_type(p.as_ref()),
             #[cfg(feature = "mysql")]
-            Self::Mysql(p) => p.db_type(),
+            Self::Mysql(p) => NewSourceReader::db_type(p.as_ref()),
         }
     }
 
     /// Extract schema information.
     pub async fn extract_schema(&self, schema: &str) -> Result<Vec<Table>> {
         match self {
-            Self::Mssql(p) => p.extract_schema(schema).await,
-            Self::Postgres(p) => p.extract_schema(schema).await,
+            Self::Mssql(p) => NewSourceReader::extract_schema(p.as_ref(), schema).await,
+            Self::Postgres(p) => NewSourceReader::extract_schema(p.as_ref(), schema).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::extract_schema(p.as_ref(), schema).await,
         }
@@ -251,8 +250,12 @@ impl SourcePoolImpl {
         num_partitions: usize,
     ) -> Result<Vec<Partition>> {
         match self {
-            Self::Mssql(p) => p.get_partition_boundaries(table, num_partitions).await,
-            Self::Postgres(p) => p.get_partition_boundaries(table, num_partitions).await,
+            Self::Mssql(p) => {
+                NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await
+            }
+            Self::Postgres(p) => {
+                NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await
+            }
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => {
                 NewSourceReader::get_partition_boundaries(p.as_ref(), table, num_partitions).await
@@ -263,8 +266,8 @@ impl SourcePoolImpl {
     /// Load index metadata for a table.
     pub async fn load_indexes(&self, table: &mut Table) -> Result<()> {
         match self {
-            Self::Mssql(p) => p.load_indexes(table).await,
-            Self::Postgres(p) => p.load_indexes(table).await,
+            Self::Mssql(p) => NewSourceReader::load_indexes(p.as_ref(), table).await,
+            Self::Postgres(p) => NewSourceReader::load_indexes(p.as_ref(), table).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::load_indexes(p.as_ref(), table).await,
         }
@@ -273,8 +276,8 @@ impl SourcePoolImpl {
     /// Load foreign key metadata for a table.
     pub async fn load_foreign_keys(&self, table: &mut Table) -> Result<()> {
         match self {
-            Self::Mssql(p) => p.load_foreign_keys(table).await,
-            Self::Postgres(p) => p.load_foreign_keys(table).await,
+            Self::Mssql(p) => NewSourceReader::load_foreign_keys(p.as_ref(), table).await,
+            Self::Postgres(p) => NewSourceReader::load_foreign_keys(p.as_ref(), table).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::load_foreign_keys(p.as_ref(), table).await,
         }
@@ -283,8 +286,8 @@ impl SourcePoolImpl {
     /// Load check constraint metadata for a table.
     pub async fn load_check_constraints(&self, table: &mut Table) -> Result<()> {
         match self {
-            Self::Mssql(p) => p.load_check_constraints(table).await,
-            Self::Postgres(p) => p.load_check_constraints(table).await,
+            Self::Mssql(p) => NewSourceReader::load_check_constraints(p.as_ref(), table).await,
+            Self::Postgres(p) => NewSourceReader::load_check_constraints(p.as_ref(), table).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::load_check_constraints(p.as_ref(), table).await,
         }
@@ -293,8 +296,8 @@ impl SourcePoolImpl {
     /// Get the row count for a table.
     pub async fn get_row_count(&self, schema: &str, table: &str) -> Result<i64> {
         match self {
-            Self::Mssql(p) => p.get_row_count(schema, table).await,
-            Self::Postgres(p) => p.get_row_count(schema, table).await,
+            Self::Mssql(p) => NewSourceReader::get_row_count(p.as_ref(), schema, table).await,
+            Self::Postgres(p) => NewSourceReader::get_row_count(p.as_ref(), schema, table).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::get_row_count(p.as_ref(), schema, table).await,
         }
@@ -313,8 +316,8 @@ impl SourcePoolImpl {
     /// Close all connections.
     pub async fn close(&self) {
         match self {
-            Self::Mssql(p) => p.close().await,
-            Self::Postgres(p) => p.close().await,
+            Self::Mssql(p) => NewSourceReader::close(p.as_ref()).await,
+            Self::Postgres(p) => NewSourceReader::close(p.as_ref()).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::close(p.as_ref()).await,
         }
@@ -330,7 +333,7 @@ impl SourcePoolImpl {
         col_types: &[String],
     ) -> Result<Vec<Vec<SqlValue>>> {
         match self {
-            Self::Mssql(p) => p.query_rows_fast(sql, columns, col_types).await,
+            Self::Mssql(p) => p.query_rows_fast_for_target(sql, columns, col_types).await,
             Self::Postgres(p) => p.query_rows_fast(sql, columns, col_types).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => p.query_rows_fast(sql, columns, col_types).await,
@@ -384,7 +387,7 @@ impl SourcePoolImpl {
     ) -> Result<i64> {
         match self {
             Self::Postgres(p) => {
-                p.copy_rows_binary(
+                p.copy_rows_binary_for_target(
                     schema, table, columns, col_types, pk_col, min_pk, max_pk, tx, batch_size,
                 )
                 .await
@@ -404,15 +407,15 @@ impl SourcePoolImpl {
     /// Get the maximum value of a primary key column.
     pub async fn get_max_pk(&self, schema: &str, table: &str, pk_col: &str) -> Result<i64> {
         match self {
-            Self::Mssql(p) => p.get_max_pk(schema, table, pk_col).await,
-            Self::Postgres(p) => p.get_max_pk(schema, table, pk_col).await,
+            Self::Mssql(p) => NewSourceReader::get_max_pk(p.as_ref(), schema, table, pk_col).await,
+            Self::Postgres(p) => NewSourceReader::get_max_pk(p.as_ref(), schema, table, pk_col).await,
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => NewSourceReader::get_max_pk(p.as_ref(), schema, table, pk_col).await,
         }
     }
 
-    /// Get the underlying MSSQL pool (for transfer engine compatibility).
-    pub fn as_mssql(&self) -> Option<Arc<MssqlPool>> {
+    /// Get the underlying MSSQL reader.
+    pub fn as_mssql(&self) -> Option<Arc<MssqlReader>> {
         match self {
             Self::Mssql(p) => Some(p.clone()),
             Self::Postgres(_) => None,
@@ -421,8 +424,8 @@ impl SourcePoolImpl {
         }
     }
 
-    /// Get the underlying PostgreSQL source pool.
-    pub fn as_postgres(&self) -> Option<Arc<PgSourcePool>> {
+    /// Get the underlying PostgreSQL source reader.
+    pub fn as_postgres(&self) -> Option<Arc<PostgresReader>> {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
@@ -457,7 +460,7 @@ impl SourcePoolImpl {
 /// Enum wrapper for target pool implementations.
 pub enum TargetPoolImpl {
     Mssql(Arc<MssqlTargetPool>),
-    Postgres(Arc<PgPool>),
+    Postgres(Arc<PostgresWriter>),
     #[cfg(feature = "mysql")]
     Mysql(Arc<MysqlWriter>),
 }
@@ -529,16 +532,10 @@ impl TargetPoolImpl {
                 ))
             }
         } else {
-            // PostgreSQL target - native tokio-postgres only
+            // PostgreSQL target - native tokio-postgres via PostgresWriter
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
-            let pool = PgPool::new(
-                &config.target,
-                max_conns,
-                config.migration.get_copy_buffer_rows(),
-                config.migration.use_binary_copy,
-            )
-            .await?;
-            Ok(Self::Postgres(Arc::new(pool)))
+            let writer = PostgresWriter::new(&config.target, max_conns).await?;
+            Ok(Self::Postgres(Arc::new(writer)))
         }
     }
 
@@ -876,7 +873,7 @@ impl TargetPoolImpl {
     }
 
     /// Get the underlying PostgreSQL pool.
-    pub fn as_postgres(&self) -> Option<Arc<PgPool>> {
+    pub fn as_postgres(&self) -> Option<Arc<PostgresWriter>> {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),

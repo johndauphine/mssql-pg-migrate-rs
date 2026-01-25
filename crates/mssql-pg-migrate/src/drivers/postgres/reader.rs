@@ -21,6 +21,7 @@ use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
 use crate::source::BinaryRowParser;
+use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// PostgreSQL source reader implementation.
 pub struct PostgresReader {
@@ -300,6 +301,229 @@ impl PostgresReader {
         }
 
         Ok(total_rows)
+    }
+
+    /// Read rows using PostgreSQL COPY TO BINARY format.
+    /// Compatible with legacy transfer engine API - sends target::SqlValue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_rows_binary_for_target(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+        col_types: &[String],
+        pk_col: Option<&str>,
+        min_pk: Option<i64>,
+        max_pk: Option<i64>,
+        tx: mpsc::Sender<Vec<Vec<TargetSqlValue>>>,
+        batch_size: usize,
+    ) -> Result<i64> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting connection for copy_rows_binary"))?;
+
+        let query = build_copy_query(schema, table, columns, pk_col, min_pk, max_pk);
+        debug!("COPY query: {}", query);
+
+        let copy_stream = client.copy_out(&query).await.map_err(|e| {
+            MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                format!("initiating COPY: {}", e),
+            )
+        })?;
+
+        let mut parser = BinaryRowParser::from_type_names(col_types);
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut total_rows = 0i64;
+
+        tokio::pin!(copy_stream);
+
+        while let Some(data) = copy_stream.next().await {
+            let bytes = data.map_err(|e| {
+                MigrateError::transfer(
+                    format!("{}.{}", schema, table),
+                    format!("reading COPY data: {}", e),
+                )
+            })?;
+
+            parser.extend(&bytes);
+
+            while let Some(row) = parser.next_row()? {
+                // next_row() returns old SqlValue directly, no conversion needed
+                batch.push(row);
+                total_rows += 1;
+
+                if batch.len() >= batch_size {
+                    if tx.send(std::mem::take(&mut batch)).await.is_err() {
+                        return Err(MigrateError::transfer(
+                            format!("{}.{}", schema, table),
+                            "channel closed while sending COPY batch".to_string(),
+                        ));
+                    }
+                    batch = Vec::with_capacity(batch_size);
+                }
+            }
+        }
+
+        if !batch.is_empty() && tx.send(batch).await.is_err() {
+            return Err(MigrateError::transfer(
+                format!("{}.{}", schema, table),
+                "channel closed while sending final COPY batch".to_string(),
+            ));
+        }
+
+        Ok(total_rows)
+    }
+
+    /// Query rows with pre-computed column types for O(1) lookup.
+    /// Compatible with legacy transfer engine API.
+    /// Returns target::SqlValue for compatibility with transfer engine.
+    pub async fn query_rows_fast(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<TargetSqlValue>>> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "query_rows_fast"))?;
+
+        let rows = client.query(sql, &[]).await?;
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = Self::convert_pg_value_for_target(&row, idx, data_type);
+                values.push(value);
+            }
+            result.push(values);
+        }
+
+        Ok(result)
+    }
+
+    /// Convert a PostgreSQL row value to target::SqlValue for legacy API.
+    fn convert_pg_value_for_target(
+        row: &tokio_postgres::Row,
+        idx: usize,
+        data_type: &str,
+    ) -> TargetSqlValue {
+        use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
+        use rust_decimal::Decimal;
+        use uuid::Uuid;
+
+        let data_type = data_type.to_lowercase();
+
+        // Try to get the value, handling NULL
+        match data_type.as_str() {
+            // Boolean
+            "bool" | "boolean" => row
+                .try_get::<_, bool>(idx)
+                .ok()
+                .map(TargetSqlValue::Bool)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bool)),
+
+            // Integer types
+            "int2" | "smallint" => row
+                .try_get::<_, i16>(idx)
+                .ok()
+                .map(TargetSqlValue::I16)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
+
+            "int4" | "integer" | "int" | "serial" => row
+                .try_get::<_, i32>(idx)
+                .ok()
+                .map(TargetSqlValue::I32)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I32)),
+
+            "int8" | "bigint" | "bigserial" => row
+                .try_get::<_, i64>(idx)
+                .ok()
+                .map(TargetSqlValue::I64)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I64)),
+
+            // Floating point
+            "float4" | "real" => row
+                .try_get::<_, f32>(idx)
+                .ok()
+                .map(TargetSqlValue::F32)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F32)),
+
+            "float8" | "double precision" => row
+                .try_get::<_, f64>(idx)
+                .ok()
+                .map(TargetSqlValue::F64)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F64)),
+
+            // Decimal/numeric
+            "numeric" | "decimal" => row
+                .try_get::<_, Decimal>(idx)
+                .ok()
+                .map(TargetSqlValue::Decimal)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Decimal)),
+
+            // UUID
+            "uuid" => row
+                .try_get::<_, Uuid>(idx)
+                .ok()
+                .map(TargetSqlValue::Uuid)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Uuid)),
+
+            // Date/time types
+            "date" => row
+                .try_get::<_, NaiveDate>(idx)
+                .ok()
+                .map(TargetSqlValue::Date)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
+
+            "time" | "time without time zone" => row
+                .try_get::<_, NaiveTime>(idx)
+                .ok()
+                .map(TargetSqlValue::Time)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
+
+            "timestamp" | "timestamp without time zone" => row
+                .try_get::<_, NaiveDateTime>(idx)
+                .ok()
+                .map(TargetSqlValue::DateTime)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
+
+            "timestamptz" | "timestamp with time zone" => row
+                .try_get::<_, DateTime<FixedOffset>>(idx)
+                .ok()
+                .map(TargetSqlValue::DateTimeOffset)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTimeOffset)),
+
+            // Binary
+            "bytea" => row
+                .try_get::<_, Vec<u8>>(idx)
+                .ok()
+                .map(TargetSqlValue::Bytes)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bytes)),
+
+            // Text/string types (default)
+            _ => row
+                .try_get::<_, String>(idx)
+                .ok()
+                .map(TargetSqlValue::String)
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
+        }
+    }
+
+    /// Test the database connection.
+    pub async fn test_connection(&self) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing PostgreSQL connection"))?;
+        client.simple_query("SELECT 1").await?;
+        Ok(())
     }
 }
 

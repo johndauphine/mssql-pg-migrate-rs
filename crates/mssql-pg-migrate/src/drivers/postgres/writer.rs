@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use chrono::Timelike;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use futures::SinkExt;
 use rustls::ClientConfig;
 use tokio_postgres::Config as PgConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -18,8 +19,10 @@ use tracing::{debug, info, warn};
 use crate::config::TargetConfig;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
-use crate::core::value::{Batch, SqlValue};
+use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
+use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue, UpsertWriter};
+use std::borrow::Cow;
 
 /// Connection pool timeout.
 const POOL_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -174,6 +177,278 @@ impl PostgresWriter {
             col_defs.join(",\n    ")
         )
     }
+
+    // === Backward-compatible methods for legacy transfer engine ===
+
+    /// Get the underlying connection pool for state backend creation.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Test the database connection.
+    pub async fn test_connection(&self) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "testing PostgreSQL connection"))?;
+        client.simple_query("SELECT 1").await?;
+        Ok(())
+    }
+
+    /// Write rows using old SqlValue type (backward compatibility).
+    pub async fn write_chunk(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        rows: Vec<Vec<TargetSqlValue>>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Convert old SqlValue to new SqlValue
+        let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .collect();
+
+        let batch = Batch::new(converted_rows);
+
+        // Call the new write_batch via TargetWriter trait
+        TargetWriter::write_batch(self, schema, table, cols, batch).await
+    }
+
+    /// Upsert rows using old SqlValue type (backward compatibility).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_chunk(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<TargetSqlValue>>,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Convert old SqlValue to new SqlValue
+        let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .collect();
+
+        let batch = Batch::new(converted_rows);
+
+        // Call the new upsert_batch via TargetWriter trait
+        TargetWriter::upsert_batch(self, schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+    }
+
+    /// Get an upsert writer for streaming upserts (backward compatibility).
+    pub async fn get_upsert_writer(
+        &self,
+        schema: &str,
+        table: &str,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<Box<dyn UpsertWriter>> {
+        // Return a wrapper that adapts the new writer to the old UpsertWriter trait
+        Ok(Box::new(PostgresUpsertWriterAdapter {
+            pool: self.pool.clone(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+            writer_id,
+            partition_id,
+        }))
+    }
+}
+
+/// Convert old target::SqlValue to new core::value::SqlValue.
+fn convert_target_to_new_sql_value(value: TargetSqlValue) -> SqlValue<'static> {
+    match value {
+        TargetSqlValue::Null(nt) => SqlValue::Null(match nt {
+            TargetSqlNullType::Bool => SqlNullType::Bool,
+            TargetSqlNullType::I16 => SqlNullType::I16,
+            TargetSqlNullType::I32 => SqlNullType::I32,
+            TargetSqlNullType::I64 => SqlNullType::I64,
+            TargetSqlNullType::F32 => SqlNullType::F32,
+            TargetSqlNullType::F64 => SqlNullType::F64,
+            TargetSqlNullType::String => SqlNullType::String,
+            TargetSqlNullType::Bytes => SqlNullType::Bytes,
+            TargetSqlNullType::Uuid => SqlNullType::Uuid,
+            TargetSqlNullType::DateTime => SqlNullType::DateTime,
+            TargetSqlNullType::Date => SqlNullType::Date,
+            TargetSqlNullType::Time => SqlNullType::Time,
+            TargetSqlNullType::Decimal => SqlNullType::Decimal,
+            TargetSqlNullType::DateTimeOffset => SqlNullType::DateTimeOffset,
+        }),
+        TargetSqlValue::Bool(b) => SqlValue::Bool(b),
+        TargetSqlValue::I16(i) => SqlValue::I16(i),
+        TargetSqlValue::I32(i) => SqlValue::I32(i),
+        TargetSqlValue::I64(i) => SqlValue::I64(i),
+        TargetSqlValue::F32(f) => SqlValue::F32(f),
+        TargetSqlValue::F64(f) => SqlValue::F64(f),
+        TargetSqlValue::String(s) => SqlValue::Text(Cow::Owned(s)),
+        TargetSqlValue::Bytes(b) => SqlValue::Bytes(Cow::Owned(b)),
+        TargetSqlValue::Uuid(u) => SqlValue::Uuid(u),
+        TargetSqlValue::DateTime(dt) => SqlValue::DateTime(dt),
+        TargetSqlValue::Date(d) => SqlValue::Date(d),
+        TargetSqlValue::Time(t) => SqlValue::Time(t),
+        TargetSqlValue::Decimal(d) => SqlValue::Decimal(d),
+        TargetSqlValue::CompressedText { compressed, original_len } => {
+            SqlValue::CompressedText {
+                compressed,
+                original_len,
+            }
+        }
+        TargetSqlValue::DateTimeOffset(dto) => SqlValue::DateTimeOffset(dto),
+    }
+}
+
+/// Adapter to make PostgresWriter work with the old UpsertWriter trait.
+struct PostgresUpsertWriterAdapter {
+    pool: Pool,
+    schema: String,
+    table: String,
+    writer_id: usize,
+    partition_id: Option<i32>,
+}
+
+#[async_trait]
+impl UpsertWriter for PostgresUpsertWriterAdapter {
+    async fn upsert_chunk(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<TargetSqlValue>>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Convert old SqlValue to new SqlValue
+        let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .collect();
+
+        let batch = Batch::new(converted_rows);
+        let row_count = batch.rows.len() as u64;
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
+
+        // Create staging table name
+        let staging_name = match self.partition_id {
+            Some(pid) => format!("_staging_{}_p{}_{}", self.table, pid, self.writer_id),
+            None => format!("_staging_{}_{}", self.table, self.writer_id),
+        };
+
+        let qualified_target = format!(
+            "{}.{}",
+            quote_ident(&self.schema),
+            quote_ident(&self.table)
+        );
+        let staging_qualified = format!("{}.{}", quote_ident(&self.schema), quote_ident(&staging_name));
+
+        // Create temp table
+        let create_staging = format!(
+            "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING ALL) ON COMMIT DROP",
+            quote_ident(&staging_name),
+            qualified_target
+        );
+        client.execute(&create_staging, &[]).await?;
+
+        // Truncate staging
+        let truncate_staging = format!("TRUNCATE TABLE {}", quote_ident(&staging_name));
+        client.execute(&truncate_staging, &[]).await?;
+
+        // Write batch to staging using COPY
+        let col_list: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+        let copy_sql = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT BINARY)",
+            quote_ident(&staging_name),
+            col_list.join(", ")
+        );
+
+        let sink = client
+            .copy_in(&copy_sql)
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("initiating COPY: {}", e)))?;
+
+        let mut buf = BytesMut::with_capacity(batch.rows.len() * 512);
+
+        // Write header
+        buf.put_slice(b"PGCOPY\n\xff\r\n\0");
+        buf.put_i32(0); // flags
+        buf.put_i32(0); // extension area length
+
+        // Write rows
+        for row in &batch.rows {
+            buf.put_i16(row.len() as i16);
+            for val in row {
+                write_binary_value(&mut buf, val);
+            }
+        }
+
+        // Write trailer
+        buf.put_i16(-1);
+
+        // Use pin_mut for the sink
+        tokio::pin!(sink);
+        let data = buf.freeze();
+        sink.send(data)
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("sending COPY data: {}", e)))?;
+        sink.finish()
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("finishing COPY: {}", e)))?;
+
+        // Merge into target
+        let pk_list: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+        let update_cols: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
+            .collect();
+
+        let merge_sql = if update_cols.is_empty() {
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO NOTHING",
+                qualified_target,
+                col_list.join(", "),
+                col_list.join(", "),
+                staging_qualified,
+                pk_list.join(", ")
+            )
+        } else {
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+                qualified_target,
+                col_list.join(", "),
+                col_list.join(", "),
+                staging_qualified,
+                pk_list.join(", "),
+                update_cols.join(", ")
+            )
+        };
+
+        client.execute(&merge_sql, &[]).await?;
+
+        Ok(row_count)
+    }
+}
+
+/// Quote a PostgreSQL identifier.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[async_trait]
