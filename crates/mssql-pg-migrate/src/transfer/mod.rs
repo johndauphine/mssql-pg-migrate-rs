@@ -8,7 +8,7 @@
 use crate::config::TargetMode;
 use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
-use crate::source::Table;
+use crate::core::schema::Table;
 use crate::target::SqlValue;
 use chrono::{DateTime, Utc};
 use futures::future::try_join_all;

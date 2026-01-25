@@ -20,7 +20,7 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition,
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
-use crate::source::BinaryRowParser;
+use crate::drivers::common::BinaryRowParser;
 use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// PostgreSQL source reader implementation.

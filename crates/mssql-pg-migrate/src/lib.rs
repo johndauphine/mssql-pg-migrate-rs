@@ -40,7 +40,6 @@ pub mod source;
 pub mod state;
 pub mod target;
 pub mod transfer;
-pub mod typemap;
 
 // Re-exports for convenient access
 pub use config::{
@@ -50,11 +49,10 @@ pub use error::{MigrateError, Result};
 pub use orchestrator::{
     HealthCheckResult, MigrationResult, Orchestrator, ProgressUpdate, TableError,
 };
-pub use source::{MssqlPool, PgSourcePool, Table};
+pub use source::Table;
 pub use state::MigrationState;
-pub use target::{MssqlTargetPool, PgPool, SqlNullType, SqlValue};
+pub use target::{SqlNullType, SqlValue, UpsertWriter};
 pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};
-pub use typemap::{map_type, mssql_to_postgres, postgres_to_mssql, TypeMapping};
 
 
 // Core module re-exports (new plugin architecture)
