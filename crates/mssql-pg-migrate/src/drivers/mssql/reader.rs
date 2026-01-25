@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -22,7 +22,6 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition,
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
-use crate::drivers::common::DirectCopyEncoder;
 use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// Maximum TDS packet size (32767 bytes, ~32KB).
@@ -351,50 +350,6 @@ impl MssqlReader {
         }
 
         Ok(result)
-    }
-
-    /// Query rows and encode directly to PostgreSQL COPY binary format.
-    ///
-    /// This is the high-performance path that bypasses SqlValue entirely.
-    /// Returns (encoded_bytes, first_pk, last_pk, row_count).
-    pub async fn query_rows_direct_copy(
-        &self,
-        sql: &str,
-        col_types: &[String],
-        pk_idx: Option<usize>,
-    ) -> Result<(bytes::Bytes, Option<i64>, Option<i64>, usize)> {
-        use bytes::BytesMut;
-
-        let mut client = self.get_client().await?;
-        let stream = client.simple_query(sql).await?;
-        let rows = stream.into_first_result().await?;
-
-        let encoder = DirectCopyEncoder::new(col_types);
-        let estimated_size = encoder.buffer_size_for_rows(rows.len());
-        let mut buf = BytesMut::with_capacity(estimated_size);
-
-        encoder.write_header(&mut buf);
-
-        let mut first_pk: Option<i64> = None;
-        let mut last_pk: Option<i64> = None;
-        let row_count = rows.len();
-
-        for (i, row) in rows.iter().enumerate() {
-            let pk = encoder.encode_row(row, &mut buf, pk_idx);
-
-            if pk_idx.is_some() {
-                if i == 0 {
-                    first_pk = pk;
-                }
-                if pk.is_some() {
-                    last_pk = pk;
-                }
-            }
-        }
-
-        encoder.write_trailer(&mut buf);
-
-        Ok((buf.freeze(), first_pk, last_pk, row_count))
     }
 
     /// Test the connection.
@@ -780,10 +735,6 @@ impl SourceReader for MssqlReader {
     async fn close(&self) {
         // bb8 pool handles cleanup automatically
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        true
-    }
 }
 
 /// Internal function to read table rows and send batches through channel.
@@ -955,12 +906,12 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue<'static
             .map(SqlValue::DateTime)
             .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
         "date" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| SqlValue::Date(dt.date()))
+            .get::<NaiveDate, _>(idx)
+            .map(SqlValue::Date)
             .unwrap_or(SqlValue::Null(SqlNullType::Date)),
         "time" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| SqlValue::Time(dt.time()))
+            .get::<NaiveTime, _>(idx)
+            .map(SqlValue::Time)
             .unwrap_or(SqlValue::Null(SqlNullType::Time)),
         "binary" | "varbinary" | "image" => row
             .get::<&[u8], _>(idx)
@@ -1028,12 +979,12 @@ fn convert_row_value_for_target(row: &Row, idx: usize, data_type: &str) -> Targe
             .map(TargetSqlValue::DateTime)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
         "date" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| TargetSqlValue::Date(dt.date()))
+            .get::<NaiveDate, _>(idx)
+            .map(TargetSqlValue::Date)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
         "time" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| TargetSqlValue::Time(dt.time()))
+            .get::<NaiveTime, _>(idx)
+            .map(TargetSqlValue::Time)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
         "binary" | "varbinary" | "image" => row
             .get::<&[u8], _>(idx)

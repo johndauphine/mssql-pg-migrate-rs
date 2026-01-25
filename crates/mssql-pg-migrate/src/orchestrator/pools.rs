@@ -146,10 +146,6 @@ impl UpsertWriter for MssqlUpsertWriter {
         )
         .await
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// MySQL UpsertWriter wrapper that implements the UpsertWriter trait using the new TargetWriter API.
@@ -214,10 +210,6 @@ impl UpsertWriter for MysqlUpsertWriter {
             self.partition_id,
         )
         .await
-    }
-
-    fn supports_direct_copy(&self) -> bool {
-        false
     }
 }
 
@@ -403,35 +395,6 @@ impl SourcePoolImpl {
         }
     }
 
-    /// Query rows and encode directly to PostgreSQL COPY binary format.
-    ///
-    /// This is the high-performance path for MSSQL->PG upsert that bypasses
-    /// SqlValue entirely. Returns (encoded_bytes, first_pk, last_pk, row_count).
-    ///
-    /// Only supported for MSSQL sources - returns None for other sources.
-    pub async fn query_rows_direct_copy(
-        &self,
-        sql: &str,
-        col_types: &[String],
-        pk_idx: Option<usize>,
-    ) -> Result<Option<(bytes::Bytes, Option<i64>, Option<i64>, usize)>> {
-        match self {
-            Self::Mssql(p) => {
-                let result = p.query_rows_direct_copy(sql, col_types, pk_idx).await?;
-                Ok(Some(result))
-            }
-            // Direct copy is only optimized for MSSQL sources
-            Self::Postgres(_) => Ok(None),
-            #[cfg(feature = "mysql")]
-            Self::Mysql(_) => Ok(None),
-        }
-    }
-
-    /// Returns true if this source supports direct copy encoding.
-    pub fn supports_direct_copy(&self) -> bool {
-        matches!(self, Self::Mssql(_))
-    }
-
     /// Stream rows using PostgreSQL COPY TO BINARY protocol.
     /// Returns the total number of rows read.
     /// Only supported for PostgreSQL sources - returns an error for other sources.
@@ -559,7 +522,23 @@ impl TargetPoolImpl {
                 }
             }
             // Use new MssqlWriter (Tiberius + bb8)
+            use crate::dialect::{MysqlToMssqlMapper, PostgresToMssqlMapper};
             let writer = MssqlWriter::with_pool_size(config.target.clone(), max_conns as u32).await?;
+            // Add type mapper based on source database type
+            let source_type = config.source.r#type.to_lowercase();
+            let writer = if source_type == "mssql"
+                || source_type == "sqlserver"
+                || source_type == "sql_server"
+            {
+                // MSSQL → MSSQL: no type mapper needed (identity mapping)
+                writer
+            } else if source_type == "mysql" || source_type == "mariadb" {
+                // MySQL/MariaDB → MSSQL
+                writer.with_type_mapper(Arc::new(MysqlToMssqlMapper::new()))
+            } else {
+                // Default: PostgreSQL → MSSQL
+                writer.with_type_mapper(Arc::new(PostgresToMssqlMapper::new()))
+            };
             Ok(Self::Mssql(Arc::new(writer)))
         } else if target_type == "mysql" || target_type == "mariadb" {
             // MySQL/MariaDB target - uses SQLx
@@ -627,12 +606,6 @@ impl TargetPoolImpl {
             #[cfg(feature = "mysql")]
             Self::Mysql(p) => p.db_type(),
         }
-    }
-
-    /// Returns true if this target supports direct copy encoding (PostgreSQL binary format).
-    /// Only PostgreSQL targets support this - MSSQL and MySQL use parameterized inserts.
-    pub fn supports_direct_copy(&self) -> bool {
-        matches!(self, Self::Postgres(_))
     }
 
     /// Create a state backend appropriate for this target database type.

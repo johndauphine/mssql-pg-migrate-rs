@@ -846,10 +846,6 @@ impl SourceReader for MysqlReader {
     async fn close(&self) {
         self.pool.clone().disconnect().await.ok();
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        false
-    }
 }
 
 /// Represents a primary key value for keyset pagination.

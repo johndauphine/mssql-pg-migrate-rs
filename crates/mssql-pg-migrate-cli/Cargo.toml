@@ -27,6 +27,9 @@ clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 
+# TLS crypto provider (must be initialized before any TLS operations)
+rustls = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 

@@ -844,10 +844,6 @@ impl SourceReader for PostgresReader {
     async fn close(&self) {
         // deadpool handles cleanup automatically
     }
-
-    fn supports_direct_copy(&self) -> bool {
-        true
-    }
 }
 
 /// Internal function to read table rows.

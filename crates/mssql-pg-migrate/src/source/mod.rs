@@ -17,4 +17,4 @@ pub use crate::core::schema::{
 };
 
 // Re-export utility types from drivers::common
-pub use crate::drivers::common::{BinaryColumnType, BinaryRowParser, DirectCopyEncoder};
+pub use crate::drivers::common::{BinaryColumnType, BinaryRowParser};
