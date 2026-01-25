@@ -356,11 +356,12 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
             quote_ident(&self.schema),
             quote_ident(&self.table)
         );
-        let staging_qualified = format!("{}.{}", quote_ident(&self.schema), quote_ident(&staging_name));
+        // Temp tables are in session's temp schema, not the target schema
+        let staging_quoted = quote_ident(&staging_name);
 
-        // Create temp table
+        // Create temp table (no ON COMMIT DROP - we'll drop it manually)
         let create_staging = format!(
-            "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING ALL) ON COMMIT DROP",
+            "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
             quote_ident(&staging_name),
             qualified_target
         );
@@ -425,7 +426,7 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
                 qualified_target,
                 col_list.join(", "),
                 col_list.join(", "),
-                staging_qualified,
+                staging_quoted,
                 pk_list.join(", ")
             )
         } else {
@@ -434,13 +435,17 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
                 qualified_target,
                 col_list.join(", "),
                 col_list.join(", "),
-                staging_qualified,
+                staging_quoted,
                 pk_list.join(", "),
                 update_cols.join(", ")
             )
         };
 
         client.execute(&merge_sql, &[]).await?;
+
+        // Drop staging table to free temp memory
+        let drop_staging = format!("DROP TABLE IF EXISTS {}", staging_quoted);
+        client.execute(&drop_staging, &[]).await.ok();
 
         Ok(row_count)
     }

@@ -598,7 +598,23 @@ impl TargetPoolImpl {
         } else {
             // PostgreSQL target - native tokio-postgres via PostgresWriter
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
+            use crate::dialect::{MssqlToPostgresMapper, MysqlToPostgresMapper};
             let writer = PostgresWriter::new(&config.target, max_conns).await?;
+            // Add type mapper based on source database type
+            let source_type = config.source.r#type.to_lowercase();
+            let writer = if source_type == "postgres"
+                || source_type == "postgresql"
+                || source_type == "pg"
+            {
+                // PostgreSQL → PostgreSQL: no type mapper needed (identity mapping)
+                writer
+            } else if source_type == "mysql" || source_type == "mariadb" {
+                // MySQL/MariaDB → PostgreSQL
+                writer.with_type_mapper(Arc::new(MysqlToPostgresMapper::new()))
+            } else {
+                // Default: MSSQL/SQL Server → PostgreSQL
+                writer.with_type_mapper(Arc::new(MssqlToPostgresMapper::new()))
+            };
             Ok(Self::Postgres(Arc::new(writer)))
         }
     }
