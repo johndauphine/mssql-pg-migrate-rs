@@ -96,8 +96,9 @@ impl TlsBuilder {
                 // TLS enabled but no certificate verification
                 // SECURITY WARNING: Vulnerable to MITM attacks
                 warn!(
-                    "ssl_mode=require: TLS enabled but server certificate is not verified. \
-                     Consider using 'verify-full' for production."
+                    "SECURITY WARNING: ssl_mode=require enables TLS but does NOT verify the \
+                     server certificate. This is vulnerable to man-in-the-middle attacks. \
+                     For production environments, use ssl_mode=verify-full instead."
                 );
                 ClientConfig::builder()
                     .dangerous()

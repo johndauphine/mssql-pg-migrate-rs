@@ -187,6 +187,7 @@ mod tests {
                 user: "sa".to_string(),
                 password: "password".to_string(),
                 schema: "dbo".to_string(),
+                ssl_mode: "disable".to_string(),
                 encrypt: false,
                 trust_server_cert: true,
                 auth: AuthMethod::Native,

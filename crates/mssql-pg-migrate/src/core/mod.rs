@@ -25,6 +25,7 @@
 //! - **Template Method**: Default trait method implementations define algorithm skeletons
 
 pub mod catalog;
+pub mod identifier;
 pub mod schema;
 pub mod traits;
 pub mod value;
