@@ -356,25 +356,33 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
             quote_ident(&self.schema),
             quote_ident(&self.table)
         );
-        let staging_qualified = format!("{}.{}", quote_ident(&self.schema), quote_ident(&staging_name));
+        // Use schema-qualified name for unlogged staging table
+        let staging_qualified = format!(
+            "{}.{}",
+            quote_ident(&self.schema),
+            quote_ident(&staging_name)
+        );
 
-        // Create temp table
+        // Drop and recreate staging table (faster than truncate, no indexes)
+        let drop_staging = format!("DROP TABLE IF EXISTS {}", staging_qualified);
+        client.execute(&drop_staging, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("dropping staging table: {}", e)))?;
+
+        // Create unlogged table without indexes for fast COPY
         let create_staging = format!(
-            "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING ALL) ON COMMIT DROP",
-            quote_ident(&staging_name),
+            "CREATE UNLOGGED TABLE {} (LIKE {} INCLUDING DEFAULTS)",
+            staging_qualified,
             qualified_target
         );
-        client.execute(&create_staging, &[]).await?;
-
-        // Truncate staging
-        let truncate_staging = format!("TRUNCATE TABLE {}", quote_ident(&staging_name));
-        client.execute(&truncate_staging, &[]).await?;
+        debug!("Creating staging table: {}", create_staging);
+        client.execute(&create_staging, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("creating staging table: {}", e)))?;
 
         // Write batch to staging using COPY
         let col_list: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT BINARY)",
-            quote_ident(&staging_name),
+            staging_qualified,
             col_list.join(", ")
         );
 
@@ -440,9 +448,123 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
             )
         };
 
-        client.execute(&merge_sql, &[]).await?;
+        debug!("Executing merge SQL for {}: {}", self.table, merge_sql);
+        client.execute(&merge_sql, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("merge to target: {}", e)))?;
 
         Ok(row_count)
+    }
+
+    async fn upsert_chunk_direct(
+        &mut self,
+        cols: &[String],
+        pk_cols: &[String],
+        copy_data: bytes::Bytes,
+        row_count: usize,
+    ) -> Result<u64> {
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
+
+        // Create staging table name
+        let staging_name = match self.partition_id {
+            Some(pid) => format!("_staging_{}_p{}_{}", self.table, pid, self.writer_id),
+            None => format!("_staging_{}_{}", self.table, self.writer_id),
+        };
+
+        let qualified_target = format!(
+            "{}.{}",
+            quote_ident(&self.schema),
+            quote_ident(&self.table)
+        );
+        // Use schema-qualified name for unlogged staging table
+        let staging_qualified = format!(
+            "{}.{}",
+            quote_ident(&self.schema),
+            quote_ident(&staging_name)
+        );
+
+        // Drop and recreate staging table (faster than truncate, no indexes)
+        let drop_staging = format!("DROP TABLE IF EXISTS {}", staging_qualified);
+        client.execute(&drop_staging, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("dropping staging table: {}", e)))?;
+
+        // Create unlogged table without indexes for fast COPY
+        let create_staging = format!(
+            "CREATE UNLOGGED TABLE {} (LIKE {} INCLUDING DEFAULTS)",
+            staging_qualified,
+            qualified_target
+        );
+        debug!("Creating staging table for direct copy: {}", create_staging);
+        client.execute(&create_staging, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("creating staging table: {}", e)))?;
+
+        // Write pre-encoded data to staging using COPY
+        let col_list: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+        let copy_sql = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT BINARY)",
+            staging_qualified,
+            col_list.join(", ")
+        );
+
+        let sink = client
+            .copy_in(&copy_sql)
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("initiating COPY: {}", e)))?;
+
+        // Send pre-encoded data directly
+        tokio::pin!(sink);
+        sink.send(copy_data)
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("sending COPY data: {}", e)))?;
+        sink.finish()
+            .await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("finishing COPY: {}", e)))?;
+
+        // Merge into target
+        let pk_list: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+        let update_cols: Vec<String> = cols
+            .iter()
+            .filter(|c| !pk_cols.contains(c))
+            .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
+            .collect();
+
+        let merge_sql = if update_cols.is_empty() {
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO NOTHING",
+                qualified_target,
+                col_list.join(", "),
+                col_list.join(", "),
+                staging_qualified,
+                pk_list.join(", ")
+            )
+        } else {
+            format!(
+                "INSERT INTO {} ({}) SELECT {} FROM {} ON CONFLICT ({}) DO UPDATE SET {}",
+                qualified_target,
+                col_list.join(", "),
+                col_list.join(", "),
+                staging_qualified,
+                pk_list.join(", "),
+                update_cols.join(", ")
+            )
+        };
+
+        debug!("Executing merge SQL for {}: {}", self.table, merge_sql);
+        client.execute(&merge_sql, &[]).await
+            .map_err(|e| MigrateError::transfer(&self.table, format!("merge to target: {}", e)))?;
+
+        Ok(row_count as u64)
+    }
+
+    fn supports_direct_copy(&self) -> bool {
+        true
     }
 }
 
@@ -995,10 +1117,6 @@ impl TargetWriter for PostgresWriter {
 
     async fn close(&self) {
         // deadpool handles cleanup
-    }
-
-    fn supports_direct_copy(&self) -> bool {
-        true
     }
 }
 
