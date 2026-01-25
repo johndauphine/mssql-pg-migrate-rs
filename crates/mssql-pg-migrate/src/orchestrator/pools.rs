@@ -17,18 +17,17 @@ use crate::config::Config;
 use crate::error::MigrateError;
 use crate::error::Result;
 use crate::core::traits::SourceReader as NewSourceReader;
-use crate::drivers::{MssqlReader, PostgresReader};
+use crate::core::traits::TargetWriter as NewTargetWriter;
+use crate::drivers::{MssqlReader, PostgresReader, PostgresWriter};
 use crate::source::{CheckConstraint, ForeignKey, Index, Partition, Table};
 #[cfg(feature = "mysql")]
 use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 #[cfg(not(feature = "mysql"))]
 use crate::state::{DbStateBackend, MssqlStateBackend, StateBackendEnum};
-use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
+use crate::target::{MssqlTargetPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[cfg(feature = "mysql")]
-use crate::core::traits::TargetWriter as NewTargetWriter;
 #[cfg(feature = "mysql")]
 use crate::core::value::{Batch, SqlNullType as NewSqlNullType, SqlValue as NewSqlValue};
 #[cfg(feature = "mysql")]
@@ -461,7 +460,7 @@ impl SourcePoolImpl {
 /// Enum wrapper for target pool implementations.
 pub enum TargetPoolImpl {
     Mssql(Arc<MssqlTargetPool>),
-    Postgres(Arc<PgPool>),
+    Postgres(Arc<PostgresWriter>),
     #[cfg(feature = "mysql")]
     Mysql(Arc<MysqlWriter>),
 }
@@ -533,16 +532,10 @@ impl TargetPoolImpl {
                 ))
             }
         } else {
-            // PostgreSQL target - native tokio-postgres only
+            // PostgreSQL target - native tokio-postgres via PostgresWriter
             // Note: PostgreSQL Kerberos is not supported (tokio-postgres lacks GSSAPI)
-            let pool = PgPool::new(
-                &config.target,
-                max_conns,
-                config.migration.get_copy_buffer_rows(),
-                config.migration.use_binary_copy,
-            )
-            .await?;
-            Ok(Self::Postgres(Arc::new(pool)))
+            let writer = PostgresWriter::new(&config.target, max_conns).await?;
+            Ok(Self::Postgres(Arc::new(writer)))
         }
     }
 
@@ -880,7 +873,7 @@ impl TargetPoolImpl {
     }
 
     /// Get the underlying PostgreSQL pool.
-    pub fn as_postgres(&self) -> Option<Arc<PgPool>> {
+    pub fn as_postgres(&self) -> Option<Arc<PostgresWriter>> {
         match self {
             Self::Mssql(_) => None,
             Self::Postgres(p) => Some(p.clone()),
