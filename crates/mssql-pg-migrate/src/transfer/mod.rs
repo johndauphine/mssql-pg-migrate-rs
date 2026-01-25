@@ -306,7 +306,7 @@ impl Default for TransferConfig {
             parallel_readers: 4,
             parallel_writers: 4,
             use_copy_binary: true, // Default to COPY TO BINARY for PostgreSQL sources
-            use_direct_copy: true, // Default to direct COPY encoding for MSSQL->PG upsert
+            use_direct_copy: false, // Disabled - upsert writers don't support direct copy yet
             compress_text: false,  // Disabled by default
         }
     }
