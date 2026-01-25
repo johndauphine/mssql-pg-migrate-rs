@@ -23,6 +23,7 @@ use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
 use crate::source::DirectCopyEncoder;
+use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// Maximum TDS packet size (32767 bytes, ~32KB).
 const TDS_MAX_PACKET_SIZE: u32 = 32767;
@@ -401,6 +402,33 @@ impl MssqlReader {
         let mut client = self.get_client().await?;
         client.simple_query("SELECT 1").await?.into_row().await?;
         Ok(())
+    }
+
+    /// Query rows with pre-computed column types for O(1) lookup.
+    /// Compatible with legacy transfer engine API.
+    /// Returns target::SqlValue for compatibility with transfer engine.
+    pub async fn query_rows_fast_for_target(
+        &self,
+        sql: &str,
+        _columns: &[String],
+        col_types: &[String],
+    ) -> Result<Vec<Vec<TargetSqlValue>>> {
+        let mut client = self.get_client().await?;
+        let stream = client.simple_query(sql).await?;
+        let rows = stream.into_first_result().await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let mut values = Vec::with_capacity(col_types.len());
+            for (idx, data_type) in col_types.iter().enumerate() {
+                let value = convert_row_value_for_target(&row, idx, data_type);
+                values.push(value);
+            }
+            result.push(values);
+        }
+
+        Ok(result)
     }
 }
 
@@ -954,6 +982,79 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue<'static
             row.get::<&str, _>(idx)
                 .map(|s| SqlValue::Text(Cow::Owned(s.to_string())))
                 .unwrap_or(SqlValue::Null(SqlNullType::String))
+        }
+    }
+}
+
+/// Convert a row value to target::SqlValue for legacy API compatibility.
+fn convert_row_value_for_target(row: &Row, idx: usize, data_type: &str) -> TargetSqlValue {
+    let dt = data_type.to_lowercase();
+
+    match dt.as_str() {
+        "bit" => row
+            .get::<bool, _>(idx)
+            .map(TargetSqlValue::Bool)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bool)),
+        "tinyint" => row
+            .get::<u8, _>(idx)
+            .map(|v| TargetSqlValue::I16(v as i16))
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
+        "smallint" => row
+            .get::<i16, _>(idx)
+            .map(TargetSqlValue::I16)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I16)),
+        "int" | "integer" => row
+            .get::<i32, _>(idx)
+            .map(TargetSqlValue::I32)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I32)),
+        "bigint" => row
+            .get::<i64, _>(idx)
+            .map(TargetSqlValue::I64)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::I64)),
+        "real" => row
+            .get::<f32, _>(idx)
+            .map(TargetSqlValue::F32)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F32)),
+        "float" => row
+            .get::<f64, _>(idx)
+            .map(TargetSqlValue::F64)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::F64)),
+        "uniqueidentifier" => row
+            .get::<Uuid, _>(idx)
+            .map(TargetSqlValue::Uuid)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Uuid)),
+        "datetime" | "datetime2" | "smalldatetime" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(TargetSqlValue::DateTime)
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
+        "date" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(|dt| TargetSqlValue::Date(dt.date()))
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
+        "time" => row
+            .get::<NaiveDateTime, _>(idx)
+            .map(|dt| TargetSqlValue::Time(dt.time()))
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
+        "binary" | "varbinary" | "image" => row
+            .get::<&[u8], _>(idx)
+            .map(|v| TargetSqlValue::Bytes(v.to_vec()))
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Bytes)),
+        "decimal" | "numeric" | "money" | "smallmoney" => row
+            .get::<rust_decimal::Decimal, _>(idx)
+            .map(TargetSqlValue::Decimal)
+            .or_else(|| {
+                row.get::<f64, _>(idx).map(|f| {
+                    rust_decimal::Decimal::try_from(f)
+                        .map(TargetSqlValue::Decimal)
+                        .unwrap_or(TargetSqlValue::F64(f))
+                })
+            })
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Decimal)),
+        _ => {
+            // Default: treat as string
+            row.get::<&str, _>(idx)
+                .map(|s| TargetSqlValue::String(s.to_string()))
+                .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String))
         }
     }
 }
