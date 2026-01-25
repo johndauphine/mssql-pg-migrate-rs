@@ -8,7 +8,7 @@ use crate::config::{Config, TableStats, TargetMode};
 use crate::core::catalog::DriverCatalog;
 use crate::drivers::{SourceReaderImpl, TargetWriterImpl};
 use crate::error::{MigrateError, Result};
-use crate::source::Table;
+use crate::core::schema::Table;
 use crate::state::{MigrationState, RunStatus, StateBackendEnum, TableState, TaskStatus};
 use crate::transfer::{DateFilter, TransferConfig, TransferEngine, TransferJob};
 use chrono::{DateTime, Utc};

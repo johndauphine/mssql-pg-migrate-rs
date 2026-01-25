@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::core::traits::SourceReader as NewSourceReader;
 use crate::core::traits::TargetWriter as NewTargetWriter;
 use crate::drivers::{MssqlReader, MssqlWriter, PostgresReader, PostgresWriter};
-use crate::source::{CheckConstraint, ForeignKey, Index, Partition, Table};
+use crate::core::schema::{CheckConstraint, ForeignKey, Index, Partition, Table};
 #[cfg(feature = "mysql")]
 use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 #[cfg(not(feature = "mysql"))]

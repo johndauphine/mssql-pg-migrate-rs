@@ -22,7 +22,7 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition,
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
-use crate::source::DirectCopyEncoder;
+use crate::drivers::common::DirectCopyEncoder;
 use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// Maximum TDS packet size (32767 bytes, ~32KB).
