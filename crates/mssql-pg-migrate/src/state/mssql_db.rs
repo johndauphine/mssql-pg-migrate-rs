@@ -6,22 +6,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tiberius::Row;
 
+use crate::drivers::MssqlWriter;
 use crate::error::{MigrateError, Result};
 use crate::state::backend::{
     run_status_to_str, str_to_run_status, str_to_task_status, task_status_to_str, StateBackend,
 };
 use crate::state::{MigrationState, RunStatus, TableState};
-use crate::target::MssqlTargetPool;
 
 /// MSSQL database state backend for migration runs.
 pub struct MssqlStateBackend {
-    pool: Arc<MssqlTargetPool>,
+    pool: Arc<MssqlWriter>,
     schema: String,
 }
 
 impl MssqlStateBackend {
     /// Create a new MSSQL database state backend.
-    pub fn new(pool: Arc<MssqlTargetPool>) -> Self {
+    pub fn new(pool: Arc<MssqlWriter>) -> Self {
         Self {
             pool,
             schema: "_mssql_pg_migrate".to_string(),

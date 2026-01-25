@@ -12,4 +12,4 @@ mod writer;
 
 pub use dialect::MssqlDialect;
 pub use reader::MssqlReader;
-pub use writer::MssqlWriter;
+pub use writer::{MssqlWriter, TiberiusConnectionManager};
