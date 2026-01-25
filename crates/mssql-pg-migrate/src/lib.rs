@@ -36,7 +36,6 @@ pub mod dialect;
 pub mod drivers;
 pub mod error;
 pub mod orchestrator;
-pub mod pipeline;
 pub mod source;
 pub mod state;
 pub mod target;
@@ -57,8 +56,6 @@ pub use target::{MssqlTargetPool, PgPool, SqlNullType, SqlValue};
 pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};
 pub use typemap::{map_type, mssql_to_postgres, postgres_to_mssql, TypeMapping};
 
-// Pipeline re-exports (new plugin architecture)
-pub use pipeline::{PipelineConfig, PipelineStats, TransferPipeline};
 
 // Core module re-exports (new plugin architecture)
 // These provide the new trait-based abstractions for database operations

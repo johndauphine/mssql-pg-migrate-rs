@@ -22,9 +22,6 @@ mysql = ["dep:mysql_async"]
 # Async runtime
 tokio = { workspace = true }
 
-# Zero-cost polymorphism for driver dispatch
-enum_dispatch = "0.3"
-
 # MSSQL driver
 tiberius = { workspace = true }
 tokio-util = { workspace = true }
@@ -60,20 +57,15 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 async-channel = { workspace = true }
 
-# Concurrency
-parking_lot = { workspace = true }
-rayon = "1.10"
-
 # Decimal handling
 rust_decimal = { workspace = true }
 
 # Bytes handling
 bytes = { workspace = true }
 
-# Hashing for config validation and row change detection
+# Hashing for config validation
 sha2 = { workspace = true }
 hmac = { workspace = true }
-md-5 = "0.10"
 
 # Hex encoding
 hex = { workspace = true }
