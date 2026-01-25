@@ -126,13 +126,13 @@ impl MysqlReader {
             // COLUMN_NAME and DATA_TYPE are required - if NULL, indicates DB corruption
             let name: String = row.get("COLUMN_NAME").ok_or_else(|| {
                 MigrateError::transfer(
-                    &format!("{}.{}", table.schema, table.name),
+                    format!("{}.{}", table.schema, table.name),
                     "COLUMN_NAME is NULL in INFORMATION_SCHEMA.COLUMNS",
                 )
             })?;
             let data_type: String = row.get("DATA_TYPE").ok_or_else(|| {
                 MigrateError::transfer(
-                    &format!("{}.{}", table.schema, table.name),
+                    format!("{}.{}", table.schema, table.name),
                     format!("DATA_TYPE is NULL for column '{}'", name),
                 )
             })?;

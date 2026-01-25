@@ -251,7 +251,7 @@ impl<'a> SqlValue<'a> {
                         // Convert bytes to string
                         String::from_utf8(decompressed)
                             .ok()
-                            .map(|s| Cow::Owned(s))
+                            .map(Cow::Owned)
                     }
                     Err(_) => None,
                 }

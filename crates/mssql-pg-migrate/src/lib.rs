@@ -49,7 +49,7 @@ pub use error::{MigrateError, Result};
 pub use orchestrator::{
     HealthCheckResult, MigrationResult, Orchestrator, ProgressUpdate, TableError,
 };
-pub use source::Table;
+pub use core::schema::Table;
 pub use state::MigrationState;
 pub use target::{SqlNullType, SqlValue, UpsertWriter};
 pub use transfer::{TransferConfig, TransferEngine, TransferJob, TransferStats};

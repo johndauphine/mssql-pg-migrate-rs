@@ -1938,8 +1938,8 @@ mod tests {
         let mut state = MigrationState::new("test-run".to_string(), "hash123".to_string());
 
         // Add completed tables
-        let table_names = vec!["dbo.Users", "dbo.Orders", "dbo.Products"];
-        for name in &table_names {
+        let table_names = ["dbo.Users", "dbo.Orders", "dbo.Products"];
+        for name in table_names {
             let mut ts = TableState::new(1000);
             ts.status = TaskStatus::Completed;
             state.tables.insert(name.to_string(), ts);
@@ -1957,7 +1957,7 @@ mod tests {
                 } else {
                     state
                         .tables
-                        .get(&t.to_string())
+                        .get(**t)
                         .map(|ts| ts.status != TaskStatus::Completed)
                         .unwrap_or(true)
                 }
@@ -1981,7 +1981,7 @@ mod tests {
         let pending = TableState::new(1000);
         state.tables.insert("dbo.Orders".to_string(), pending);
 
-        let table_names = vec!["dbo.Users", "dbo.Orders", "dbo.Products"];
+        let table_names = ["dbo.Users", "dbo.Orders", "dbo.Products"];
 
         // Simulate upsert mode filtering (should skip completed tables)
         let is_drop_recreate = false;
@@ -1995,7 +1995,7 @@ mod tests {
                 } else {
                     state
                         .tables
-                        .get(&t.to_string())
+                        .get(**t)
                         .map(|ts| ts.status != TaskStatus::Completed)
                         .unwrap_or(true)
                 }
