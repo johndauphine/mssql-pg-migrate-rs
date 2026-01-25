@@ -1366,97 +1366,242 @@ impl Orchestrator {
     }
 
     /// Finalize migration (create indexes, FKs, constraints).
+    ///
+    /// All operations are parallelized where possible:
+    /// - Primary keys: parallel (no inter-table dependencies)
+    /// - Indexes: parallel (no inter-table dependencies)
+    /// - Foreign keys: parallel within dependency levels (topological order)
+    /// - Check constraints: parallel (no inter-table dependencies)
+    /// - Sequence resets: parallel (no inter-table dependencies)
     async fn finalize(&self, tables: &[Table]) -> Result<()> {
         let target_schema = &self.config.target.schema;
+        let max_tasks = self.config.migration.get_finalizer_concurrency().max(1);
+        let semaphore = Arc::new(Semaphore::new(max_tasks));
 
         // Create primary keys (only for drop_recreate - truncate and upsert preserve existing PKs)
         if matches!(self.config.migration.target_mode, TargetMode::DropRecreate) {
-            for table in tables {
-                if !table.primary_key.is_empty() {
-                    info!(
-                        "Creating primary key on {}: {:?}",
-                        table.full_name(),
-                        table.primary_key
-                    );
-                    self.target.create_primary_key(table, target_schema).await?;
-                } else {
-                    debug!("Skipping PK creation for {} (no primary key)", table.full_name());
+            let tables_with_pk: Vec<_> = tables
+                .iter()
+                .filter(|t| !t.primary_key.is_empty())
+                .cloned()
+                .collect();
+
+            if !tables_with_pk.is_empty() {
+                let pk_start = Instant::now();
+                info!(
+                    "Creating {} primary keys with up to {} concurrent tasks",
+                    tables_with_pk.len(),
+                    max_tasks
+                );
+                let mut handles = Vec::new();
+
+                for table in tables_with_pk {
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let target = self.target.clone();
+                    let schema = target_schema.to_string();
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
+                        let start = Instant::now();
+                        let table_name = table.full_name();
+                        let row_count = table.row_count;
+                        match target.create_primary_key(&table, &schema).await {
+                            Ok(_) => {
+                                info!(
+                                    "Created PK on {} ({} rows) in {:.2}s",
+                                    table_name,
+                                    row_count,
+                                    start.elapsed().as_secs_f64()
+                                );
+                                Ok(())
+                            }
+                            Err(e) => {
+                                warn!("Failed to create PK on {}: {}", table_name, e);
+                                Err(format!("PK creation failed on {}: {}", table_name, e))
+                            }
+                        }
+                    });
+                    handles.push(handle);
                 }
+
+                let mut pk_errors = Vec::new();
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => pk_errors.push(e),
+                        Err(e) => warn!("PK creation task panicked: {}", e),
+                    }
+                }
+                if !pk_errors.is_empty() {
+                    return Err(crate::error::MigrateError::Transfer {
+                        table: "finalization".to_string(),
+                        message: pk_errors.join("; "),
+                    });
+                }
+                info!("Primary keys created in {:.2}s", pk_start.elapsed().as_secs_f64());
             }
         }
 
         // Create indexes (only if explicitly enabled)
         if self.config.migration.create_indexes {
-            let max_tasks = self.config.migration.get_finalizer_concurrency().max(1);
-            info!("Creating indexes with up to {} concurrent tasks", max_tasks);
-            let semaphore = Arc::new(Semaphore::new(max_tasks));
-            let mut handles = Vec::new();
+            let tables_with_indexes: Vec<_> = tables
+                .iter()
+                .filter(|t| !t.indexes.is_empty())
+                .cloned()
+                .collect();
 
-            for table in tables.iter().cloned() {
-                if table.indexes.is_empty() {
-                    continue;
+            if !tables_with_indexes.is_empty() {
+                info!(
+                    "Creating indexes on {} tables with up to {} concurrent tasks",
+                    tables_with_indexes.len(),
+                    max_tasks
+                );
+                let mut handles = Vec::new();
+
+                for table in tables_with_indexes {
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let target = self.target.clone();
+                    let schema = target_schema.to_string();
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
+                        for index in &table.indexes {
+                            debug!("Creating index: {}.{}", table.name, index.name);
+                            if let Err(e) = target.create_index(&table, index, &schema).await {
+                                warn!("Failed to create index {}: {}", index.name, e);
+                            }
+                        }
+                    });
+                    handles.push(handle);
                 }
 
+                for handle in handles {
+                    if let Err(e) = handle.await {
+                        warn!("Index creation task panicked: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Create foreign keys (parallel within dependency levels)
+        if self.config.migration.create_foreign_keys {
+            let levels = build_fk_dependency_levels(tables);
+            let total_fks: usize = tables.iter().map(|t| t.foreign_keys.len()).sum();
+
+            if total_fks > 0 {
+                info!(
+                    "Creating {} foreign keys in {} dependency levels",
+                    total_fks,
+                    levels.len()
+                );
+
+                for (level_idx, level_tables) in levels.iter().enumerate() {
+                    debug!(
+                        "Processing FK level {} with {} tables",
+                        level_idx,
+                        level_tables.len()
+                    );
+                    let mut handles = Vec::new();
+
+                    for table in level_tables.iter().cloned() {
+                        if table.foreign_keys.is_empty() {
+                            continue;
+                        }
+
+                        let permit = semaphore.clone().acquire_owned().await.unwrap();
+                        let target = self.target.clone();
+                        let schema = target_schema.to_string();
+
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit;
+                            for fk in &table.foreign_keys {
+                                debug!("Creating FK: {}.{}", table.name, fk.name);
+                                if let Err(e) =
+                                    target.create_foreign_key(&table, fk, &schema).await
+                                {
+                                    warn!("Failed to create FK {}: {}", fk.name, e);
+                                }
+                            }
+                        });
+                        handles.push(handle);
+                    }
+
+                    // Wait for all FKs in this level before proceeding to next
+                    for handle in handles {
+                        if let Err(e) = handle.await {
+                            warn!("FK creation task panicked: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create check constraints (parallel)
+        if self.config.migration.create_check_constraints {
+            let tables_with_checks: Vec<_> = tables
+                .iter()
+                .filter(|t| !t.check_constraints.is_empty())
+                .cloned()
+                .collect();
+
+            if !tables_with_checks.is_empty() {
+                info!(
+                    "Creating check constraints on {} tables with up to {} concurrent tasks",
+                    tables_with_checks.len(),
+                    max_tasks
+                );
+                let mut handles = Vec::new();
+
+                for table in tables_with_checks {
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    let target = self.target.clone();
+                    let schema = target_schema.to_string();
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
+                        for chk in &table.check_constraints {
+                            debug!("Creating check: {}.{}", table.name, chk.name);
+                            if let Err(e) =
+                                target.create_check_constraint(&table, chk, &schema).await
+                            {
+                                warn!("Failed to create check {}: {}", chk.name, e);
+                            }
+                        }
+                    });
+                    handles.push(handle);
+                }
+
+                for handle in handles {
+                    if let Err(e) = handle.await {
+                        warn!("Check constraint task panicked: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Reset sequences (parallel)
+        {
+            let mut handles = Vec::new();
+
+            for table in tables {
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                 let target = self.target.clone();
                 let schema = target_schema.to_string();
+                let table = table.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
-                    for index in &table.indexes {
-                        debug!("Creating index: {}.{}", table.name, index.name);
-                        if let Err(e) = target.create_index(&table, index, &schema).await {
-                            warn!("Failed to create index {}: {}", index.name, e);
-                        }
+                    if let Err(e) = target.reset_sequence(&schema, &table).await {
+                        debug!("No sequence to reset for {}: {}", table.full_name(), e);
                     }
                 });
-
                 handles.push(handle);
             }
 
             for handle in handles {
                 if let Err(e) = handle.await {
-                    warn!("Index creation task panicked: {}", e);
+                    warn!("Sequence reset task panicked: {}", e);
                 }
-            }
-        }
-
-        // Create foreign keys
-        if self.config.migration.create_foreign_keys {
-            for table in tables {
-                for fk in &table.foreign_keys {
-                    debug!("Creating FK: {}.{}", table.name, fk.name);
-                    if let Err(e) = self
-                        .target
-                        .create_foreign_key(table, fk, target_schema)
-                        .await
-                    {
-                        warn!("Failed to create FK {}: {}", fk.name, e);
-                    }
-                }
-            }
-        }
-
-        // Create check constraints
-        if self.config.migration.create_check_constraints {
-            for table in tables {
-                for chk in &table.check_constraints {
-                    debug!("Creating check: {}.{}", table.name, chk.name);
-                    if let Err(e) = self
-                        .target
-                        .create_check_constraint(table, chk, target_schema)
-                        .await
-                    {
-                        warn!("Failed to create check {}: {}", chk.name, e);
-                    }
-                }
-            }
-        }
-
-        // Reset sequences
-        for table in tables {
-            if let Err(e) = self.target.reset_sequence(target_schema, table).await {
-                debug!("No sequence to reset for {}: {}", table.full_name(), e);
             }
         }
 
@@ -1530,6 +1675,101 @@ impl MigrationResult {
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
     }
+}
+
+/// Build FK dependency levels for topological ordering.
+///
+/// Returns tables grouped by dependency level. Tables in level 0 have no FK dependencies
+/// on other tables in the set. Tables in level N only reference tables in levels 0..N-1.
+/// This allows parallel FK creation within each level while respecting dependencies.
+fn build_fk_dependency_levels(tables: &[Table]) -> Vec<Vec<Table>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Build a map of table name -> table for quick lookup
+    let table_map: HashMap<String, &Table> = tables
+        .iter()
+        .map(|t| (t.full_name(), t))
+        .collect();
+
+    // Build adjacency list: table -> set of tables it references
+    let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for table in tables {
+        let table_name = table.full_name();
+        dependencies.entry(table_name.clone()).or_default();
+
+        for fk in &table.foreign_keys {
+            let ref_name = format!("{}.{}", fk.ref_schema, fk.ref_table);
+            // Only count dependencies on tables in our set
+            if table_map.contains_key(&ref_name) && ref_name != table_name {
+                dependencies
+                    .entry(table_name.clone())
+                    .or_default()
+                    .insert(ref_name);
+            }
+        }
+    }
+
+    // Kahn's algorithm with level tracking
+    let mut levels: Vec<Vec<Table>> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut remaining: HashSet<String> = tables.iter().map(|t| t.full_name()).collect();
+
+    // Start with tables that have no dependencies
+    for table in tables {
+        let name = table.full_name();
+        if dependencies.get(&name).map(|d| d.is_empty()).unwrap_or(true) {
+            queue.push_back(name);
+        }
+    }
+
+    while !remaining.is_empty() {
+        let mut current_level: Vec<Table> = Vec::new();
+        let level_size = queue.len();
+
+        if level_size == 0 {
+            // Circular dependency detected - add remaining tables to final level
+            // (FKs may fail but that's expected behavior for circular refs)
+            for name in &remaining {
+                if let Some(table) = table_map.get(name) {
+                    current_level.push((*table).clone());
+                }
+            }
+            remaining.clear();
+        } else {
+            for _ in 0..level_size {
+                if let Some(name) = queue.pop_front() {
+                    if remaining.remove(&name) {
+                        if let Some(table) = table_map.get(&name) {
+                            current_level.push((*table).clone());
+                        }
+                    }
+                }
+            }
+
+            // Add tables whose dependencies are now satisfied
+            for table in tables {
+                let name = table.full_name();
+                if remaining.contains(&name) {
+                    let deps = dependencies.get(&name).cloned().unwrap_or_default();
+                    if deps.iter().all(|d| !remaining.contains(d)) {
+                        queue.push_back(name);
+                    }
+                }
+            }
+        }
+
+        if !current_level.is_empty() {
+            levels.push(current_level);
+        }
+    }
+
+    // If no levels were created, return all tables in a single level
+    if levels.is_empty() && !tables.is_empty() {
+        levels.push(tables.to_vec());
+    }
+
+    levels
 }
 
 #[cfg(test)]
@@ -2007,5 +2247,115 @@ mod tests {
         assert!(pending_tables.contains(&&"dbo.Orders"));
         assert!(pending_tables.contains(&&"dbo.Products"));
         assert!(!pending_tables.contains(&&"dbo.Users")); // Completed, should be skipped
+    }
+
+    use crate::core::schema::Column;
+
+    fn make_test_column(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: "int".to_string(),
+            max_length: 4,
+            precision: 10,
+            scale: 0,
+            is_nullable: false,
+            is_identity: name == "id",
+            ordinal_pos: 1,
+        }
+    }
+
+    fn make_test_table(schema: &str, name: &str) -> Table {
+        Table {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            columns: vec![make_test_column("id")],
+            primary_key: vec!["id".to_string()],
+            pk_columns: vec![make_test_column("id")],
+            row_count: 1000,
+            estimated_row_size: 100,
+            indexes: vec![],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        }
+    }
+
+    #[test]
+    fn test_fk_dependency_levels_no_fks() {
+        let tables = vec![
+            make_test_table("dbo", "Users"),
+            make_test_table("dbo", "Products"),
+        ];
+
+        let levels = super::build_fk_dependency_levels(&tables);
+
+        // All tables should be in a single level (no dependencies)
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].len(), 2);
+    }
+
+    #[test]
+    fn test_fk_dependency_levels_with_dependencies() {
+        use crate::core::schema::ForeignKey;
+
+        // Create tables with FK dependencies:
+        // Orders -> Users (Orders references Users)
+        // OrderItems -> Orders, Products (OrderItems references both)
+        let users = make_test_table("dbo", "Users");
+        let products = make_test_table("dbo", "Products");
+
+        let mut orders = make_test_table("dbo", "Orders");
+        orders.foreign_keys = vec![ForeignKey {
+            name: "FK_Orders_Users".to_string(),
+            columns: vec!["user_id".to_string()],
+            ref_table: "Users".to_string(),
+            ref_schema: "dbo".to_string(),
+            ref_columns: vec!["id".to_string()],
+            on_delete: "NO ACTION".to_string(),
+            on_update: "NO ACTION".to_string(),
+        }];
+
+        let mut order_items = make_test_table("dbo", "OrderItems");
+        order_items.foreign_keys = vec![
+            ForeignKey {
+                name: "FK_OrderItems_Orders".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "Orders".to_string(),
+                ref_schema: "dbo".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "NO ACTION".to_string(),
+                on_update: "NO ACTION".to_string(),
+            },
+            ForeignKey {
+                name: "FK_OrderItems_Products".to_string(),
+                columns: vec!["product_id".to_string()],
+                ref_table: "Products".to_string(),
+                ref_schema: "dbo".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "NO ACTION".to_string(),
+                on_update: "NO ACTION".to_string(),
+            },
+        ];
+
+        let tables = vec![order_items, orders, users, products];
+        let levels = super::build_fk_dependency_levels(&tables);
+
+        // Should have 3 levels:
+        // Level 0: Users, Products (no dependencies)
+        // Level 1: Orders (depends on Users)
+        // Level 2: OrderItems (depends on Orders and Products)
+        assert_eq!(levels.len(), 3);
+
+        // Level 0 should have Users and Products
+        let level0_names: Vec<_> = levels[0].iter().map(|t| t.full_name()).collect();
+        assert!(level0_names.contains(&"dbo.Users".to_string()));
+        assert!(level0_names.contains(&"dbo.Products".to_string()));
+
+        // Level 1 should have Orders
+        let level1_names: Vec<_> = levels[1].iter().map(|t| t.full_name()).collect();
+        assert!(level1_names.contains(&"dbo.Orders".to_string()));
+
+        // Level 2 should have OrderItems
+        let level2_names: Vec<_> = levels[2].iter().map(|t| t.full_name()).collect();
+        assert!(level2_names.contains(&"dbo.OrderItems".to_string()));
     }
 }
