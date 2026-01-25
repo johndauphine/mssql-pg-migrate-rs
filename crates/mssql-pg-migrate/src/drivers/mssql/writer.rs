@@ -25,6 +25,7 @@ use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
 use crate::error::{MigrateError, Result};
+use crate::target::{SqlNullType as TargetSqlNullType, SqlValue as TargetSqlValue};
 
 /// Maximum string length (in bytes) for TDS bulk insert.
 const BULK_INSERT_STRING_LIMIT: usize = 65535;
@@ -46,7 +47,7 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Connection manager for bb8 pool with Tiberius.
 #[derive(Clone)]
-struct TiberiusConnectionManager {
+pub struct TiberiusConnectionManager {
     config: TargetConfig,
 }
 
@@ -206,8 +207,61 @@ impl MssqlWriter {
         self
     }
 
+    /// Test the database connection.
+    pub async fn test_connection(&self) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        conn.simple_query("SELECT 1").await?;
+        Ok(())
+    }
+
+    // === Backward-compatible methods for legacy target::SqlValue API ===
+
+    /// Write rows using old SqlValue type (backward compatibility).
+    pub async fn write_chunk(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        rows: Vec<Vec<TargetSqlValue>>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .collect();
+        let batch = Batch::new(converted_rows);
+        TargetWriter::write_batch(self, schema, table, cols, batch).await
+    }
+
+    /// Upsert rows using old SqlValue type (backward compatibility).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_chunk(
+        &self,
+        schema: &str,
+        table: &str,
+        cols: &[String],
+        pk_cols: &[String],
+        rows: Vec<Vec<TargetSqlValue>>,
+        writer_id: usize,
+        partition_id: Option<i32>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .collect();
+        let batch = Batch::new(converted_rows);
+        TargetWriter::upsert_batch(self, schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+    }
+
     /// Get a pooled connection.
-    async fn get_conn(&self) -> Result<PooledConnection<'_, TiberiusConnectionManager>> {
+    ///
+    /// This method is public to allow state backends to access the connection pool.
+    pub async fn get_conn(&self) -> Result<PooledConnection<'_, TiberiusConnectionManager>> {
         self.pool
             .get()
             .await
@@ -1185,6 +1239,52 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
             let increments = nanos / 100;
             ColumnData::Time(Some(tiberius::time::Time::new(increments, 7)))
         }
+    }
+}
+
+/// Convert old target::SqlValue to new core::value::SqlValue for backward compatibility.
+fn convert_target_to_new_sql_value(old: TargetSqlValue) -> SqlValue<'static> {
+    match old {
+        TargetSqlValue::Null(nt) => {
+            let new_nt = match nt {
+                TargetSqlNullType::Bool => SqlNullType::Bool,
+                TargetSqlNullType::I16 => SqlNullType::I16,
+                TargetSqlNullType::I32 => SqlNullType::I32,
+                TargetSqlNullType::I64 => SqlNullType::I64,
+                TargetSqlNullType::F32 => SqlNullType::F32,
+                TargetSqlNullType::F64 => SqlNullType::F64,
+                TargetSqlNullType::String => SqlNullType::String,
+                TargetSqlNullType::Bytes => SqlNullType::Bytes,
+                TargetSqlNullType::Uuid => SqlNullType::Uuid,
+                TargetSqlNullType::Decimal => SqlNullType::Decimal,
+                TargetSqlNullType::DateTime => SqlNullType::DateTime,
+                TargetSqlNullType::DateTimeOffset => SqlNullType::DateTimeOffset,
+                TargetSqlNullType::Date => SqlNullType::Date,
+                TargetSqlNullType::Time => SqlNullType::Time,
+            };
+            SqlValue::Null(new_nt)
+        }
+        TargetSqlValue::Bool(v) => SqlValue::Bool(v),
+        TargetSqlValue::I16(v) => SqlValue::I16(v),
+        TargetSqlValue::I32(v) => SqlValue::I32(v),
+        TargetSqlValue::I64(v) => SqlValue::I64(v),
+        TargetSqlValue::F32(v) => SqlValue::F32(v),
+        TargetSqlValue::F64(v) => SqlValue::F64(v),
+        TargetSqlValue::String(v) => SqlValue::Text(Cow::Owned(v)),
+        TargetSqlValue::CompressedText {
+            original_len,
+            compressed,
+        } => SqlValue::CompressedText {
+            original_len,
+            compressed,
+        },
+        TargetSqlValue::Bytes(v) => SqlValue::Bytes(Cow::Owned(v)),
+        TargetSqlValue::Uuid(v) => SqlValue::Uuid(v),
+        TargetSqlValue::Decimal(v) => SqlValue::Decimal(v),
+        TargetSqlValue::DateTime(v) => SqlValue::DateTime(v),
+        TargetSqlValue::DateTimeOffset(v) => SqlValue::DateTimeOffset(v),
+        TargetSqlValue::Date(v) => SqlValue::Date(v),
+        TargetSqlValue::Time(v) => SqlValue::Time(v),
     }
 }
 

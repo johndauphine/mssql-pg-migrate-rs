@@ -39,7 +39,7 @@ pub mod postgres;
 pub use common::{SslMode, TlsBuilder};
 
 // Re-export driver types
-pub use mssql::{MssqlDialect, MssqlReader, MssqlWriter};
+pub use mssql::{MssqlDialect, MssqlReader, MssqlWriter, TiberiusConnectionManager};
 #[cfg(feature = "mysql")]
 pub use mysql::{MysqlDialect, MysqlReader, MysqlWriter};
 pub use postgres::{PostgresDialect, PostgresReader, PostgresWriter};
