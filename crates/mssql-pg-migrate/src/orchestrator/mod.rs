@@ -1405,24 +1405,38 @@ impl Orchestrator {
                         let start = Instant::now();
                         let table_name = table.full_name();
                         let row_count = table.row_count;
-                        if let Err(e) = target.create_primary_key(&table, &schema).await {
-                            warn!("Failed to create PK on {}: {}", table_name, e);
-                        } else {
-                            info!(
-                                "Created PK on {} ({} rows) in {:.2}s",
-                                table_name,
-                                row_count,
-                                start.elapsed().as_secs_f64()
-                            );
+                        match target.create_primary_key(&table, &schema).await {
+                            Ok(_) => {
+                                info!(
+                                    "Created PK on {} ({} rows) in {:.2}s",
+                                    table_name,
+                                    row_count,
+                                    start.elapsed().as_secs_f64()
+                                );
+                                Ok(())
+                            }
+                            Err(e) => {
+                                warn!("Failed to create PK on {}: {}", table_name, e);
+                                Err(format!("PK creation failed on {}: {}", table_name, e))
+                            }
                         }
                     });
                     handles.push(handle);
                 }
 
+                let mut pk_errors = Vec::new();
                 for handle in handles {
-                    if let Err(e) = handle.await {
-                        warn!("PK creation task panicked: {}", e);
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => pk_errors.push(e),
+                        Err(e) => warn!("PK creation task panicked: {}", e),
                     }
+                }
+                if !pk_errors.is_empty() {
+                    return Err(crate::error::MigrateError::Transfer {
+                        table: "finalization".to_string(),
+                        message: pk_errors.join("; "),
+                    });
                 }
                 info!("Primary keys created in {:.2}s", pk_start.elapsed().as_secs_f64());
             }
@@ -1679,12 +1693,10 @@ fn build_fk_dependency_levels(tables: &[Table]) -> Vec<Vec<Table>> {
 
     // Build adjacency list: table -> set of tables it references
     let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
 
     for table in tables {
         let table_name = table.full_name();
         dependencies.entry(table_name.clone()).or_default();
-        in_degree.entry(table_name.clone()).or_insert(0);
 
         for fk in &table.foreign_keys {
             let ref_name = format!("{}.{}", fk.ref_schema, fk.ref_table);
@@ -1695,13 +1707,6 @@ fn build_fk_dependency_levels(tables: &[Table]) -> Vec<Vec<Table>> {
                     .or_default()
                     .insert(ref_name);
             }
-        }
-    }
-
-    // Calculate in-degrees (how many tables depend on each table)
-    for deps in dependencies.values() {
-        for dep in deps {
-            *in_degree.entry(dep.clone()).or_insert(0) += 1;
         }
     }
 
