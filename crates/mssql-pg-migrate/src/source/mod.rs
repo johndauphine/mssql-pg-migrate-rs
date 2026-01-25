@@ -17,7 +17,6 @@
 //!
 //! The old types remain for backward compatibility during the transition period.
 
-mod bench_copy;
 mod direct_copy;
 mod pg_binary;
 mod postgres;

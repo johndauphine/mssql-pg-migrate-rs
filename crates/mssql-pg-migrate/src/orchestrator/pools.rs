@@ -22,7 +22,7 @@ use crate::source::{
 #[cfg(feature = "mysql")]
 use crate::state::{DbStateBackend, MssqlStateBackend, MysqlStateBackend, StateBackendEnum};
 #[cfg(not(feature = "mysql"))]
-use crate::state::{DbStateBackend, MssqlStateBackend, NoOpStateBackend, StateBackendEnum};
+use crate::state::{DbStateBackend, MssqlStateBackend, StateBackendEnum};
 use crate::target::{MssqlTargetPool, PgPool, SqlValue, TargetPool, UpsertWriter};
 use std::sync::Arc;
 use tokio::sync::mpsc;
