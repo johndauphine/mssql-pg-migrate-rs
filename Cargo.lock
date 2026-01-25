@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "mssql-pg-migrate"
-version = "1.41.1"
+version = "1.42.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "mssql-pg-migrate-cli"
-version = "1.41.1"
+version = "1.42.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
