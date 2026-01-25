@@ -2079,6 +2079,7 @@ mod tests {
     #[test]
     fn test_mssql_to_postgres_integer_types() {
         assert_eq!(mssql_to_postgres("int", 0, 0, 0), "integer");
+        assert_eq!(mssql_to_postgres("integer", 0, 0, 0), "integer"); // alias for int
         assert_eq!(mssql_to_postgres("bigint", 0, 0, 0), "bigint");
         assert_eq!(mssql_to_postgres("smallint", 0, 0, 0), "smallint");
         assert_eq!(mssql_to_postgres("tinyint", 0, 0, 0), "smallint");
@@ -2216,6 +2217,10 @@ mod tests {
     fn test_mssql_to_mysql_types() {
         let m = mssql_to_mysql("bit", 0, 0, 0);
         assert_eq!(m.target_type, "TINYINT(1)");
+        let m = mssql_to_mysql("int", 0, 0, 0);
+        assert_eq!(m.target_type, "INT");
+        let m = mssql_to_mysql("integer", 0, 0, 0); // alias for int
+        assert_eq!(m.target_type, "INT");
         let m = mssql_to_mysql("nvarchar", 255, 0, 0);
         assert_eq!(m.target_type, "VARCHAR(255)");
         let m = mssql_to_mysql("nvarchar", -1, 0, 0);
@@ -2268,6 +2273,9 @@ mod tests {
         assert_eq!(info.canonical_type, CanonicalType::Int16);
 
         let info = conv.to_canonical("int", 0, 0, 0);
+        assert_eq!(info.canonical_type, CanonicalType::Int32);
+
+        let info = conv.to_canonical("integer", 0, 0, 0); // alias for int
         assert_eq!(info.canonical_type, CanonicalType::Int32);
 
         let info = conv.to_canonical("bigint", 0, 0, 0);
