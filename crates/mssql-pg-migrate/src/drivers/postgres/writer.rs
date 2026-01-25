@@ -1059,11 +1059,13 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue<'_>) {
             buf.put_slice(u.as_bytes());
         }
         SqlValue::Decimal(d) => {
-            // Simplified - write as text
-            let s = d.to_string();
-            let bytes = s.as_bytes();
-            buf.put_i32(bytes.len() as i32);
-            buf.put_slice(bytes);
+            // PostgreSQL NUMERIC binary format:
+            // - ndigits (i16): number of base-10000 digits
+            // - weight (i16): weight of first digit (position above decimal)
+            // - sign (i16): 0x0000=positive, 0x4000=negative
+            // - dscale (i16): display scale (decimal places)
+            // - digits (i16[]): base-10000 digits
+            encode_decimal_binary(buf, d);
         }
         SqlValue::DateTime(dt) => {
             // PostgreSQL timestamp: microseconds since 2000-01-01
@@ -1098,6 +1100,130 @@ fn write_binary_value(buf: &mut BytesMut, value: &SqlValue<'_>) {
             buf.put_i32(8);
             buf.put_i64(micros);
         }
+    }
+}
+
+/// Encode a Decimal value into PostgreSQL binary NUMERIC format.
+///
+/// PostgreSQL NUMERIC binary format:
+/// - ndigits (i16): number of base-10000 digits
+/// - weight (i16): weight of first digit (position of first digit above decimal, minus 1)
+/// - sign (i16): 0x0000=positive, 0x4000=negative
+/// - dscale (i16): display scale (decimal places)
+/// - digits (i16[]): array of base-10000 digits
+fn encode_decimal_binary(buf: &mut BytesMut, d: &rust_decimal::Decimal) {
+    const NUMERIC_POS: i16 = 0x0000;
+    const NUMERIC_NEG: i16 = 0x4000;
+
+    // Handle zero
+    if d.is_zero() {
+        buf.put_i32(8); // 4 i16 header fields
+        buf.put_i16(0); // ndigits
+        buf.put_i16(0); // weight
+        buf.put_i16(NUMERIC_POS); // sign
+        buf.put_i16(d.scale() as i16); // dscale
+        return;
+    }
+
+    let sign = if d.is_sign_negative() {
+        NUMERIC_NEG
+    } else {
+        NUMERIC_POS
+    };
+    let scale = d.scale();
+    let dscale = scale as i16;
+
+    // Use string representation to properly handle decimal positioning
+    // This correctly handles cases like 0.01 where mantissa=1 but we need "01"
+    let abs_str = d.abs().to_string();
+
+    // Split into integer and fractional parts
+    let (int_part, frac_part) = if let Some(dot_pos) = abs_str.find('.') {
+        (&abs_str[..dot_pos], &abs_str[dot_pos + 1..])
+    } else {
+        (abs_str.as_str(), "")
+    };
+
+    // For base-10000, we need to group digits from the decimal point
+    // Integer part: group from right to left (from decimal point) in groups of 4
+    // Fractional part: group from left to right (from decimal point) in groups of 4
+
+    // Process integer part: pad on LEFT to multiple of 4
+    let mut int_digits: Vec<i16> = Vec::new();
+    let int_part_clean = int_part.trim_start_matches('0');
+    if !int_part_clean.is_empty() {
+        let padded_len = ((int_part_clean.len() + 3) / 4) * 4;
+        let padded = format!("{:0>width$}", int_part_clean, width = padded_len);
+        for chunk in padded.as_bytes().chunks(4) {
+            let s = std::str::from_utf8(chunk).unwrap();
+            int_digits.push(s.parse::<i16>().unwrap());
+        }
+    }
+
+    // Process fractional part: pad on RIGHT to multiple of 4
+    let mut frac_digits: Vec<i16> = Vec::new();
+    if !frac_part.is_empty() {
+        let padded_len = ((frac_part.len() + 3) / 4) * 4;
+        let mut padded = frac_part.to_string();
+        while padded.len() < padded_len {
+            padded.push('0');
+        }
+        for chunk in padded.as_bytes().chunks(4) {
+            let s = std::str::from_utf8(chunk).unwrap();
+            frac_digits.push(s.parse::<i16>().unwrap());
+        }
+    }
+
+    // Calculate weight
+    let num_int_groups = int_digits.len() as i16;
+    let weight = if num_int_groups > 0 {
+        num_int_groups - 1
+    } else {
+        // All fractional - find how many leading zero groups
+        // e.g., 0.0001 -> frac_part="0001" -> first group is 1 -> weight=-1
+        // e.g., 0.00000001 -> frac_part="00000001" -> groups ["0000","0001"] -> first nonzero at index 1 -> weight=-2
+        let mut leading_zero_groups = 0i16;
+        for &digit in &frac_digits {
+            if digit == 0 {
+                leading_zero_groups += 1;
+            } else {
+                break;
+            }
+        }
+        -(leading_zero_groups + 1)
+    };
+
+    // Combine digits
+    let mut base10000_digits: Vec<i16> = Vec::new();
+    base10000_digits.extend(int_digits);
+    base10000_digits.extend(frac_digits);
+
+    // Remove trailing zeros from the digit array (PostgreSQL does this)
+    while base10000_digits.len() > 1 && *base10000_digits.last().unwrap() == 0 {
+        base10000_digits.pop();
+    }
+
+    // Remove leading zeros (but keep at least one digit)
+    // Note: weight is NOT adjusted because it represents the position of the first non-zero digit
+    while base10000_digits.len() > 1 && base10000_digits[0] == 0 {
+        base10000_digits.remove(0);
+    }
+
+    let ndigits = base10000_digits.len() as i16;
+
+    // Write length: 8 bytes header + 2 bytes per digit
+    let len = 8 + (ndigits as i32 * 2);
+    buf.put_i32(len);
+
+    // Write header
+    buf.put_i16(ndigits);
+    buf.put_i16(weight);
+    buf.put_i16(sign);
+    buf.put_i16(dscale);
+
+    // Write digits
+    for digit in base10000_digits {
+        buf.put_i16(digit);
     }
 }
 

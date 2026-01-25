@@ -210,7 +210,6 @@ fn prompt_source_config(existing: Option<&SourceConfig>) -> WizardResult<SourceC
         user,
         password,
         schema,
-        ssl_mode: "require".to_string(), // Default for PostgreSQL sources; ignored for MSSQL
         encrypt,
         trust_server_cert,
         auth: Default::default(), // SQL Server auth by default; Kerberos via config file
