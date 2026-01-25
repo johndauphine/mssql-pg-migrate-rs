@@ -522,7 +522,23 @@ impl TargetPoolImpl {
                 }
             }
             // Use new MssqlWriter (Tiberius + bb8)
+            use crate::dialect::{MysqlToMssqlMapper, PostgresToMssqlMapper};
             let writer = MssqlWriter::with_pool_size(config.target.clone(), max_conns as u32).await?;
+            // Add type mapper based on source database type
+            let source_type = config.source.r#type.to_lowercase();
+            let writer = if source_type == "mssql"
+                || source_type == "sqlserver"
+                || source_type == "sql_server"
+            {
+                // MSSQL → MSSQL: no type mapper needed (identity mapping)
+                writer
+            } else if source_type == "mysql" || source_type == "mariadb" {
+                // MySQL/MariaDB → MSSQL
+                writer.with_type_mapper(Arc::new(MysqlToMssqlMapper::new()))
+            } else {
+                // Default: PostgreSQL → MSSQL
+                writer.with_type_mapper(Arc::new(PostgresToMssqlMapper::new()))
+            };
             Ok(Self::Mssql(Arc::new(writer)))
         } else if target_type == "mysql" || target_type == "mariadb" {
             // MySQL/MariaDB target - uses SQLx

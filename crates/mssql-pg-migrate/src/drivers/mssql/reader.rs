@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bb8::{Pool, PooledConnection};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use tiberius::{AuthMethod as TiberiusAuthMethod, Client, Config, EncryptionLevel, Query, Row};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -906,12 +906,12 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue<'static
             .map(SqlValue::DateTime)
             .unwrap_or(SqlValue::Null(SqlNullType::DateTime)),
         "date" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| SqlValue::Date(dt.date()))
+            .get::<NaiveDate, _>(idx)
+            .map(SqlValue::Date)
             .unwrap_or(SqlValue::Null(SqlNullType::Date)),
         "time" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| SqlValue::Time(dt.time()))
+            .get::<NaiveTime, _>(idx)
+            .map(SqlValue::Time)
             .unwrap_or(SqlValue::Null(SqlNullType::Time)),
         "binary" | "varbinary" | "image" => row
             .get::<&[u8], _>(idx)
@@ -979,12 +979,12 @@ fn convert_row_value_for_target(row: &Row, idx: usize, data_type: &str) -> Targe
             .map(TargetSqlValue::DateTime)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::DateTime)),
         "date" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| TargetSqlValue::Date(dt.date()))
+            .get::<NaiveDate, _>(idx)
+            .map(TargetSqlValue::Date)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Date)),
         "time" => row
-            .get::<NaiveDateTime, _>(idx)
-            .map(|dt| TargetSqlValue::Time(dt.time()))
+            .get::<NaiveTime, _>(idx)
+            .map(TargetSqlValue::Time)
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Time)),
         "binary" | "varbinary" | "image" => row
             .get::<&[u8], _>(idx)

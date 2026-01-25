@@ -125,6 +125,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the ring crypto provider for rustls before any TLS operations.
+    // This is required when multiple crates (tokio-postgres-rustls, mysql_async)
+    // bring in rustls with different default features.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
