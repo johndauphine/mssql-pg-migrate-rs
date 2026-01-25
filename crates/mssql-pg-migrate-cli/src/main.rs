@@ -128,7 +128,13 @@ async fn main() -> ExitCode {
     // Install the ring crypto provider for rustls before any TLS operations.
     // This is required when multiple crates (tokio-postgres-rustls, mysql_async)
     // bring in rustls with different default features.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+        // Only fail if it's not already installed - Err means a different provider is set
+        eprintln!(
+            "Warning: Could not install ring crypto provider: {:?}. TLS may not work correctly.",
+            e
+        );
+    }
 
     match run().await {
         Ok(()) => ExitCode::SUCCESS,

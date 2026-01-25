@@ -1392,4 +1392,136 @@ mod tests {
         assert_eq!(format_postgres_type("varchar", 0, 0, 0), "text");
         assert_eq!(format_postgres_type("numeric", 0, 10, 2), "numeric(10,2)");
     }
+
+    /// Helper to extract NUMERIC header from encoded buffer
+    fn parse_numeric_header(buf: &[u8]) -> (i32, i16, i16, i16, i16, Vec<i16>) {
+        use bytes::Buf;
+        let mut cursor = std::io::Cursor::new(buf);
+        let len = cursor.get_i32();
+        let ndigits = cursor.get_i16();
+        let weight = cursor.get_i16();
+        let sign = cursor.get_i16();
+        let dscale = cursor.get_i16();
+        let mut digits = Vec::new();
+        for _ in 0..ndigits {
+            digits.push(cursor.get_i16());
+        }
+        (len, ndigits, weight, sign, dscale, digits)
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_zero() {
+        let mut buf = BytesMut::new();
+        let d = rust_decimal::Decimal::ZERO;
+        encode_decimal_binary(&mut buf, &d);
+
+        let (len, ndigits, weight, sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(len, 8); // Header only
+        assert_eq!(ndigits, 0);
+        assert_eq!(weight, 0);
+        assert_eq!(sign, 0x0000); // Positive
+        assert_eq!(dscale, 0);
+        assert!(digits.is_empty());
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_simple_integer() {
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "12345".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (len, ndigits, weight, sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(len, 8 + 4); // Header + 2 digits
+        assert_eq!(ndigits, 2); // "1" and "2345" in base-10000
+        assert_eq!(weight, 1); // First digit in 10000s place
+        assert_eq!(sign, 0x0000); // Positive
+        assert_eq!(dscale, 0);
+        assert_eq!(digits, vec![1, 2345]);
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_with_fraction() {
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "123.45".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (len, ndigits, weight, sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 2); // "123" and "4500" in base-10000
+        assert_eq!(weight, 0); // First digit in 1s place (0-9999)
+        assert_eq!(sign, 0x0000); // Positive
+        assert_eq!(dscale, 2);
+        assert_eq!(digits, vec![123, 4500]);
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_negative() {
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "-456.78".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (_len, ndigits, weight, sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 2);
+        assert_eq!(weight, 0);
+        assert_eq!(sign, 0x4000); // Negative
+        assert_eq!(dscale, 2);
+        assert_eq!(digits, vec![456, 7800]);
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_small_fraction() {
+        // 0.01 should be: weight=-1, digits=[100]
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "0.01".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (_len, ndigits, weight, sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 1);
+        assert_eq!(weight, -1); // First digit in 0.0001-0.9999 range
+        assert_eq!(sign, 0x0000);
+        assert_eq!(dscale, 2);
+        assert_eq!(digits, vec![100]); // 0.01 = 100/10000
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_very_small() {
+        // 0.0001 should be: weight=-1, digits=[1]
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "0.0001".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (_len, ndigits, weight, _sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 1);
+        assert_eq!(weight, -1);
+        assert_eq!(dscale, 4);
+        assert_eq!(digits, vec![1]); // 0.0001 = 1/10000
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_tiny() {
+        // 0.0000000001 should be: weight=-3, digits=[100]
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "0.0000000001".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (_len, ndigits, weight, _sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 1);
+        assert_eq!(weight, -3); // 10000^-3 range
+        assert_eq!(dscale, 10);
+        assert_eq!(digits, vec![100]); // 0.0000000001 = 100 * 10000^-3
+    }
+
+    #[test]
+    fn test_encode_decimal_binary_large() {
+        // Large number: 12345678901234
+        let mut buf = BytesMut::new();
+        let d: rust_decimal::Decimal = "12345678901234".parse().unwrap();
+        encode_decimal_binary(&mut buf, &d);
+
+        let (_len, ndigits, weight, _sign, dscale, digits) = parse_numeric_header(&buf);
+        assert_eq!(ndigits, 4);
+        assert_eq!(weight, 3); // 10000^3 = 10^12 range
+        assert_eq!(dscale, 0);
+        // 12345678901234 = 12*10000^3 + 3456*10000^2 + 7890*10000^1 + 1234*10000^0
+        assert_eq!(digits, vec![12, 3456, 7890, 1234]);
+    }
 }
