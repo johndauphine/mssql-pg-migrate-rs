@@ -14,6 +14,7 @@ use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslO
 use tracing::{debug, info, warn};
 
 use crate::config::{MysqlLoadData, TargetConfig};
+use crate::core::identifier::validate_check_constraint;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlValue};
@@ -678,7 +679,7 @@ impl TargetWriter for MysqlWriter {
             "ALTER TABLE {} ADD CONSTRAINT {} {}",
             Self::qualify_table(target_schema, &table.name),
             Self::quote_ident(&chk.name),
-            convert_check_definition(&chk.definition)
+            convert_check_definition(&chk.definition)?
         );
 
         match conn.query_drop(&sql).await {
@@ -1002,8 +1003,11 @@ fn map_referential_action(action: &str) -> &str {
     }
 }
 
-/// Convert check definition for MySQL.
-fn convert_check_definition(def: &str) -> String {
+/// Convert check definition for MySQL with security validation.
+fn convert_check_definition(def: &str) -> Result<String> {
+    // Validate the check constraint for SQL injection patterns
+    validate_check_constraint(def)?;
+
     let mut result = def.to_string();
 
     // Convert SQL Server bracket-quoted identifiers to MySQL backticks
@@ -1028,7 +1032,7 @@ fn convert_check_definition(def: &str) -> String {
     result = result.replace("getdate()", "NOW()");
     result = result.replace("GETDATE()", "NOW()");
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1044,13 +1048,21 @@ mod tests {
     #[test]
     fn test_convert_check_definition() {
         assert_eq!(
-            convert_check_definition("CHECK ([age] >= 0)"),
+            convert_check_definition("CHECK ([age] >= 0)").unwrap(),
             "CHECK (`age` >= 0)"
         );
         assert_eq!(
-            convert_check_definition("CHECK (\"status\" IN ('A', 'B'))"),
+            convert_check_definition("CHECK (\"status\" IN ('A', 'B'))").unwrap(),
             "CHECK (`status` IN ('A', 'B'))"
         );
+    }
+
+    #[test]
+    fn test_convert_check_definition_rejects_injection() {
+        // Should reject SQL injection attempts
+        assert!(convert_check_definition("1=1; DROP TABLE users").is_err());
+        assert!(convert_check_definition("1=1 -- comment").is_err());
+        assert!(convert_check_definition("1=1; EXEC xp_cmdshell").is_err());
     }
 
     #[test]

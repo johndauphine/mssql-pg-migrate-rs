@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "kerberos")]
 use crate::config::AuthMethod as ConfigAuthMethod;
 use crate::config::TargetConfig;
+use crate::core::identifier::{qualify_mssql, quote_mssql};
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
@@ -229,7 +230,11 @@ impl MssqlWriter {
         }
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
-            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(convert_target_to_new_sql_value)
+                    .collect()
+            })
             .collect();
         let batch = Batch::new(converted_rows);
         TargetWriter::write_batch(self, schema, table, cols, batch).await
@@ -252,10 +257,24 @@ impl MssqlWriter {
         }
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
-            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(convert_target_to_new_sql_value)
+                    .collect()
+            })
             .collect();
         let batch = Batch::new(converted_rows);
-        TargetWriter::upsert_batch(self, schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+        TargetWriter::upsert_batch(
+            self,
+            schema,
+            table,
+            cols,
+            pk_cols,
+            batch,
+            writer_id,
+            partition_id,
+        )
+        .await
     }
 
     /// Get a pooled connection.
@@ -268,14 +287,16 @@ impl MssqlWriter {
             .map_err(|e| MigrateError::pool(e, "getting MSSQL target connection"))
     }
 
-    /// Quote an MSSQL identifier with brackets.
+    /// Quote an MSSQL identifier using centralized validation.
+    /// Panics on invalid identifiers (null bytes, excessive length).
     fn quote_ident(name: &str) -> String {
-        format!("[{}]", name.replace(']', "]]"))
+        quote_mssql(name).expect("invalid identifier")
     }
 
-    /// Qualify a table name with schema.
+    /// Qualify a table name with schema using centralized validation.
+    /// Panics on invalid identifiers.
     fn qualify_table(schema: &str, table: &str) -> String {
-        format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
+        qualify_mssql(schema, table).expect("invalid identifier")
     }
 
     /// Map a source type to MSSQL type.
@@ -846,8 +867,9 @@ impl TargetWriter for MssqlWriter {
 
 // Helper functions
 
+/// Quote an MSSQL identifier using centralized validation.
 fn quote_ident(name: &str) -> String {
-    format!("[{}]", name.replace(']', "]]"))
+    quote_mssql(name).expect("invalid identifier")
 }
 
 async fn ensure_staging_table(
@@ -1166,9 +1188,9 @@ fn sql_value_to_column_data(value: &SqlValue<'_>) -> ColumnData<'static> {
         SqlValue::CompressedText { compressed, .. } => {
             // Decompress LZ4 data
             match lz4_flex::decompress_size_prepended(compressed) {
-                Ok(decompressed) => {
-                    ColumnData::String(Some(Cow::Owned(String::from_utf8_lossy(&decompressed).into_owned())))
-                }
+                Ok(decompressed) => ColumnData::String(Some(Cow::Owned(
+                    String::from_utf8_lossy(&decompressed).into_owned(),
+                ))),
                 Err(_) => ColumnData::String(Some(Cow::Owned(String::new()))),
             }
         }

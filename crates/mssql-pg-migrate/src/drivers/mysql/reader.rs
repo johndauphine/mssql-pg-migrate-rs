@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::SourceConfig;
+use crate::core::identifier::quote_mysql;
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Partition, Table};
 use crate::core::traits::{ReadOptions, SourceReader};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
@@ -184,9 +185,10 @@ impl MysqlReader {
         Ok(())
     }
 
-    /// Quote a MySQL identifier.
+    /// Quote a MySQL identifier using centralized validation.
+    /// Panics on invalid identifiers (null bytes, excessive length).
     fn quote_ident(name: &str) -> String {
-        format!("`{}`", name.replace('`', "``"))
+        quote_mysql(name).expect("invalid identifier")
     }
 
     /// Convert a MySQL row to SqlValue vector.

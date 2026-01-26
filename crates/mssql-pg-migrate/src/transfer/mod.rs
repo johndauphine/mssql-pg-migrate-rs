@@ -6,9 +6,12 @@
 //! - Read-ahead buffering to overlap read and write operations
 
 use crate::config::TargetMode;
+use crate::core::identifier::{
+    qualify_mssql, qualify_mysql, qualify_pg, quote_mssql, quote_mysql, quote_pg,
+};
+use crate::core::schema::Table;
 use crate::error::{MigrateError, Result};
 use crate::orchestrator::{SourcePoolImpl, TargetPoolImpl};
-use crate::core::schema::Table;
 use crate::target::SqlValue;
 use chrono::{DateTime, Utc};
 use futures::future::try_join_all;
@@ -475,12 +478,7 @@ impl TransferEngine {
                         }
                         _ => {
                             target
-                                .write_chunk(
-                                    &schema,
-                                    &table_name_clone,
-                                    &columns_clone,
-                                    rows,
-                                )
+                                .write_chunk(&schema, &table_name_clone, &columns_clone, rows)
                                 .await
                         }
                     };
@@ -1021,29 +1019,29 @@ async fn read_chunk_keyset_fast(
         .iter()
         .map(|c| {
             if is_postgres {
-                quote_pg_ident(c)
+                quote_pg(c)
             } else if is_mysql {
-                quote_mysql_ident(c)
+                quote_mysql(c)
             } else {
-                quote_mssql_ident(c)
+                quote_mssql(c)
             }
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>>>()?
         .join(", ");
 
     let pk_quoted = if is_postgres {
-        quote_pg_ident(pk_col)
+        quote_pg(pk_col)?
     } else if is_mysql {
-        quote_mysql_ident(pk_col)
+        quote_mysql(pk_col)?
     } else {
-        quote_mssql_ident(pk_col)
+        quote_mssql(pk_col)?
     };
     let table_ref = if is_postgres {
-        qualify_pg_table(&table.schema, &table.name)
+        qualify_pg(&table.schema, &table.name)?
     } else if is_mysql {
-        qualify_mysql_table(&table.schema, &table.name)
+        qualify_mysql(&table.schema, &table.name)?
     } else {
-        qualify_mssql_table(&table.schema, &table.name)
+        qualify_mssql(&table.schema, &table.name)?
     };
 
     // Build query with database-specific syntax
@@ -1072,11 +1070,11 @@ async fn read_chunk_keyset_fast(
     // Add date filter for incremental sync (WHERE date_col > last_sync OR date_col IS NULL)
     if let Some(filter) = date_filter {
         let date_quoted = if is_postgres {
-            quote_pg_ident(&filter.column)
+            quote_pg(&filter.column)?
         } else if is_mysql {
-            quote_mysql_ident(&filter.column)
+            quote_mysql(&filter.column)?
         } else {
-            quote_mssql_ident(&filter.column)
+            quote_mssql(&filter.column)?
         };
         // SECURITY: timestamp_sql_safe() returns bounds-validated ISO 8601 string
         // ISO 8601 format (YYYY-MM-DD HH:MM:SS.fff) contains no SQL metacharacters
@@ -1137,33 +1135,33 @@ async fn read_chunk_offset(
         .iter()
         .map(|c| {
             if is_postgres {
-                quote_pg_ident(c)
+                quote_pg(c)
             } else if is_mysql {
-                quote_mysql_ident(c)
+                quote_mysql(c)
             } else {
-                quote_mssql_ident(c)
+                quote_mssql(c)
             }
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>>>()?
         .join(", ");
 
     let table_ref = if is_postgres {
-        qualify_pg_table(&table.schema, &table.name)
+        qualify_pg(&table.schema, &table.name)?
     } else if is_mysql {
-        qualify_mysql_table(&table.schema, &table.name)
+        qualify_mysql(&table.schema, &table.name)?
     } else {
-        qualify_mssql_table(&table.schema, &table.name)
+        qualify_mssql(&table.schema, &table.name)?
     };
 
     // Create ORDER BY from primary key columns
     let order_by = if table.primary_key.is_empty() {
         if !columns.is_empty() {
             if is_postgres {
-                quote_pg_ident(&columns[0])
+                quote_pg(&columns[0])?
             } else if is_mysql {
-                quote_mysql_ident(&columns[0])
+                quote_mysql(&columns[0])?
             } else {
-                quote_mssql_ident(&columns[0])
+                quote_mssql(&columns[0])?
             }
         } else {
             return Err(MigrateError::Transfer {
@@ -1177,14 +1175,14 @@ async fn read_chunk_offset(
             .iter()
             .map(|c| {
                 if is_postgres {
-                    quote_pg_ident(c)
+                    quote_pg(c)
                 } else if is_mysql {
-                    quote_mysql_ident(c)
+                    quote_mysql(c)
                 } else {
-                    quote_mssql_ident(c)
+                    quote_mssql(c)
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>>>()?
             .join(", ")
     };
 
@@ -1344,78 +1342,6 @@ async fn read_table_chunks_copy_binary(
     Ok(())
 }
 
-/// Quote a PostgreSQL identifier.
-///
-/// Escapes double quotes by doubling them and wraps in double quotes.
-/// Includes defensive validation for suspicious patterns.
-///
-/// # Security
-///
-/// Runtime validation prevents SQL injection via identifier manipulation.
-/// Panics on invalid identifiers (null bytes, excessive length) as these
-/// indicate corruption or attack attempts.
-fn quote_pg_ident(name: &str) -> String {
-    // SECURITY: Runtime validation (not debug-only)
-    // Null bytes should never appear in legitimate identifiers
-    if name.contains('\0') {
-        panic!(
-            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
-            name
-        );
-    }
-
-    // PostgreSQL identifier length limit is 63 bytes, but we're more conservative
-    if name.len() > 128 {
-        panic!(
-            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
-            name.len()
-        );
-    }
-
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// Qualify a PostgreSQL table name with schema and proper quoting.
-fn qualify_pg_table(schema: &str, table: &str) -> String {
-    format!("{}.{}", quote_pg_ident(schema), quote_pg_ident(table))
-}
-
-/// Quote a MySQL identifier using backticks.
-///
-/// Escapes backticks by doubling them and wraps in backticks.
-/// Includes defensive validation for suspicious patterns.
-///
-/// # Security
-///
-/// Runtime validation prevents SQL injection via identifier manipulation.
-/// Panics on invalid identifiers (null bytes, excessive length) as these
-/// indicate corruption or attack attempts.
-fn quote_mysql_ident(name: &str) -> String {
-    // SECURITY: Runtime validation (not debug-only)
-    // Null bytes should never appear in legitimate identifiers
-    if name.contains('\0') {
-        panic!(
-            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
-            name
-        );
-    }
-
-    // MySQL identifier length limit is 64 characters, but we're more conservative here
-    if name.len() > 128 {
-        panic!(
-            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
-            name.len()
-        );
-    }
-
-    format!("`{}`", name.replace('`', "``"))
-}
-
-/// Qualify a MySQL table name with schema/database and proper quoting.
-fn qualify_mysql_table(schema: &str, table: &str) -> String {
-    format!("{}.{}", quote_mysql_ident(schema), quote_mysql_ident(table))
-}
-
 /// Check if the primary key is a sortable integer type.
 /// Supports MSSQL, PostgreSQL, and MySQL type names.
 fn is_pk_sortable(table: &Table) -> bool {
@@ -1435,54 +1361,6 @@ fn is_pk_sortable(table: &Table) -> bool {
         // MySQL types
         "mediumint"
     )
-}
-
-/// Quote a SQL Server identifier, escaping closing brackets.
-///
-/// # SQL Identifier Parameterization
-///
-/// SQL identifiers (table names, column names, schema names) cannot be passed as
-/// parameters in prepared statements - only data values can be parameterized.
-/// This is a fundamental limitation of SQL, not a design choice.
-///
-/// To safely construct dynamic SQL with identifiers, we:
-/// 1. Wrap identifiers in brackets `[name]` (SQL Server's quoting mechanism)
-/// 2. Escape embedded closing brackets by doubling them: `]` → `]]`
-///
-/// This prevents SQL injection through identifier names while allowing dynamic
-/// table/column selection required for a generic migration tool.
-///
-/// ## Security Note
-///
-/// Identifier names come from database schema metadata, which is trusted.
-/// However, we add defensive validation to reject suspicious patterns that
-/// could indicate tampering or corruption.
-fn quote_mssql_ident(name: &str) -> String {
-    // SECURITY: Runtime validation (not debug-only)
-    // Null bytes should never appear in legitimate identifiers
-    if name.contains('\0') {
-        panic!(
-            "SECURITY: Identifier contains null byte (possible injection attempt): {:?}",
-            name
-        );
-    }
-
-    // SQL Server identifier length limit is 128 characters
-    if name.len() > 128 {
-        panic!(
-            "SECURITY: Identifier exceeds maximum length (possible injection attempt): {} bytes",
-            name.len()
-        );
-    }
-
-    format!("[{}]", name.replace(']', "]]"))
-}
-
-/// Qualify a SQL Server table name with schema and proper quoting.
-///
-/// See [`quote_mssql_ident`] for details on identifier escaping.
-fn qualify_mssql_table(schema: &str, table: &str) -> String {
-    format!("{}.{}", quote_mssql_ident(schema), quote_mssql_ident(table))
 }
 
 #[cfg(test)]

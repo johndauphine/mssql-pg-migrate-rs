@@ -17,6 +17,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, info, warn};
 
 use crate::config::TargetConfig;
+use crate::core::identifier::{qualify_pg, quote_pg, validate_check_constraint};
 use crate::core::schema::{CheckConstraint, Column, ForeignKey, Index, Table};
 use crate::core::traits::{TargetWriter, TypeMapper};
 use crate::core::value::{Batch, SqlNullType, SqlValue};
@@ -127,14 +128,14 @@ impl PostgresWriter {
         Ok(config)
     }
 
-    /// Quote a PostgreSQL identifier.
-    fn quote_ident(name: &str) -> String {
-        format!("\"{}\"", name.replace('"', "\"\""))
+    /// Quote a PostgreSQL identifier using the centralized validation.
+    fn quote_ident(name: &str) -> Result<String> {
+        quote_pg(name)
     }
 
-    /// Qualify a table name with schema.
-    fn qualify_table(schema: &str, table: &str) -> String {
-        format!("{}.{}", Self::quote_ident(schema), Self::quote_ident(table))
+    /// Qualify a table name with schema using centralized validation.
+    fn qualify_table(schema: &str, table: &str) -> Result<String> {
+        qualify_pg(schema, table)
     }
 
     /// Map a source type to PostgreSQL type.
@@ -152,30 +153,30 @@ impl PostgresWriter {
     }
 
     /// Generate table DDL.
-    fn generate_ddl(&self, table: &Table, target_schema: &str, unlogged: bool) -> String {
+    fn generate_ddl(&self, table: &Table, target_schema: &str, unlogged: bool) -> Result<String> {
         let col_defs: Vec<String> = table
             .columns
             .iter()
             .map(|c| {
                 let target_type = self.map_type(c);
                 let null_clause = if c.is_nullable { "" } else { " NOT NULL" };
-                format!(
+                Ok(format!(
                     "{} {}{}",
-                    Self::quote_ident(&c.name),
+                    Self::quote_ident(&c.name)?,
                     target_type,
                     null_clause
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let unlogged_str = if unlogged { "UNLOGGED " } else { "" };
 
-        format!(
+        Ok(format!(
             "CREATE {}TABLE {} (\n    {}\n)",
             unlogged_str,
-            Self::qualify_table(target_schema, &table.name),
+            Self::qualify_table(target_schema, &table.name)?,
             col_defs.join(",\n    ")
-        )
+        ))
     }
 
     // === Backward-compatible methods for legacy transfer engine ===
@@ -211,7 +212,11 @@ impl PostgresWriter {
         // Convert old SqlValue to new SqlValue
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
-            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(convert_target_to_new_sql_value)
+                    .collect()
+            })
             .collect();
 
         let batch = Batch::new(converted_rows);
@@ -239,13 +244,27 @@ impl PostgresWriter {
         // Convert old SqlValue to new SqlValue
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
-            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(convert_target_to_new_sql_value)
+                    .collect()
+            })
             .collect();
 
         let batch = Batch::new(converted_rows);
 
         // Call the new upsert_batch via TargetWriter trait
-        TargetWriter::upsert_batch(self, schema, table, cols, pk_cols, batch, writer_id, partition_id).await
+        TargetWriter::upsert_batch(
+            self,
+            schema,
+            table,
+            cols,
+            pk_cols,
+            batch,
+            writer_id,
+            partition_id,
+        )
+        .await
     }
 
     /// Get an upsert writer for streaming upserts (backward compatibility).
@@ -299,12 +318,13 @@ fn convert_target_to_new_sql_value(value: TargetSqlValue) -> SqlValue<'static> {
         TargetSqlValue::Date(d) => SqlValue::Date(d),
         TargetSqlValue::Time(t) => SqlValue::Time(t),
         TargetSqlValue::Decimal(d) => SqlValue::Decimal(d),
-        TargetSqlValue::CompressedText { compressed, original_len } => {
-            SqlValue::CompressedText {
-                compressed,
-                original_len,
-            }
-        }
+        TargetSqlValue::CompressedText {
+            compressed,
+            original_len,
+        } => SqlValue::CompressedText {
+            compressed,
+            original_len,
+        },
         TargetSqlValue::DateTimeOffset(dto) => SqlValue::DateTimeOffset(dto),
     }
 }
@@ -333,7 +353,11 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
         // Convert old SqlValue to new SqlValue
         let converted_rows: Vec<Vec<SqlValue<'static>>> = rows
             .into_iter()
-            .map(|row| row.into_iter().map(convert_target_to_new_sql_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(convert_target_to_new_sql_value)
+                    .collect()
+            })
             .collect();
 
         let batch = Batch::new(converted_rows);
@@ -353,29 +377,29 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
 
         let qualified_target = format!(
             "{}.{}",
-            quote_ident(&self.schema),
-            quote_ident(&self.table)
+            quote_ident_unchecked(&self.schema),
+            quote_ident_unchecked(&self.table)
         );
         // Temp tables are in session's temp schema, not the target schema
-        let staging_quoted = quote_ident(&staging_name);
+        let staging_quoted = quote_ident_unchecked(&staging_name);
 
         // Create temp table (no ON COMMIT DROP - we'll drop it manually)
         let create_staging = format!(
             "CREATE TEMP TABLE IF NOT EXISTS {} (LIKE {} INCLUDING DEFAULTS)",
-            quote_ident(&staging_name),
+            quote_ident_unchecked(&staging_name),
             qualified_target
         );
         client.execute(&create_staging, &[]).await?;
 
         // Truncate staging
-        let truncate_staging = format!("TRUNCATE TABLE {}", quote_ident(&staging_name));
+        let truncate_staging = format!("TRUNCATE TABLE {}", quote_ident_unchecked(&staging_name));
         client.execute(&truncate_staging, &[]).await?;
 
         // Write batch to staging using COPY
-        let col_list: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+        let col_list: Vec<String> = cols.iter().map(|c| quote_ident_unchecked(c)).collect();
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT BINARY)",
-            quote_ident(&staging_name),
+            quote_ident_unchecked(&staging_name),
             col_list.join(", ")
         );
 
@@ -405,19 +429,25 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
         // Use pin_mut for the sink
         tokio::pin!(sink);
         let data = buf.freeze();
-        sink.send(data)
-            .await
-            .map_err(|e| MigrateError::transfer(&self.table, format!("sending COPY data: {}", e)))?;
+        sink.send(data).await.map_err(|e| {
+            MigrateError::transfer(&self.table, format!("sending COPY data: {}", e))
+        })?;
         sink.finish()
             .await
             .map_err(|e| MigrateError::transfer(&self.table, format!("finishing COPY: {}", e)))?;
 
         // Merge into target
-        let pk_list: Vec<String> = pk_cols.iter().map(|c| quote_ident(c)).collect();
+        let pk_list: Vec<String> = pk_cols.iter().map(|c| quote_ident_unchecked(c)).collect();
         let update_cols: Vec<String> = cols
             .iter()
             .filter(|c| !pk_cols.contains(c))
-            .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
+            .map(|c| {
+                format!(
+                    "{} = EXCLUDED.{}",
+                    quote_ident_unchecked(c),
+                    quote_ident_unchecked(c)
+                )
+            })
             .collect();
 
         let merge_sql = if update_cols.is_empty() {
@@ -451,9 +481,10 @@ impl UpsertWriter for PostgresUpsertWriterAdapter {
     }
 }
 
-/// Quote a PostgreSQL identifier.
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// Quote a PostgreSQL identifier using centralized validation.
+/// Panics on invalid identifiers for backward compatibility with UpsertWriter.
+fn quote_ident_unchecked(name: &str) -> String {
+    quote_pg(name).expect("invalid identifier")
 }
 
 #[async_trait]
@@ -465,7 +496,7 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema));
+        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", Self::quote_ident(schema)?);
         client.execute(&sql, &[]).await?;
 
         debug!("Created schema '{}'", schema);
@@ -479,7 +510,7 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let ddl = self.generate_ddl(table, target_schema, false);
+        let ddl = self.generate_ddl(table, target_schema, false)?;
         client.execute(&ddl, &[]).await?;
 
         debug!("Created table {}.{}", target_schema, table.name);
@@ -493,7 +524,7 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let ddl = self.generate_ddl(table, target_schema, true);
+        let ddl = self.generate_ddl(table, target_schema, true)?;
         client.execute(&ddl, &[]).await?;
 
         debug!("Created UNLOGGED table {}.{}", target_schema, table.name);
@@ -509,7 +540,7 @@ impl TargetWriter for PostgresWriter {
 
         let sql = format!(
             "DROP TABLE IF EXISTS {} CASCADE",
-            Self::qualify_table(schema, table)
+            Self::qualify_table(schema, table)?
         );
         client.execute(&sql, &[]).await?;
 
@@ -550,13 +581,13 @@ impl TargetWriter for PostgresWriter {
             .primary_key
             .iter()
             .map(|c| Self::quote_ident(c))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let pk_name = format!("pk_{}_{}", target_schema, table.name);
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} PRIMARY KEY ({})",
-            Self::qualify_table(target_schema, &table.name),
-            Self::quote_ident(&pk_name),
+            Self::qualify_table(target_schema, &table.name)?,
+            quote_ident_unchecked(&pk_name),
             pk_cols.join(", ")
         );
 
@@ -572,14 +603,18 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let idx_cols: Vec<String> = idx.columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let idx_cols: Vec<String> = idx
+            .columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect::<Result<Vec<_>>>()?;
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
 
         let sql = format!(
             "CREATE {}INDEX {} ON {} ({})",
             unique,
-            Self::quote_ident(&idx.name),
-            Self::qualify_table(target_schema, &table.name),
+            quote_ident_unchecked(&idx.name),
+            Self::qualify_table(target_schema, &table.name)?,
             idx_cols.join(", ")
         );
 
@@ -614,8 +649,8 @@ impl TargetWriter for PostgresWriter {
             let name: String = row.get(0);
             let drop_sql = format!(
                 "DROP INDEX IF EXISTS {}.{}",
-                Self::quote_ident(schema),
-                Self::quote_ident(&name)
+                Self::quote_ident(schema)?,
+                quote_ident_unchecked(&name)
             );
             client.execute(&drop_sql, &[]).await?;
             dropped_indexes.push(name);
@@ -642,20 +677,24 @@ impl TargetWriter for PostgresWriter {
             .await
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
-        let fk_cols: Vec<String> = fk.columns.iter().map(|c| Self::quote_ident(c)).collect();
+        let fk_cols: Vec<String> = fk
+            .columns
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect::<Result<Vec<_>>>()?;
         let ref_cols: Vec<String> = fk
             .ref_columns
             .iter()
             .map(|c| Self::quote_ident(c))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({}) ON DELETE {} ON UPDATE {}",
-            Self::qualify_table(target_schema, &table.name),
-            Self::quote_ident(&fk.name),
+            Self::qualify_table(target_schema, &table.name)?,
+            quote_ident_unchecked(&fk.name),
             fk_cols.join(", "),
-            Self::quote_ident(&fk.ref_schema),
-            Self::quote_ident(&fk.ref_table),
+            quote_ident_unchecked(&fk.ref_schema),
+            quote_ident_unchecked(&fk.ref_table),
             ref_cols.join(", "),
             map_referential_action(&fk.on_delete),
             map_referential_action(&fk.on_update)
@@ -683,9 +722,9 @@ impl TargetWriter for PostgresWriter {
 
         let sql = format!(
             "ALTER TABLE {} ADD CONSTRAINT {} {}",
-            Self::qualify_table(target_schema, &table.name),
-            Self::quote_ident(&chk.name),
-            convert_check_definition(&chk.definition)
+            Self::qualify_table(target_schema, &table.name)?,
+            quote_ident_unchecked(&chk.name),
+            convert_check_definition(&chk.definition)?
         );
 
         client.execute(&sql, &[]).await?;
@@ -725,7 +764,7 @@ impl TargetWriter for PostgresWriter {
 
         let sql = format!(
             "SELECT COUNT(*)::int8 FROM {}",
-            Self::qualify_table(schema, table)
+            Self::qualify_table(schema, table)?
         );
         let row = client.query_one(&sql, &[]).await?;
         Ok(row.get::<_, i64>(0))
@@ -746,7 +785,7 @@ impl TargetWriter for PostgresWriter {
         for pk_col in &table.primary_key {
             let seq_query = format!(
                 "SELECT pg_get_serial_sequence('{}', '{}')",
-                Self::qualify_table(schema, &table.name),
+                Self::qualify_table(schema, &table.name)?,
                 pk_col
             );
 
@@ -755,8 +794,8 @@ impl TargetWriter for PostgresWriter {
                     let reset_query = format!(
                         "SELECT setval('{}', COALESCE((SELECT MAX({}) FROM {}), 1), true)",
                         seq_name,
-                        Self::quote_ident(pk_col),
-                        Self::qualify_table(schema, &table.name)
+                        Self::quote_ident(pk_col)?,
+                        Self::qualify_table(schema, &table.name)?
                     );
                     client.execute(&reset_query, &[]).await?;
                     debug!("Reset sequence {} for {}.{}", seq_name, schema, table.name);
@@ -776,7 +815,7 @@ impl TargetWriter for PostgresWriter {
 
         let sql = format!(
             "ALTER TABLE {} SET LOGGED",
-            Self::qualify_table(schema, table)
+            Self::qualify_table(schema, table)?
         );
         client.execute(&sql, &[]).await?;
 
@@ -793,7 +832,7 @@ impl TargetWriter for PostgresWriter {
 
         let sql = format!(
             "ALTER TABLE {} SET UNLOGGED",
-            Self::qualify_table(schema, table)
+            Self::qualify_table(schema, table)?
         );
         client.execute(&sql, &[]).await?;
 
@@ -814,7 +853,7 @@ impl TargetWriter for PostgresWriter {
         }
 
         let row_count = rows.len() as u64;
-        let qualified_table = Self::qualify_table(schema, table);
+        let qualified_table = Self::qualify_table(schema, table)?;
 
         let client = self
             .pool
@@ -823,7 +862,10 @@ impl TargetWriter for PostgresWriter {
             .map_err(|e| MigrateError::pool(e, "getting PostgreSQL connection"))?;
 
         // Build COPY statement
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list: Vec<String> = cols
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect::<Result<Vec<_>>>()?;
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT BINARY)",
             qualified_table,
@@ -893,7 +935,7 @@ impl TargetWriter for PostgresWriter {
         }
 
         let row_count = rows.len() as u64;
-        let qualified_target = Self::qualify_table(schema, table);
+        let qualified_target = Self::qualify_table(schema, table)?;
 
         let client = self
             .pool
@@ -906,7 +948,7 @@ impl TargetWriter for PostgresWriter {
             Some(pid) => format!("_staging_{}_p{}_{}", table, pid, writer_id),
             None => format!("_staging_{}_{}", table, writer_id),
         };
-        let staging_qualified = Self::qualify_table(schema, &staging_name);
+        let staging_qualified = Self::qualify_table(schema, &staging_name)?;
 
         // Drop if exists, create staging
         let drop_sql = format!("DROP TABLE IF EXISTS {}", staging_qualified);
@@ -914,16 +956,19 @@ impl TargetWriter for PostgresWriter {
 
         let create_sql = format!(
             "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS)",
-            Self::quote_ident(&staging_name),
+            quote_ident_unchecked(&staging_name),
             qualified_target
         );
         client.execute(&create_sql, &[]).await?;
 
         // COPY to staging
-        let col_list: Vec<String> = cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let col_list: Vec<String> = cols
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect::<Result<Vec<_>>>()?;
         let copy_sql = format!(
             "COPY {} ({}) FROM STDIN WITH (FORMAT TEXT)",
-            Self::quote_ident(&staging_name),
+            quote_ident_unchecked(&staging_name),
             col_list.join(", ")
         );
 
@@ -947,18 +992,21 @@ impl TargetWriter for PostgresWriter {
         sink.finish().await?;
 
         // Build upsert SQL
-        let pk_col_list: Vec<String> = pk_cols.iter().map(|c| Self::quote_ident(c)).collect();
+        let pk_col_list: Vec<String> = pk_cols
+            .iter()
+            .map(|c| Self::quote_ident(c))
+            .collect::<Result<Vec<_>>>()?;
         let update_cols: Vec<String> = cols
             .iter()
             .filter(|c| !pk_cols.contains(c))
             .map(|c| {
-                format!(
+                Ok(format!(
                     "{} = EXCLUDED.{}",
-                    Self::quote_ident(c),
-                    Self::quote_ident(c)
-                )
+                    Self::quote_ident(c)?,
+                    Self::quote_ident(c)?
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let upsert_sql = if update_cols.is_empty() {
             format!(
@@ -966,7 +1014,7 @@ impl TargetWriter for PostgresWriter {
                 qualified_target,
                 col_list.join(", "),
                 col_list.join(", "),
-                Self::quote_ident(&staging_name),
+                quote_ident_unchecked(&staging_name),
                 pk_col_list.join(", ")
             )
         } else {
@@ -975,7 +1023,7 @@ impl TargetWriter for PostgresWriter {
                 qualified_target,
                 col_list.join(", "),
                 col_list.join(", "),
-                Self::quote_ident(&staging_name),
+                quote_ident_unchecked(&staging_name),
                 pk_col_list.join(", "),
                 update_cols.join(", ")
             )
@@ -986,7 +1034,10 @@ impl TargetWriter for PostgresWriter {
         // Drop staging
         client
             .execute(
-                &format!("DROP TABLE IF EXISTS {}", Self::quote_ident(&staging_name)),
+                &format!(
+                    "DROP TABLE IF EXISTS {}",
+                    quote_ident_unchecked(&staging_name)
+                ),
                 &[],
             )
             .await?;
@@ -1310,8 +1361,11 @@ fn map_referential_action(action: &str) -> &str {
     }
 }
 
-/// Convert check definition.
-fn convert_check_definition(def: &str) -> String {
+/// Convert check definition with security validation.
+fn convert_check_definition(def: &str) -> Result<String> {
+    // Validate the check constraint for SQL injection patterns
+    validate_check_constraint(def)?;
+
     let mut result = def.to_string();
     while let Some(start) = result.find('[') {
         if let Some(end) = result[start..].find(']') {
@@ -1328,7 +1382,7 @@ fn convert_check_definition(def: &str) -> String {
     }
     result = result.replace("getdate()", "CURRENT_TIMESTAMP");
     result = result.replace("GETDATE()", "CURRENT_TIMESTAMP");
-    result
+    Ok(result)
 }
 
 /// Certificate verifier.

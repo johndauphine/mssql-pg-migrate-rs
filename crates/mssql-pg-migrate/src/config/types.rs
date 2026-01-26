@@ -239,12 +239,17 @@ pub struct SourceConfig {
     pub user: String,
 
     /// Password (optional for Kerberos auth).
-    #[serde(default)]
+    /// Never serialized to prevent accidental leakage in logs or config dumps.
+    #[serde(default, skip_serializing)]
     pub password: String,
 
     /// Source schema (default: "dbo").
     #[serde(default = "default_dbo_schema")]
     pub schema: String,
+
+    /// SSL mode for PostgreSQL sources (default: "require"). Ignored for MSSQL/MySQL.
+    #[serde(default = "default_require")]
+    pub ssl_mode: String,
 
     /// Encrypt connection (default: true).
     #[serde(default = "default_true")]
@@ -301,7 +306,8 @@ pub struct TargetConfig {
     pub user: String,
 
     /// Password (optional for Kerberos auth with MSSQL targets).
-    #[serde(default)]
+    /// Never serialized to prevent accidental leakage in logs or config dumps.
+    #[serde(default, skip_serializing)]
     pub password: String,
 
     /// Target schema (default: "public" for PostgreSQL, "dbo" for MSSQL).
