@@ -513,6 +513,52 @@ impl Default for MigrationConfig {
     }
 }
 
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_mssql(),
+            host: "localhost".to_string(),
+            port: default_mssql_port(),
+            database: String::new(),
+            user: "sa".to_string(),
+            password: String::new(),
+            schema: default_dbo_schema(),
+            ssl_mode: default_require(),
+            encrypt: default_true(),
+            trust_server_cert: false,
+            auth: AuthMethod::default(),
+        }
+    }
+}
+
+impl Default for TargetConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_postgres(),
+            host: "localhost".to_string(),
+            port: default_pg_port(),
+            database: String::new(),
+            user: "postgres".to_string(),
+            password: String::new(),
+            schema: default_public_schema(),
+            ssl_mode: default_require(),
+            encrypt: default_true(),
+            trust_server_cert: false,
+            auth: AuthMethod::default(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            source: SourceConfig::default(),
+            target: TargetConfig::default(),
+            migration: MigrationConfig::default(),
+        }
+    }
+}
+
 fn default_memory_budget_percent() -> u8 {
     70
 }
