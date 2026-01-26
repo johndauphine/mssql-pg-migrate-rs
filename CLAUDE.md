@@ -70,19 +70,26 @@ This is a Rust workspace with two crates:
 
 ### Plugin Architecture (GoF Patterns)
 
-The codebase uses enum dispatch for zero-cost polymorphism instead of trait objects:
+The codebase uses enum dispatch for zero-cost polymorphism instead of trait objects. All readers/writers are wrapped in `Arc<T>` for cheap cloning:
 
 ```
 SourceReaderImpl (enum)          TargetWriterImpl (enum)
-├── Mssql(MssqlReader)           └── Postgres(PostgresWriter)
-├── Mysql(MysqlReader)
-└── Postgres(PostgresReader)
+├── Mssql(Arc<MssqlReader>)      ├── Mssql(Arc<MssqlWriter>)
+├── Mysql(Arc<MysqlReader>)      ├── Mysql(Arc<MysqlWriter>)
+└── Postgres(Arc<PostgresReader>)└── Postgres(Arc<PostgresWriter>)
 
 DialectImpl (enum)
 ├── Mssql(MssqlDialect)
 ├── Mysql(MysqlDialect)
 └── Postgres(PostgresDialect)
 ```
+
+To add a new database driver:
+1. Create module under `drivers/` (e.g., `drivers/newdb/`)
+2. Implement `Dialect`, `SourceReader`, and/or `TargetWriter` traits
+3. Add enum variant to `DialectImpl`, `SourceReaderImpl`, `TargetWriterImpl`
+4. Register type mappers in `DriverCatalog::with_builtins()`
+5. Feature-gate in `Cargo.toml`
 
 ### Core Traits (`crates/mssql-pg-migrate/src/core/`)
 
@@ -102,15 +109,18 @@ Config → Auto-Tuning → Schema Extraction → Connection Pools
 
 ### Key Modules
 
+All paths relative to `crates/mssql-pg-migrate/src/`:
+
 | Path | Purpose |
 |------|---------|
-| `src/drivers/` | Database driver implementations (mssql, postgres, mysql) |
-| `src/transfer/` | Transfer engine with parallel read-ahead/write-ahead |
-| `src/pipeline/` | Template Method pattern for transfer workflow |
-| `src/orchestrator/` | Migration workflow coordinator |
-| `src/state/` | Migration state backends (DB/file/no-op) |
-| `src/typemap/` | MSSQL/MySQL → PostgreSQL type conversion |
-| `src/config/` | Configuration loading, validation, auto-tuning |
+| `drivers/` | Database driver implementations (mssql, postgres, mysql) |
+| `drivers/common/` | Shared utilities: TLS, binary COPY parser |
+| `transfer/` | Transfer engine with parallel read-ahead/write-ahead |
+| `orchestrator/` | Migration workflow coordinator, connection pools |
+| `state/` | Migration state backends (postgres, mssql, mysql, no-op) |
+| `dialect/` | SQL dialect strategies and cross-database type mapping |
+| `core/` | Traits (`SourceReader`, `TargetWriter`, `Dialect`), schema types, value types |
+| `config/` | Configuration loading, validation, auto-tuning |
 
 ### Target Modes
 
