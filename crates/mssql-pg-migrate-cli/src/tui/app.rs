@@ -46,6 +46,15 @@ pub enum InputMode {
     Wizard,
 }
 
+/// Reason why the wizard was started automatically.
+#[derive(Debug, Clone)]
+pub enum WizardStartReason {
+    /// Config file was not found.
+    ConfigNotFound,
+    /// Config file exists but failed to parse.
+    ConfigInvalid(String),
+}
+
 /// A slash command with metadata for auto-completion.
 #[derive(Debug, Clone)]
 pub struct SlashCommand {
@@ -433,6 +442,51 @@ impl App {
         app
     }
 
+    /// Start the configuration wizard immediately.
+    /// Used when config file is missing or invalid on startup.
+    pub fn start_wizard(&mut self, output_path: PathBuf, reason: WizardStartReason) {
+        let path_display = output_path.display().to_string();
+
+        // Clear the "Loaded config" message since we're using a default config
+        self.transcript.clear();
+
+        // Add appropriate message based on reason
+        match reason {
+            WizardStartReason::ConfigNotFound => {
+                self.add_transcript(TranscriptEntry::info(
+                    "Config file not found. Starting configuration wizard...".to_string(),
+                ));
+            }
+            WizardStartReason::ConfigInvalid(ref error) => {
+                self.add_transcript(TranscriptEntry::error(format!(
+                    "Failed to load config: {}",
+                    error
+                )));
+                self.add_transcript(TranscriptEntry::info(
+                    "Starting configuration wizard...".to_string(),
+                ));
+            }
+        }
+        self.add_transcript(TranscriptEntry::info(format!(
+            "Configuration will be saved to: {}",
+            path_display
+        )));
+
+        // Enter wizard mode with current (default) config
+        self.enter_wizard_mode(output_path, &self.config.clone());
+    }
+
+    /// Enter wizard mode with the given config.
+    /// Shared helper used by both `start_wizard` and the `/wizard` command.
+    fn enter_wizard_mode(&mut self, output_path: PathBuf, config_for_wizard: &Config) {
+        let mut wizard_state = WizardState::with_config(output_path, config_for_wizard);
+        wizard_state.init_selection_for_step();
+        self.wizard = Some(wizard_state);
+        self.input_mode = InputMode::Wizard;
+        self.shared_input_mode
+            .store(INPUT_MODE_WIZARD, Ordering::Relaxed);
+    }
+
     /// Handle an application event. Returns true if the app should quit.
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<bool, MigrateError> {
         match event {
@@ -739,6 +793,12 @@ impl App {
                             "Configuration saved to {}",
                             output_path
                         )));
+                        // Reload the newly saved config
+                        if self.try_load_config(Some(&output_path)) {
+                            self.add_transcript(TranscriptEntry::success(
+                                "Configuration loaded. Ready to run migration.".to_string(),
+                            ));
+                        }
                     } else {
                         self.add_transcript(TranscriptEntry::info("Wizard cancelled".to_string()));
                     }
@@ -1447,16 +1507,11 @@ impl App {
                     self.config.clone()
                 };
 
-                let mut wizard_state = WizardState::with_config(output_path, &config_for_wizard);
-                wizard_state.init_selection_for_step();
-                self.wizard = Some(wizard_state);
-                self.input_mode = InputMode::Wizard;
-                self.shared_input_mode
-                    .store(INPUT_MODE_WIZARD, Ordering::Relaxed);
                 self.add_transcript(TranscriptEntry::info(format!(
                     "Starting configuration wizard (output: {})...",
                     path_display
                 )));
+                self.enter_wizard_mode(output_path, &config_for_wizard);
             }
             "/config" => {
                 // Reload the config file and display it

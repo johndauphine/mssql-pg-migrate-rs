@@ -83,10 +83,27 @@ fn install_panic_hook() {
     }));
 }
 
+use crate::tui::app::WizardStartReason;
+
 /// Run the TUI application.
 pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
-    // Load config BEFORE setting up terminal so errors display properly
-    let config = Config::load(config_path.as_ref())?;
+    let config_path = config_path.as_ref();
+
+    // Try to load config - handle missing file gracefully
+    let (config, wizard_reason) = match Config::load(config_path) {
+        Ok(cfg) => (cfg, None),
+        Err(MigrateError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Config file doesn't exist - use default and start wizard
+            (Config::default(), Some(WizardStartReason::ConfigNotFound))
+        }
+        Err(e) => {
+            // Other error (invalid YAML, etc.) - use default and start wizard with error message
+            (
+                Config::default(),
+                Some(WizardStartReason::ConfigInvalid(e.to_string())),
+            )
+        }
+    };
 
     // Install panic hook to restore terminal on panic
     install_panic_hook();
@@ -123,11 +140,16 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     // Create application state
     let mut app = App::new(
         config,
-        config_path.as_ref().to_path_buf(),
+        config_path.to_path_buf(),
         event_tx.clone(),
         palette_open.clone(),
         shared_input_mode.clone(),
     );
+
+    // If config was missing or invalid, start the wizard immediately
+    if let Some(reason) = wizard_reason {
+        app.start_wizard(config_path.to_path_buf(), reason);
+    }
 
     // Spawn log forwarder
     let log_event_tx = event_tx.clone();
