@@ -83,22 +83,25 @@ fn install_panic_hook() {
     }));
 }
 
+use crate::tui::app::WizardStartReason;
+
 /// Run the TUI application.
 pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
     let config_path = config_path.as_ref();
 
     // Try to load config - handle missing file gracefully
-    let (config, start_wizard) = match Config::load(config_path) {
-        Ok(cfg) => (cfg, false),
+    let (config, wizard_reason) = match Config::load(config_path) {
+        Ok(cfg) => (cfg, None),
         Err(MigrateError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
             // Config file doesn't exist - use default and start wizard
-            (Config::default(), true)
+            (Config::default(), Some(WizardStartReason::ConfigNotFound))
         }
         Err(e) => {
-            // Other error (invalid YAML, etc.) - show error and start wizard
-            eprintln!("Error loading config: {}", e);
-            eprintln!("Starting configuration wizard...");
-            (Config::default(), true)
+            // Other error (invalid YAML, etc.) - use default and start wizard with error message
+            (
+                Config::default(),
+                Some(WizardStartReason::ConfigInvalid(e.to_string())),
+            )
         }
     };
 
@@ -143,9 +146,9 @@ pub async fn run<P: AsRef<Path>>(config_path: P) -> Result<(), MigrateError> {
         shared_input_mode.clone(),
     );
 
-    // If config was missing, start the wizard immediately
-    if start_wizard {
-        app.start_wizard(config_path.to_path_buf());
+    // If config was missing or invalid, start the wizard immediately
+    if let Some(reason) = wizard_reason {
+        app.start_wizard(config_path.to_path_buf(), reason);
     }
 
     // Spawn log forwarder
