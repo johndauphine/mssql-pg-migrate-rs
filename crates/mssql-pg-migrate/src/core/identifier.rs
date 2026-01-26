@@ -190,12 +190,56 @@ pub fn validate_check_constraint(definition: &str) -> Result<()> {
         )));
     }
 
-    // Check for stored procedure prefixes
-    if lower.contains("xp_") || lower.contains("sp_") {
-        return Err(MigrateError::Config(format!(
-            "SECURITY: Check constraint contains stored procedure prefix (possible injection): {:?}",
-            definition
-        )));
+    // Check for known dangerous stored procedures
+    // We use a specific list of dangerous procedures rather than broad prefix matching
+    // to avoid false positives for legitimate column names like 'sp_rate' or 'xp_value'
+    const DANGEROUS_PROCEDURES: &[&str] = &[
+        // Extended stored procedures (xp_) - OS/file system access
+        "xp_cmdshell",
+        "xp_regread",
+        "xp_regwrite",
+        "xp_regdelete",
+        "xp_dirtree",
+        "xp_fileexist",
+        "xp_availablemedia",
+        "xp_enumgroups",
+        "xp_loginconfig",
+        "xp_makecab",
+        "xp_ntsec_enumdomains",
+        "xp_subdirs",
+        // System stored procedures (sp_) - dynamic SQL and OLE automation
+        "sp_executesql",
+        "sp_execute",
+        "sp_oacreate",
+        "sp_oamethod",
+        "sp_oagetproperty",
+        "sp_oasetproperty",
+        "sp_oadestroy",
+        "sp_addextendedproc",
+        "sp_configure",
+        "sp_makewebtask",
+    ];
+
+    for proc in DANGEROUS_PROCEDURES {
+        // Check if the dangerous procedure name appears as a word (with optional parenthesis)
+        // Use word boundary detection by checking characters before/after
+        for (idx, _) in lower.match_indices(proc) {
+            // Check character before (must be start of string or non-alphanumeric)
+            let before_ok = idx == 0 || !lower[..idx].chars().last().unwrap().is_alphanumeric();
+            // Check character after (must be end of string, parenthesis, or whitespace)
+            let after_idx = idx + proc.len();
+            let after_ok = after_idx >= lower.len() || {
+                let next_char = lower[after_idx..].chars().next().unwrap();
+                !next_char.is_alphanumeric() || next_char == '('
+            };
+
+            if before_ok && after_ok {
+                return Err(MigrateError::Config(format!(
+                    "SECURITY: Check constraint contains dangerous stored procedure '{}' (possible injection): {:?}",
+                    proc, definition
+                )));
+            }
+        }
     }
 
     Ok(())
@@ -415,17 +459,23 @@ mod tests {
     }
 
     #[test]
-    fn test_check_constraint_rejects_xp_prefix() {
+    fn test_check_constraint_rejects_xp_cmdshell() {
         let result = validate_check_constraint("xp_cmdshell('cmd')");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("stored procedure"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("dangerous stored procedure"));
     }
 
     #[test]
-    fn test_check_constraint_rejects_sp_prefix() {
+    fn test_check_constraint_rejects_sp_executesql() {
         let result = validate_check_constraint("sp_executesql(@sql)");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("stored procedure"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("dangerous stored procedure"));
     }
 
     #[test]
@@ -441,9 +491,17 @@ mod tests {
     fn test_check_constraint_allows_partial_matches() {
         // "executive" should be allowed (doesn't contain "exec" as a word)
         assert!(validate_check_constraint("status = 'executive'").is_ok());
-        // "respect" contains "sp_" but not as a standalone pattern
-        // Actually "respect" doesn't contain "sp_" so this passes
+        // "respect" should be allowed
         assert!(validate_check_constraint("type = 'respect'").is_ok());
+    }
+
+    #[test]
+    fn test_check_constraint_allows_legitimate_sp_xp_columns() {
+        // Legitimate column names containing sp_ or xp_ prefixes should be allowed
+        assert!(validate_check_constraint("sp_rate > 0").is_ok());
+        assert!(validate_check_constraint("xp_value IS NOT NULL").is_ok());
+        assert!(validate_check_constraint("custom_sp_format = 'A'").is_ok());
+        assert!(validate_check_constraint("my_xp_column < 100").is_ok());
     }
 
     // =========================================================================

@@ -213,12 +213,16 @@ mod tests {
 
     #[test]
     fn test_tls_builder_require_returns_some() {
+        // Install the ring crypto provider for this test (ignore if already installed)
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let builder = TlsBuilder::new(SslMode::Require);
         assert!(builder.build().unwrap().is_some());
     }
 
     #[test]
     fn test_tls_builder_verify_full_returns_some() {
+        // Install the ring crypto provider for this test (ignore if already installed)
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let builder = TlsBuilder::new(SslMode::VerifyFull);
         assert!(builder.build().unwrap().is_some());
     }
