@@ -1017,13 +1017,21 @@ async fn read_chunk_keyset_fast(
     // Build column list with appropriate quoting
     let col_list = columns
         .iter()
-        .map(|c| {
+        .zip(col_types.iter())
+        .map(|(c, t)| {
             if is_postgres {
                 quote_pg(c)
             } else if is_mysql {
                 quote_mysql(c)
             } else {
-                quote_mssql(c)
+                // For MSSQL geography/geometry UDT columns, convert to WKT text
+                let quoted = quote_mssql(c)?;
+                match t.to_lowercase().as_str() {
+                    "geography" | "geometry" => {
+                        Ok(format!("{}.STAsText() AS {}", quoted, quoted))
+                    }
+                    _ => Ok(quoted),
+                }
             }
         })
         .collect::<Result<Vec<_>>>()?
@@ -1133,13 +1141,21 @@ async fn read_chunk_offset(
 
     let col_list = columns
         .iter()
-        .map(|c| {
+        .zip(col_types.iter())
+        .map(|(c, t)| {
             if is_postgres {
                 quote_pg(c)
             } else if is_mysql {
                 quote_mysql(c)
             } else {
-                quote_mssql(c)
+                // For MSSQL geography/geometry UDT columns, convert to WKT text
+                let quoted = quote_mssql(c)?;
+                match t.to_lowercase().as_str() {
+                    "geography" | "geometry" => {
+                        Ok(format!("{}.STAsText() AS {}", quoted, quoted))
+                    }
+                    _ => Ok(quoted),
+                }
             }
         })
         .collect::<Result<Vec<_>>>()?

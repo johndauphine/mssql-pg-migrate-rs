@@ -752,7 +752,16 @@ async fn read_table_internal(
     let cols = opts
         .columns
         .iter()
-        .map(|c| format!("[{}]", c.replace(']', "]]")))
+        .zip(opts.col_types.iter())
+        .map(|(c, t)| {
+            let escaped = c.replace(']', "]]");
+            match t.to_lowercase().as_str() {
+                "geography" | "geometry" => {
+                    format!("[{}].STAsText() AS [{}]", escaped, escaped)
+                }
+                _ => format!("[{}]", escaped),
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -920,14 +929,11 @@ fn convert_row_value(row: &Row, idx: usize, data_type: &str) -> SqlValue<'static
         "decimal" | "numeric" | "money" | "smallmoney" => row
             .get::<rust_decimal::Decimal, _>(idx)
             .map(SqlValue::Decimal)
-            .or_else(|| {
-                row.get::<f64, _>(idx).map(|f| {
-                    rust_decimal::Decimal::try_from(f)
-                        .map(SqlValue::Decimal)
-                        .unwrap_or(SqlValue::F64(f))
-                })
-            })
             .unwrap_or(SqlValue::Null(SqlNullType::Decimal)),
+        "geography" | "geometry" => row
+            .get::<&str, _>(idx)
+            .map(|s| SqlValue::Text(Cow::Owned(s.to_string())))
+            .unwrap_or(SqlValue::Null(SqlNullType::String)),
         _ => {
             // Default: treat as string
             row.get::<&str, _>(idx)
@@ -993,14 +999,11 @@ fn convert_row_value_for_target(row: &Row, idx: usize, data_type: &str) -> Targe
         "decimal" | "numeric" | "money" | "smallmoney" => row
             .get::<rust_decimal::Decimal, _>(idx)
             .map(TargetSqlValue::Decimal)
-            .or_else(|| {
-                row.get::<f64, _>(idx).map(|f| {
-                    rust_decimal::Decimal::try_from(f)
-                        .map(TargetSqlValue::Decimal)
-                        .unwrap_or(TargetSqlValue::F64(f))
-                })
-            })
             .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::Decimal)),
+        "geography" | "geometry" => row
+            .get::<&str, _>(idx)
+            .map(|s| TargetSqlValue::String(s.to_string()))
+            .unwrap_or(TargetSqlValue::Null(TargetSqlNullType::String)),
         _ => {
             // Default: treat as string
             row.get::<&str, _>(idx)
