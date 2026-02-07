@@ -755,11 +755,10 @@ async fn read_table_internal(
         .zip(opts.col_types.iter())
         .map(|(c, t)| {
             let escaped = c.replace(']', "]]");
-            match t.to_lowercase().as_str() {
-                "geography" | "geometry" => {
-                    format!("[{}].STAsText() AS [{}]", escaped, escaped)
-                }
-                _ => format!("[{}]", escaped),
+            if t.eq_ignore_ascii_case("geography") || t.eq_ignore_ascii_case("geometry") {
+                format!("[{}].STAsText() AS [{}]", escaped, escaped)
+            } else {
+                format!("[{}]", escaped)
             }
         })
         .collect::<Vec<_>>()

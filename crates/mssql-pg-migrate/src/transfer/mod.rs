@@ -1026,11 +1026,10 @@ async fn read_chunk_keyset_fast(
             } else {
                 // For MSSQL geography/geometry UDT columns, convert to WKT text
                 let quoted = quote_mssql(c)?;
-                match t.to_lowercase().as_str() {
-                    "geography" | "geometry" => {
-                        Ok(format!("{}.STAsText() AS {}", quoted, quoted))
-                    }
-                    _ => Ok(quoted),
+                if t.eq_ignore_ascii_case("geography") || t.eq_ignore_ascii_case("geometry") {
+                    Ok(format!("{}.STAsText() AS {}", quoted, quoted))
+                } else {
+                    Ok(quoted)
                 }
             }
         })
@@ -1150,11 +1149,10 @@ async fn read_chunk_offset(
             } else {
                 // For MSSQL geography/geometry UDT columns, convert to WKT text
                 let quoted = quote_mssql(c)?;
-                match t.to_lowercase().as_str() {
-                    "geography" | "geometry" => {
-                        Ok(format!("{}.STAsText() AS {}", quoted, quoted))
-                    }
-                    _ => Ok(quoted),
+                if t.eq_ignore_ascii_case("geography") || t.eq_ignore_ascii_case("geometry") {
+                    Ok(format!("{}.STAsText() AS {}", quoted, quoted))
+                } else {
+                    Ok(quoted)
                 }
             }
         })
